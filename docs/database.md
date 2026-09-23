@@ -820,3 +820,66 @@ Verificado: `npx supabase db reset` completo aplica limpio desde cero (incluido
 el `drop function schedule_rule_standing_reservations(uuid)` de §3), y la
 suite de integración completa (182 tests, 19 archivos) pasa con
 `--no-file-parallelism`.
+
+## Fase 27 — `organizations_slug_format_check` (hallazgo de `security-engineer`, migración `20260923140000_phase27_organization_slug_format_check.sql`)
+
+`organizations.slug` era `text not null unique` sin ninguna validación de
+formato a nivel de base desde la Fase 1 — sólo `organizationSlugSchema`
+(Zod, `backend/src/schemas.ts`) del lado del formulario, y
+`create_organization_with_owner()` insertaba `p_slug` tal cual. Un usuario
+autenticado podía llamar `rpc/create_organization_with_owner` directo por
+PostgREST con un slug malicioso (`/evil.com`, `//evil.com`) saltándose Zod
+por completo. Detalle del vector y por qué importa en `docs/security.md`.
+
+**El `CHECK`, exacto espejo de `organizationSlugSchema`:**
+
+```sql
+alter table public.organizations
+  add constraint organizations_slug_format_check
+  check (
+    char_length(slug) between 2 and 60
+    and slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'
+  );
+```
+
+Agregado como `CHECK` directo, no `NOT VALID` + `VALIDATE`: el único camino
+de escritura de `slug` en las 27 migraciones de este repo es
+`create_organization_with_owner()` (grepeado explícitamente antes de
+decidir esto — no hay ningún `UPDATE ... set slug` en ninguna función), y
+esa RPC hasta ahora sólo se invocó desde el formulario del frontend, que ya
+corre este mismo patrón antes de llamarla. No hace falta backfill.
+
+**`create_organization_with_owner()` (firma sin cambios, 4 args de la Fase
+10) traduce la violación a `INVALID_SLUG`** en vez de dejar pasar el
+mensaje crudo de Postgres (`new row for relation "organizations" violates
+check constraint ...`), mismo criterio que cualquier otro RPC de este repo
+(`SLOT_FULL`, `INVITE_NOT_FOUND`, etc. — nunca una excepción genérica sin
+traducir):
+
+```sql
+begin
+  insert into public.organizations (...) values (...) returning * into v_org;
+exception
+  when check_violation then
+    get stacked diagnostics v_constraint_name = constraint_name;
+    if v_constraint_name = 'organizations_slug_format_check' then
+      raise exception 'INVALID_SLUG';
+    end if;
+    raise;
+end;
+```
+
+`get stacked diagnostics ... = constraint_name` en vez de matchear
+`sqlerrm` con `like` — evita atrapar por accidente una violación de un
+`CHECK` distinto que algún día se agregue a la tabla y termine
+reportándose también como `INVALID_SLUG`. Es `create or replace`, no
+`drop`+`create`: los grants existentes (`grant ... to authenticated` de la
+Fase 10, `revoke ... from public, anon` de la Fase 19/ADR-0028) se
+preservan sin re-declararlos (`DROP` sí los resetea, `CREATE OR REPLACE`
+no).
+
+Test: `test/phase27.organization-slug-format.test.ts` (6 casos —
+`/evil.com`, `//evil.com`, mayúsculas, vacío, guión al inicio/final/doble,
+caso feliz). Verificado: `npx supabase db reset` limpio desde cero y la
+suite de integración completa (194 tests, 21 archivos) pasa con
+`--no-file-parallelism`.

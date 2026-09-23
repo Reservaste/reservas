@@ -189,10 +189,26 @@ automáticamente** dos filas; el dueño resuelve con `merge_customers()`
 propósito.** En ADR-0015 el intent viaja sin firmar en query params porque
 son datos ya públicos; acá el query param **es un secreto**. El route
 handler `GET /activar/[token]` lo mueve a una cookie `httpOnly`, `Secure`,
-`SameSite=Lax`, 15 min de vida, y redirige a `/activar/continuar` **sin el
+`SameSite=Lax`, y redirige a `/activar/continuar` **sin el
 token en la URL** — no queda en el historial del navegador ni en logs de
 proxy. Ese primer GET manda `Cache-Control: no-store` y
-`Referrer-Policy: no-referrer`. `returnTo` sigue el allowlist
+`Referrer-Policy: no-referrer`, y **no toca la base**: WhatsApp le pega a
+todo link compartido para armar el preview, así que cualquier cosa que ese
+GET consumiera la consumiría un crawler antes que la persona.
+
+**La cookie dura lo mismo que el token (72 h), no menos** — corregido el
+2026-09-23 tras el bug en producción "el primer intento de abrir el link ya
+dice que está expirado". La cookie es *la única copia* del token en claro
+(la base guarda sólo el SHA-256), y el flujo de ADR-0026 es por definición
+el de alguien que **todavía no tiene cuenta**: abre el link, se registra,
+confirma por mail y recién ahí vuelve. Con 15 min de vida, la cookie —y no
+el token— era el verdadero vencimiento del link, y al volver
+`/activar/continuar` no encontraba nada y decía "venció" con el token
+todavía pendiente en la base por tres días. El invariante quedó escrito y
+testeado en `frontend/lib/activation-cookie.ts`: *la cookie nunca puede
+vencer antes que el token*, con el TTL de SQL fijado desde
+`backend/test/phase21.managed-customers.test.ts` y el de la cookie desde
+`frontend/app/activar/[token]/route.test.ts`. `returnTo` sigue el allowlist
 server-side de ADR-0015 (`lib/return-to.ts`) — acá un open redirect sería
 exfiltración directa del token, no solo phishing. La pantalla de
 confirmación (`/activar/continuar`) **nunca vincula automáticamente**,
@@ -254,6 +270,101 @@ esta sesión — sin acceso a shell/Supabase CLI): correr
 `npx supabase db reset`, y el checklist de verificación manual que queda
 como comentario al final de la migración 21 (Hallazgo A con `profile_id`
 genuinamente `NULL`, Hallazgo E vía PostgREST directo, canje end-to-end).
+
+### Residuales de la ventana de 72 h (revisión de seguridad 2026-09-23)
+
+Alargar la cookie de 15 min a 72 h es correcto —la cookie **no puede** ser
+el vencimiento real del link, ver arriba— pero mueve dos cosas, y quedan
+escritas para no volver a discutirlas:
+
+- **Dispositivo compartido.** El token ahora sobrevive hasta 72 h en el
+  navegador donde se abrió el link. Si esa persona no termina el canje,
+  cualquiera que use ese mismo navegador, inicie sesión con su cuenta y
+  entre a `/activar/continuar` puede quedarse con la invitación (la ficha
+  del cliente: su nombre, teléfono, pagos y reservas de ahí en adelante).
+  Mitigado, no cerrado: la pantalla **nunca vincula automáticamente**,
+  exige un clic explícito y muestra con qué cuenta se va a vincular. Se
+  acepta porque el link sigue estando en el WhatsApp de esa misma persona
+  igual, y porque acortar la cookie reintroduce el bug que ya llegó a
+  producción. **Regla:** un secreto que sólo vive en una cookie se borra en
+  cuanto se consume — `claimActivation()` la borra **con su `path`**
+  (`/activar`), no con `cookies().delete(name)`, que apunta a la cookie de
+  `path=/`, que es otra. Fijado en `frontend/lib/activation-cookie.test.ts`.
+- **`Referrer-Policy: no-referrer` de esa ruta lo pisaba el proxy.** El
+  bloque `header` de `frontend/deploy/Caddyfile` es un *set*, no un
+  *default*: reemplazaba el `no-referrer` que manda `GET /activar/[token]`
+  por `strict-origin-when-cross-origin`. Impacto real hoy: despreciable —
+  esa respuesta es un `303` sin cuerpo, no hay documento que dispare un
+  `Referer`, y en un redirect el navegador no usa la URL del redirect como
+  referrer. Se corrigió igual (`?Referrer-Policy`, o sea "sólo si la app no
+  mandó uno") porque la única defensa que le queda a esa URL, si alguna vez
+  renderiza un documento (una página de error de Next sobre la misma URL,
+  por ejemplo), es ese header. **Regla: el proxy no baja headers de
+  seguridad que la app sube; los headers globales del edge van como
+  default (`?`), nunca como override.**
+- **Logs.** El token viaja en la URL exactamente una vez, y hoy Caddy
+  corre **sin `log`** (los access logs de Caddy 2 son opt-in), así que no
+  queda en disco. Si alguna vez se habilita access logging, ese `GET` deja
+  el token en claro en el log — hay que excluir `/activar/*` o redactar el
+  URI en la misma tarea, no después.
+
+## `my_customer_organizations()` (Fase 26) — portal del cliente
+
+RPC nueva (`20260923130000_phase26_my_customer_organizations.sql`) que
+lista los negocios donde el profile autenticado ya es `Customer`, para que
+alguien recién activado tenga un link a la agenda en vez de un portal
+vacío. Cumple el patrón completo de las RPC de portal (`my_bookings()`,
+`my_services()`):
+
+- **Identidad sólo desde `auth.uid()`.** Cero parámetros: no hay input que
+  apunte a una fila, así que no hay IDOR posible. Sin sesión, `auth.uid()`
+  es `null` y la comparación no devuelve filas (defensa además del grant).
+- **`where c.is_active`**: un cliente dado de baja deja de ver el negocio.
+- **ADR-0028**: `revoke execute ... from public, anon` + `grant ... to
+  authenticated` explícitos.
+- **Shape mínimo**: `slug` y `name` de la organización, ambos datos ya
+  públicos (son la página pública, ADR-0023). No expone `organization_id`,
+  ni la fila de `customers`, ni nada de otros clientes.
+
+El `security definer` es necesario y está acotado: `organizations_select_members`
+(Fase 1) limita el `SELECT` directo de `organizations` a miembros, así que
+un `Customer` sin membership no puede leer ni el nombre del negocio al que
+pertenece por PostgREST.
+
+**Resuelto (Fase 27, `20260923140000_phase27_organization_slug_format_check.sql`)
+— `organizations.slug` sin `CHECK` de formato.** Era `text not null unique`
+y `create_organization_with_owner()` lo insertaba tal cual, sin validar — la
+forma la garantizaba hasta ahora sólo Zod en el formulario. Un usuario
+autenticado podía llamar la RPC por PostgREST con `p_slug = '/evil.com'`;
+cualquiera de los ~8 `href={\`/${slug}\`}` del frontend (`/me`,
+`/me/servicios`, `/admin`, `/org/[slug]/layout`, confirmación de reserva)
+producía entonces `//evil.com`, que el navegador lee como URL
+protocol-relative: un link externo con la estética del producto, dentro de
+la sesión de la víctima. Explotarlo exigía además que la víctima fuera
+`Customer` activo de esa organización (o sea, que hubiera canjeado una
+invitación del atacante), así que la severidad era baja, pero el arreglo
+correcto es **un `CHECK` en la columna** (mismo patrón que
+`organizationSlugSchema`), no parchear cada `href`. `frontend/lib/organization-path.ts`
+—que sí valida— cubre sólo el `redirect()` del canje, y sigue sin tocarse:
+el dato pasa a ser imposible de guardar mal, así que no hace falta.
+
+`organizations_slug_format_check` espeja exactamente `organizationSlugSchema`
+(`backend/src/schemas.ts`): `char_length(slug) between 2 and 60` y
+`slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'` (minúsculas/dígitos separados por un
+solo guión, nunca al principio/final, nunca doble). Se agregó como `CHECK`
+directo (no `NOT VALID` + `VALIDATE`): el único camino de escritura de
+`slug` en todo el repo es `create_organization_with_owner()` (verificado
+grepeando las 27 migraciones — no existe ningún `UPDATE ... set slug`), y
+esa RPC sólo se llamó hasta ahora desde el formulario, que ya corre este
+mismo patrón de Zod antes de invocarla — las filas existentes lo cumplen
+por construcción. `create_organization_with_owner()` traduce la violación
+del `CHECK` a `INVALID_SLUG` (vía `get stacked diagnostics ... =
+constraint_name`, comparando contra el nombre exacto de la constraint) en
+vez de dejar pasar el mensaje crudo de Postgres — mismo criterio que
+`SLOT_FULL`/`INVITE_NOT_FOUND`: ningún RPC de este repo devuelve una
+excepción genérica sin traducir al caller. 6 tests de integración en
+`test/phase27.organization-slug-format.test.ts`: `/evil.com`, `//evil.com`,
+mayúsculas, vacío, guión al inicio/final/doble, y el caso feliz.
 
 ## Escritura pública anónima — `platform_contact_requests` (ADR-0030, Fase 24)
 

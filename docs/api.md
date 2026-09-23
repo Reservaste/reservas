@@ -209,3 +209,91 @@ en su condición 1 y "liberar cupo" cancela la fecha sin emitir nada.
 `PAYMENT_DUPLICATE_PERIOD`, `PAYMENT_DUPLICATE_OCCURRENCE` y
 `SERVICE_PLAN_SCOPE_EMPTY` se traducen a texto de mostrador en vez de caer
 en el genérico "No se pudo registrar el pago".
+
+---
+
+## Feedback de producción — "no veo la agenda para reservar"
+
+Ningún shape de request/response cambia acá: lo que cambia es **a dónde
+aterriza** cada acción. Se documenta igual porque el destino de un
+`redirect()` es parte observable del contrato para `frontend-engineer`.
+
+### `activation.ts` — `claimActivation()` aterriza en el negocio que invitó
+
+Antes: `redirect("/me?activado=1")`. Ahora: `redirect("/{organization_slug}?activado=1")`,
+con el slug que devuelve `claim_customer_activation()` (resuelto adentro de
+la RPC desde el token — el caller nunca lo elige). Si el slug no viniera o
+no tuviera forma válida, el fallback sigue siendo `/me`.
+
+El motivo: `/me` para alguien **recién** activado está vacío por
+definición (todavía no reservó nada) y no tiene un solo link a la agenda
+del negocio — el nombre de la organización aparece en `/me` recién cuando
+ya existe una `Booking`. La activación es la invitación de una
+organización puntual y su página pública **es** su agenda (ADR-0023), así
+que tirar ese contexto para caer en un portal genérico era terminar el
+flujo en un callejón sin salida.
+
+**Pendiente de `frontend-engineer` (no bloqueante):** `?activado=1` ya
+viaja en la URL, pero `app/[organizationSlug]/page.tsx` todavía no lo lee.
+Un `Alert` de éxito ("Listo, ya podés reservar en {negocio}") cierra el
+flujo; sin él la confirmación es implícita (la agenda del negocio con su
+marca).
+
+### `auth.ts` — `signUpWithPassword()` sin `returnTo` va a `/dashboard`
+
+El default era `/onboarding` ("creá tu negocio"): la misma puerta
+equivocada que la Fase 9 ya había sacado de `/dashboard`, sobreviviendo en
+la acción hermana. Hoy `/signup` siempre manda un `returnTo`, así que era
+una trampa latente y no un bug en vivo, pero el default de "intención
+desconocida" tiene que ser el mismo en las dos puertas: `/dashboard`
+pregunta en vez de adivinar, y "Crear mi organización" sigue estando a un
+tap.
+
+### Helper nuevo: `frontend/lib/organization-path.ts`
+
+`organizationPath(slug)` → `/slug` o `null`. Valida contra
+`organizationSlugSchema` de `@reservaste/domain` (no una regex nueva) para
+que un `redirect("/" + slug)` armado desde el valor de retorno de una RPC
+no pueda salirse de la página que se quiso. Nunca "limpia" el slug:
+devuelve `null` y el caller decide el fallback.
+
+## Hotfix 2026-09-23 — el link de activación "vencido" en el primer intento
+
+Ningún shape de request/response cambia. Lo que cambia es el **transporte**
+del token y el destino del mail de confirmación.
+
+### `frontend/lib/activation-cookie.ts` (nuevo) — la cookie dura lo que el token
+
+`ACTIVATION_COOKIE_NAME`, `ACTIVATION_TOKEN_TTL_SECONDS` (72 h, espejo del
+`interval '72 hours'` de `issue_customer_activation()`),
+`activationCookieOptions()` y `activationCookieClearOptions()`. Lo usan el
+route handler `GET /activar/[token]` y las server actions de
+`activation.ts`, que antes repetían la política cada una por su cuenta —
+con dos valores distintos de `path` al borrar y un `maxAge` de 15 min que
+era, en los hechos, el vencimiento real del link. Invariante: **la cookie
+nunca puede vencer antes que el token**.
+
+### `activation.ts` — `claimActivation()` sin cookie ya no dice "venció"
+
+El texto pasó de *"Este link ya no es válido. Pedile al negocio que te lo
+reenvíe."* a *"No encontramos la invitación en este navegador. Volvé a
+abrir el link de WhatsApp desde este mismo teléfono y seguí desde ahí."*.
+No hay cookie ≠ link vencido: el token sigue pendiente en la base y pedir
+uno nuevo no arregla nada. El campo sigue siendo `{ error: string | null }`.
+
+**Pendiente de `frontend-engineer` (misma causa, otro archivo):**
+`app/activar/continuar/page.tsx` muestra, cuando no hay cookie, *"Este link
+ya no es válido — Puede haber vencido o ya haberse usado"*. Es la pantalla
+donde más se ve el mensaje equivocado y es UI, así que no la toqué: el
+texto correcto es el mismo de arriba ("abrí de nuevo el link de WhatsApp
+desde este teléfono").
+
+### `auth.ts` — `signUpWithPassword()` pasa `emailRedirectTo`
+
+`options.emailRedirectTo = ${siteUrl()}/auth/callback?next=<returnTo>`
+(misma forma que el `redirectTo` de Google, ya en el allowlist de Supabase
+Auth). Sin eso, con "Confirm email" prendido el link del mail caía en la
+Site URL del proyecto y la intención con la que la persona se registró se
+perdía ahí: el cliente gestionado que se registra **para** activar volvía a
+la home y nunca a `/activar/continuar`. Aplica a todo signup con
+`returnTo`, no sólo a la activación (ADR-0015 tenía el mismo agujero).
