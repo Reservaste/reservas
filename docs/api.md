@@ -22,6 +22,16 @@ Nunca nombres de clientes, bookings individuales, pagos, ni ninguna
 escritura server-side (no se crea `Booking`/`Customer` en draft para un
 anónimo).
 
+**Excepción puntual (ADR-0030 resolución 2):**
+`POST /contacto` (`submitContactRequest()` en
+`frontend/app/actions/contact.ts`, RPC `submit_platform_contact_request`)
+es la única escritura anónima permitida — un lead del formulario público
+de la landing, sin relación con `Organization`/`Customer`/`Booking`. Solo
+el platform admin lee esas filas (`GET /admin`, gateado por
+`is_platform_admin()`), nunca es un dato público de lectura. Rate-limited
+en la RPC (ver `docs/database.md`, Fase 24) en vez de un endpoint que
+pueda floodearse sin control.
+
 **Shape de disponibilidad — `publicAvailabilityDisplay` (ADR-0008):**
 unión discriminada por `mode`, nunca incluye el conteo exacto salvo en
 `EXACT`:

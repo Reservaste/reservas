@@ -255,6 +255,83 @@ esta sesión — sin acceso a shell/Supabase CLI): correr
 como comentario al final de la migración 21 (Hallazgo A con `profile_id`
 genuinamente `NULL`, Hallazgo E vía PostgREST directo, canje end-to-end).
 
+## Escritura pública anónima — `platform_contact_requests` (ADR-0030, Fase 24)
+
+Primera y **única** superficie del producto donde un anónimo sin sesión
+escribe una fila. Regla general que queda establecida para cualquier
+tabla futura de esta clase:
+
+1. **RLS habilitada con cero policies.** Es la única defensa real: en
+   Supabase las *default privileges* de `public` ya otorgan
+   `select/insert/update/delete` a `anon`/`authenticated` sobre toda tabla
+   nueva, y este repo nunca las revoca. "No hay grant" **no** es un
+   argumento válido — el que deniega es RLS. El único acceso es vía RPC
+   `security definer`. Mismo patrón que `customer_activations` (Fase 21).
+2. **Toda validación de formato y largo vive en SQL**, no solo en Zod: la
+   RPC es invocable directo por PostgREST sin pasar por el Server Action.
+   Zod en `schemas.ts` es solo mensaje de error de borde y sus bounds
+   deben espejar los `CHECK` exactamente.
+3. **Lectura y marcado solo con `is_platform_admin()`**, mismo shape que
+   `platform_organizations()`/`platform_invites()` (Fase 10): la RPC de
+   listado filtra con `where public.is_platform_admin()` (devuelve lista
+   vacía al no-admin, no error), la de escritura hace
+   `if not public.is_platform_admin() then raise 'NOT_AUTHORIZED'`.
+   `revoke execute ... from public, anon` + `grant ... to authenticated`.
+4. **El texto libre se guarda crudo y se escapa en la salida**, nunca al
+   revés. `name`/`message`/`business_type` son contenido controlado por
+   un atacante: prohibido `dangerouslySetInnerHTML`, `innerHTML`,
+   interpolación en HTML de email de notificación, o export a CSV sin
+   prefijar `'` a celdas que empiecen con `= + - @` (formula injection).
+   React escapa por default; el riesgo aparece cuando el lead sale de
+   React.
+5. **Rate limiting global = DoS barato.** Un contador `count(*)` global
+   sin dimensión de origen convierte a cualquiera en capaz de agotar el
+   cupo y bloquear envíos legítimos. En un formulario que es el tope del
+   embudo comercial, el default correcto es **nunca perder un lead**: el
+   límite estrecho debe ser por origen (IP vía
+   `current_setting('request.headers', true)::json`), y el global solo un
+   circuit breaker holgado.
+
+   **Resuelto** en la migración: `origin_ip` (columna nueva) se deriva de
+   `x-real-ip` con fallback al último salto de `x-forwarded-for` —
+   verificado contra `supabase start` local que el gateway sobreescribe
+   `x-real-ip` con su propia vista del peer TCP y apéndica esa misma
+   vista como último elemento de `x-forwarded-for` (un cliente puede
+   falsear entradas previas de la cadena pero no la última). Umbral real:
+   5/hora por `origin_ip`; el global sube a 200/hora como circuit
+   breaker holgado. Detalle completo en `docs/database.md`, Fase 24.
+
+   **Limitación conocida, no resuelta en esta ronda:** `/contacto` se
+   manda vía server action de Next.js (`frontend/app/actions/contact.ts`),
+   que llama a la RPC server-side desde el droplet (ADR-0021) — no desde
+   el browser del visitante. Todo el tráfico legítimo relayado por
+   nuestro propio frontend comparte un único `origin_ip` aparente (el del
+   droplet) ante Supabase; un script que llama a la RPC directamente sí
+   muestra su IP real, y es exactamente el ataque que esto cierra. Aislar
+   cada visitante del browser individualmente requeriría que el frontend
+   reenvíe la IP real como parámetro explícito — fuera de alcance de esta
+   ronda (sin cambios en `frontend/`), aceptable al volumen actual
+   (cliente único).
+6. **Chequeo y escritura del rate limit deben ser atómicos.** `count(*)`
+   seguido de `insert` sin lock es el mismo TOCTOU que ADR-0004 cazó en
+   `book_slot()`: bajo Read Committed, N requests concurrentes leen el
+   mismo conteo y pasan todos. Donde no hay fila padre para tomar
+   `for update`, el equivalente es `pg_advisory_xact_lock(<constante>)`
+   antes del conteo.
+
+   **Resuelto** en `submit_platform_contact_request()`: todo el bloque de
+   chequeo-y-escritura corre bajo un único
+   `pg_advisory_xact_lock(hashtext('platform_contact_requests_rate_limit'))`
+   (clave global, no por `origin_ip` — al volumen esperado de este
+   formulario la serialización cruzada entre orígenes no relacionados es
+   irrelevante, y una clave solo-por-origen dejaría el umbral *global*
+   racy bajo una ráfaga repartida entre muchos orígenes distintos).
+   Cubierto por un test de concurrencia nuevo (`Promise.all` de envíos
+   simultáneos) en `test/phase24.platform-contact-requests.test.ts`.
+   **Sigue pendiente, fuera de alcance de esta ronda:**
+   `issue_customer_activation()` (Fase 21) tiene el mismo patrón no
+   atómico y no se tocó acá.
+
 ## Pendiente de definir (Phase 1)
 
 - Proveedor de auth concreto: **Supabase Auth** (ADR-0002, cerrado).

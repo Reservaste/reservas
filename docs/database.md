@@ -488,3 +488,104 @@ cobrado en el mismo hecho que la reserva) quedan pendientes — es la pieza
 separable que la propia ADR marcó como tal (depende de decisiones de
 ADR-0027 que no son de esta fase). Hoy "sin cupo, pagás" se sigue resolviendo
 como antes de ADR-0025: carga manual del ADMIN.
+
+## Fase 24 — `platform_contact_requests` (ADR-0030 resolución 2, migración `20260922220000_phase24_platform_contact_requests.sql`)
+
+Tabla nueva, aislada, aditiva: captura los envíos del formulario público
+`/contacto` de la landing (el CTA principal deja de prometer un alta
+self-service que no existe — ADR-0017 — y pasa a generar un lead). No toca
+`organizations`, `plans`, `services` ni ningún flujo de booking existente.
+
+Columnas: `id`, `name`, `email` (`check` de formato + largo ≤320),
+`phone` (opcional, mismo `check` E.164 que `customers.phone` de la Fase
+21), `business_type` (texto libre, opcional, ≤120 — nunca un enum cerrado:
+el producto es genérico), `message` (1-4000 caracteres), `created_at`,
+`origin_ip` (derivado server-side de headers de request, ver abajo — nunca
+un parámetro que mande el caller), `handled_at`/`handled_by` (par opcional
+para que el platform admin marque un lead como atendido; `handled_by`
+exige `handled_at` vía `check`).
+
+**Mismo patrón de acceso que `customer_activations` (Fase 21):** RLS
+habilitada sin ninguna policy — deniega todo acceso directo por PostgREST
+(`select` devuelve `[]`, `insert`/`update` directos fallan) sin importar
+privilegios ambiente (Supabase sí otorga grants de tabla por default a
+`anon`/`authenticated`, que esta migración no revoca explícitamente — la
+defensa real y suficiente es únicamente RLS sin policies, no la ausencia
+de grants). Las únicas puertas son tres funciones `security definer`:
+
+- `submit_platform_contact_request(p_name, p_email, p_message, p_phone
+  default null, p_business_type default null)` — **pública, `grant ...
+  to anon, authenticated`**, sin chequeo de autorización (es un
+  formulario anónimo de landing). Valida formato/largo de cada campo
+  (mismo criterio de normalización de teléfono que
+  `create_managed_customer()`) y aplica un rate limit de **dos niveles por
+  origen**, corregido en revisión de seguridad tras el primer borrador
+  (que era un `count(*)` puramente global de 20/hora — un solo script
+  anónimo agota esa cuota para cualquier visitante del planeta, y
+  `/contacto` es la única puerta comercial pública tras ADR-0030
+  resolución 2):
+  - **Real: 5/hora por `origin_ip`** — derivado server-side de
+    `current_setting('request.headers', true)::json`, header `x-real-ip`
+    con fallback al último salto de `x-forwarded-for` (verificado contra
+    `supabase start` local: el gateway sobreescribe `x-real-ip` con su
+    propia vista del peer TCP y **apéndica** su vista del peer como
+    último elemento de `x-forwarded-for` — un cliente puede falsear
+    entradas anteriores de esa cadena pero no la última). `'unknown'` si
+    ninguno de los dos headers está presente.
+  - **Backstop: 200/hora global** — no es el límite real, protege contra
+    un flood distribuido entre muchos orígenes.
+  - Ambas ramas lanzan la **misma** excepción `RATE_LIMITED` (sin
+    distinguir cuál se disparó — evita que un caller anónimo infiera
+    volumen de leads probando cuál límite pisa primero).
+  - Todo el bloque de chequeo-y-escritura corre bajo
+    `pg_advisory_xact_lock(hashtext('platform_contact_requests_rate_limit'))`
+    (mismo patrón que `book_slot()`, ADR-0004, adaptado a una tabla sin
+    fila padre que lockear) — sin esto, una ráfaga concurrente puede leer
+    el mismo conteo antes de que cualquier insert se vea y pasar de largo
+    ambos umbrales (TOCTOU), como efectivamente pasaba en el primer
+    borrador.
+  - **Limitación conocida del deploy actual** (ADR-0021): `/contacto` se
+    manda vía server action de Next.js
+    (`frontend/app/actions/contact.ts`), que llama a esta RPC
+    server-side desde el droplet — no desde el browser del visitante. El
+    tráfico legítimo relayado por nuestro propio frontend comparte un
+    único `origin_ip` aparente (el del droplet) ante Supabase, mientras
+    que un script que llama a esta RPC directamente (es pública, alcanzable
+    con la anon key embebida en el bundle del frontend) sí muestra su IP
+    real. Esto cierra el ataque concreto descripto arriba sin tocar el
+    frontend; aislar cada visitante del browser individualmente
+    requeriría que el frontend reenvíe la IP real como parámetro explícito
+    — fuera de alcance de esta ronda, marcado como pase futuro si esta
+    tabla ve volumen orgánico real.
+- `platform_contact_requests()` — lectura, gateada por
+  `is_platform_admin()`, mismo patrón exacto que `platform_organizations()`/
+  `platform_invites()` (Fase 10): sin chequeo explícito, el `where
+  public.is_platform_admin()` filtra a cero filas para cualquier otro
+  caller en vez de fallar.
+- `mark_contact_request_handled(p_id)` — escritura, `NOT_AUTHORIZED` si
+  no es platform admin, `CONTACT_REQUEST_NOT_FOUND` si el id no existe.
+  Idempotente: un segundo llamado conserva el `handled_at`/`handled_by`
+  original (`coalesce`) en vez de pisarlo.
+
+Server actions en `frontend/app/actions/`: `submitContactRequest()` vive
+en `app/actions/contact.ts` (archivo nuevo, separado de `platform.ts`
+porque es la única acción de esta superficie sin `is_platform_admin()`
+detrás — todo lo demás en `platform.ts` sigue gateado en SQL, como dice
+su comentario de cabecera). `getPlatformContactRequests()` y
+`markContactRequestHandled()` se agregaron a `platform.ts`, mismo shape
+que `getPlatformOrganizations()`/`getPlatformInvites()`.
+
+Test de integración: `test/phase24.platform-contact-requests.test.ts`.
+Nota de diseño del test: como el rate limit ahora es por `origin_ip` y
+todos los requests del archivo salen del mismo test runner (comparten el
+mismo `origin_ip` ante la base), los dos tests de rate limit (umbral
+simple + concurrencia) limpian la tabla al empezar cada uno — así quedan
+deterministas y no dependen de cuántos `anon.rpc()` exitosos hicieron los
+tests anteriores del archivo, ni interfieren entre sí. El test de
+concurrencia (`Promise.all` con 8 envíos simultáneos contra un umbral de
+5) verifica el fix de TOCTOU: sin el `pg_advisory_xact_lock`, más de 5
+podrían colarse. El archivo entero también limpia la tabla en `afterAll`,
+por la misma razón que antes (sin eso, sus propias filas seguirían dentro
+de la ventana de 1h en la corrida siguiente). Verificado corriendo la
+suite completa de integración (164 tests, 18 archivos) contra
+`supabase db reset` local.
