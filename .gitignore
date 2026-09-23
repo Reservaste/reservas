@@ -1,0 +1,6 @@
+backend/
+frontend/
+.claude/agents-old/
+.env*
+!*.example
+node_modules/

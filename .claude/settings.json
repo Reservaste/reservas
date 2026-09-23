@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker build *)",
+      "Bash(docker save *)",
+      "Bash(gzip *)",
+      "Bash(ssh root@161.35.63.60 *)",
+      "Bash(scp *)"
+    ]
+  }
+}
