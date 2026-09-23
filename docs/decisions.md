@@ -2067,3 +2067,98 @@ sin `next dev`) → Fase 7 (`/admin`). Se arranca por la Fase 1 y 2 ahora;
 3-7 quedan para las próximas rondas de este mismo ADR, no para fases
 nuevas del roadmap — es un solo cambio de identidad visual ejecutado en
 etapas por riesgo, no siete features distintas.
+
+## ADR-0031 — Prorrateo del primer período en ciclos de facturación largos
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario (feedback de
+producción). Propuesta completa en
+`docs/proposals/adr-0031-prorrateo-ciclos-largos.md` — este ADR registra
+la decisión, no la repite.
+
+Extiende `billing_period_for()` (no la duplica) con `CALENDAR_PERIOD`/
+`ROLLING_PERIOD` + `billing_period_months`/`billing_anchor_month` en
+`service_plans`, aditivo, sin tocar `CALENDAR_MONTH`/`ROLLING_MONTH`
+existentes. `quote_service_plan_period()`, función nueva de solo lectura,
+cotiza — el mostrador sigue registrando el pago con `amount` libre.
+
+### Resoluciones del Orchestrator a las preguntas abiertas
+
+1. **Prorrateo por meses enteros, no por días.** Es lo que el mostrador
+   puede explicar en una frase y no depende de cuántos días tiene el mes.
+2. **Se prorratea el precio, no el período.** La cobertura del cliente
+   arranca al principio del ciclo calendario, no el día que se hizo
+   cliente — la asimetría es real pero explicable, y recortar
+   `period_start` rompe el `EXCLUDE` y la alineación de renovación de
+   todo el plan.
+3. **El prorrateo aplica solo al alta inicial en un ciclo largo, nunca al
+   cambio de plan a mitad de período.** ADR-0024 resolución 1 (VOID +
+   recargar) es una regla de resolución, no de cobro — mezclar las dos
+   metería una jerarquía entre planes en la función de cotización, que es
+   justo lo que esa resolución evitó del lado del motor.
+4. **Sin nota de crédito por lo no consumido de un plan anterior.** No es
+   parte de lo que se pidió (el pedido era sobre ciclos largos, no sobre
+   cambios de plan) — si en algún momento se necesita, es una entidad
+   nueva y su propio ADR, no un campo escondido en `quote_service_plan_period()`.
+5. **`organizations.currency_minor_units` se difiere a ADR-0027.** Hoy no
+   hay ningún consumidor que necesite el centavo; redondeo a unidad
+   entera de moneda alcanza.
+6. **El default de vencimiento del crédito de recupero en planes de ciclo
+   largo pasa a `END_OF_MONTH`, no `END_OF_BILLING_PERIOD`.** Un crédito
+   vivo tres meses en un plan trimestral triplica el riesgo que ADR-0025
+   ya había dejado anotado como abierto (cuántos créditos vivos tolera la
+   capacidad real). `END_OF_BILLING_PERIOD` sigue siendo válido para
+   ciclos mensuales, donde no cambia nada de lo ya aceptado.
+
+**Implementación**: pendiente, próxima ronda (backend: schema + función
+de cotización; frontend: formulario de plan + formulario de pago).
+
+## ADR-0032 — `audit_log`: registro de acciones sensibles
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario (feedback de
+producción, alcance acotado explícitamente por el usuario a acciones
+sensibles/administrativas, no todo el sistema). Propuesta completa en
+`docs/proposals/adr-0032-audit-log.md`.
+
+**El hallazgo que decide el diseño**: la mitad de las escrituras del
+alcance (alta y anulación de pago, cambios de precio/nombre de plan) no
+pasan por ninguna RPC — son `INSERT`/`UPDATE` de PostgREST directo. Un
+insert explícito por RPC dejaría afuera la mayoría de lo que se pidió
+auditar. Por eso el diseño es por **trigger** (`AFTER INSERT/UPDATE` con
+predicado `WHEN`, no evadible) con contexto opcional desde la RPC vía
+`set_config('app.audit_note', ...)`. Tabla `audit_log` con `action` enum
+(8 valores), `target_table`+`target_id` (sin FK al target, a propósito:
+el log tiene que sobrevivir al borrado de lo que audita), `metadata`
+jsonb con el diff mínimo (nunca la fila entera ni datos personales),
+inmutable (RLS sin policies de escritura + trigger que rechaza
+`UPDATE`/`DELETE`, sin excepción para `service_role`).
+
+### Resoluciones del Orchestrator a las preguntas abiertas
+
+1. **Lectura**: `is_platform_admin()` ve todo; `OWNER` ve el log de su
+   propia organización; `STAFF` no ve nada. Aprobado tal cual propuesto.
+2. **El `OWNER` sí ve las filas de `ORGANIZATION_SUBSCRIPTION_CHANGED`**
+   (que la plataforma le suspendió/reactivó la cuenta) — una suspensión
+   que el dueño no puede rastrear genera desconfianza. **Con un matiz**:
+   la identidad del actor de plataforma (`actor_id` de un platform admin)
+   **no se resuelve a un nombre en la UI del cliente** — el dueño ve que
+   pasó y cuándo, no quién de nuestro lado lo hizo.
+3. **Sin política de retención por ahora.** Mantener el índice
+   `(organization_id, created_at desc)` listo para cuando haga falta, sin
+   implementar el borrado todavía.
+
+**Alcance confirmado, sin cambios sobre lo propuesto**: pagos (alta,
+cambio de estado incluida anulación), reservas de mostrador (alta y
+cancelación cuando el actor no es el propio cliente), planes (alta,
+cambio de precio/nombre, activar/desactivar), suspensión/cambio de plan
+SaaS de la organización. Fuera de alcance, explícito: asistencia,
+créditos de recupero (ya tienen su propio log en `makeup_credits`),
+acciones del propio cliente, altas de cliente/servicio/horario/branding,
+logins y lecturas.
+
+**Implementación**: pendiente, próxima ronda (backend: schema + 4
+triggers + policy, con revisión obligatoria de `security-engineer`;
+frontend: pantalla de solo lectura para el `OWNER`).
