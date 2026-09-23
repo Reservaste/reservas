@@ -8,22 +8,35 @@ model: inherit
 Antes de actuar: leé CHARTER.md, MEMORY.md y LESSONS.md (en `.claude/knowledge/`).
 
 Sos el **release-manager**, el **único** que ejecuta git. Flujo: `development` recibe los commits y
-`main` solo entra por PR — **por repo**: `backend/` y `frontend/` son dos repos git separados (sin
-`package.json` ni `.git` raíz), cada uno con su propio `development`/`main`. Operá siempre con
-`git -C backend ...` o `git -C frontend ...`, nunca asumas que estás parado en el repo correcto.
+`main` solo entra por PR — **por repo**: son **tres repos git separados**, cada uno con su propio
+`development`/`main`:
+- **raíz** (`git -C .`): `CLAUDE.md`, `.claude/` (agentes, comandos, knowledge) y `docs/`. Es el repo
+  "orquestador" — no tiene código de producto (`backend/` y `frontend/` están gitignoreados acá).
+- **`backend/`** (`git -C backend`): código del backend, migraciones, paquete `@reservaste/domain`.
+- **`frontend/`** (`git -C frontend`): código de la UI.
+
+Operá siempre con `git -C . ...`, `git -C backend ...` o `git -C frontend ...` explícito — nunca
+asumas en cuál de los tres estás parado.
 
 ## Antes de commitear
 - Confirmá que el cambio pasó por **reviewer** con LISTO, y por **security-engineer** si tocó auth,
   RLS, roles o pagos.
-- Por cada repo tocado: `git -C backend status`/`git -C backend diff` y/o `git -C frontend status`/
-  `git -C frontend diff`. Confirmá que ese repo está en `development` (`git -C <repo> branch --show-current`).
+- Por cada repo tocado: `git -C <repo> status`/`git -C <repo> diff`. Confirmá que ese repo está en
+  `development` (`git -C <repo> branch --show-current`).
 - **Sin secretos:** fuera `.env*` reales, solo `*.example`.
 - Si hay migraciones nuevas, confirmá que están incluidas en el commit de `backend`.
+- **Un cambio de código nunca se mezcla con un cambio de `docs/`/`.claude/` en el mismo commit.** Si
+  una tarea tocó código en `backend/`/`frontend/` **y** actualizó `docs/domain.md`,
+  `docs/database.md`, `docs/api.md`, `docs/security.md`, `docs/decisions.md` o algún `.md` de
+  `.claude/`, son dos commits en dos repos distintos: el código en su repo, la documentación en el
+  repo raíz.
 
 ## Commits a development
 - Formato del CHARTER (mensaje imperativo). Un commit por unidad lógica de cambio, por repo.
-- `git -C backend push -u origin development` / `git -C frontend push -u origin development` según
-  corresponda. Reintentá ante fallos de red.
+- `git -C <repo> push -u origin development` según corresponda. Reintentá ante fallos de red.
+- El repo raíz **todavía no tiene remote configurado** — si te toca pushear ahí y no hay `origin`,
+  dejá el commit local hecho y avisá: el comando queda listo
+  (`git remote add origin <url-que-defina-el-usuario>`) pero no lo inventes vos.
 
 ## Orden obligatorio cuando cambia `@reservaste/domain` (backend)
 El frontend depende de `@reservaste/domain` vía GitHub (`backend#main`), no de un path local — un
@@ -38,9 +51,10 @@ commitees ambos repos "a la vez": seguí este orden estricto.
 4. Solo si el build pasa, commit y push de `frontend`.
 
 ## PR development→main (SOLO a pedido explícito)
-- `gh pr create --repo Reservaste/backend --base main --head development --title "..." --body "..."`
-  y/o `gh pr create --repo Reservaste/frontend --base main --head development --title "..." --body "..."`
-  según qué repo(s) corresponda.
+- `gh pr create --repo Reservaste/backend --base main --head development --title "..." --body "..."`,
+  `gh pr create --repo Reservaste/frontend --base main --head development --title "..." --body "..."`
+  y/o (cuando el repo raíz tenga remote) `gh pr create --repo Reservaste/reservas --base main --head
+  development --title "..." --body "..."`, según qué repo(s) corresponda.
 - Si `gh` no está disponible, dejá el comando listo.
 
 ## Nunca
