@@ -309,9 +309,47 @@ tabla futura de esta clase:
    droplet) ante Supabase; un script que llama a la RPC directamente sí
    muestra su IP real, y es exactamente el ataque que esto cierra. Aislar
    cada visitante del browser individualmente requeriría que el frontend
-   reenvíe la IP real como parámetro explícito — fuera de alcance de esta
-   ronda (sin cambios en `frontend/`), aceptable al volumen actual
-   (cliente único).
+   reenvíe la IP real como parámetro explícito — fuera de alcance de esa
+   ronda (backend-only).
+
+   **Revisión de la Fase 2 de ADR-0030 (frontend): la limitación dejó de
+   ser teórica y pasa a hallazgo abierto (severidad media,
+   disponibilidad).** Con `/contacto` ya construido sobre el server
+   action, el camino del relay no es solo el camino legítimo: es también
+   el camino *más barato para el atacante*, porque le presta el
+   `origin_ip` del droplet en vez de exponer el suyo. 5 POST a `/contacto`
+   desde cualquier IP agotan el bucket por-origen del droplet y durante el
+   resto de la hora **todo visitante legítimo del sitio ve
+   `RATE_LIMITED`** — el "nunca perder un lead" del punto 5 invertido,
+   con la única entrada comercial pública del producto caída. El límite
+   por-origen solo protege contra el atacante que elige la ruta peor para
+   él (PostgREST directo).
+
+   Regla que queda establecida para cualquier escritura anónima
+   relayada por un server action: **si el rate limit se mide en la base,
+   la dimensión de origen tiene que llegar hasta ahí; si no, el límite
+   hay que aplicarlo también en el proceso que sí ve al visitante.** El
+   droplet tiene la IP real (Caddy setea `x-forwarded-for`) y es un
+   proceso único, así que el límite por-visitante es implementable en el
+   server action. **No** se resuelve pasando la IP como parámetro de la
+   RPC a secas: la RPC es `grant execute to anon` e invocable directo, y
+   un parámetro de origen que la función acepte como verdad es
+   spoofeable por el atacante que hoy queda fuera.
+
+   **Resuelto** en `frontend/lib/rate-limit.ts`, consumido desde
+   `app/actions/contact.ts` **antes** de llamar a la RPC (protege también
+   el cupo compartido del droplet, no solo agrega una capa redundante
+   después). `getVisitorIp()` toma el último salto de `X-Forwarded-For`
+   que agrega Caddy — verificado contra `frontend/deploy/Caddyfile` real
+   (único reverse proxy, directo frente a Internet, ADR-0021): un
+   visitante puede falsear entradas previas de la cadena pero no la que
+   Caddy agrega él mismo, mismo criterio que ya usa `origin_ip` del lado
+   de la RPC. Sin IP identificable, el límite local no bloquea — el
+   backstop de la RPC sigue aplicando. Contador `Map` en memoria a nivel
+   de módulo: válido porque el deploy es un único proceso de larga vida
+   (no serverless); se resetea en cada restart/redeploy y no escala a
+   múltiples instancias, límite aceptado al volumen actual. 7 tests en
+   `frontend/lib/rate-limit.test.ts`.
 6. **Chequeo y escritura del rate limit deben ser atómicos.** `count(*)`
    seguido de `insert` sin lock es el mismo TOCTOU que ADR-0004 cazó en
    `book_slot()`: bajo Read Committed, N requests concurrentes leen el
