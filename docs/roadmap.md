@@ -303,11 +303,27 @@ posterga y solo se deja la arquitectura lista.
 |---|---|---|
 | L0 | Sistema visual base (tokens + primitivas que faltan) | **COMPLETA** (2026-09-22) |
 | H | `ServicePlan`: precio + veces por semana (ADR-0024) | **COMPLETA** (2026-09-22) — desplegada |
-| I | Liberar y recuperar: créditos de recupero (ADR-0025) | Diseño en curso |
-| J | Cliente gestionado + activación por WhatsApp (ADR-0026) | Pendiente |
-| K | Cobro con tarjeta (ADR-0027) — parcial, sin pasarela | Pendiente |
-| L | Pulido de UI/UX de pantallas | Pendiente |
-| M | Tests de pantallas, revisión de seguridad, cierre | Pendiente |
+| I | Liberar y recuperar: créditos de recupero (ADR-0025) | **COMPLETA** (2026-09-22) — desplegada |
+| J | Cliente gestionado + activación por WhatsApp (ADR-0026) | **COMPLETA** (2026-09-22) — desplegada |
+| — | Alcance configurable de `ServicePlan` (ADR-0029, no estaba en el plan original — pedido del usuario en producción tras ADR-0024) | **COMPLETA** (2026-09-22) — desplegada |
+| K | Cobro con tarjeta (ADR-0027) — parcial, sin pasarela | Pendiente — bloqueada por elección de pasarela |
+| L | Pulido de UI/UX de pantallas | **COMPLETA** (2026-09-22) — ver `architecture.md` § "Sistema visual — Fase L" |
+| M | Tests de pantallas, revisión de seguridad, verificar todo renderizado con sesión real, cierre | **Pendiente — es la fase que falta cerrar ahora mismo** |
+
+**Nota de esta actualización (2026-09-22, Orchestrator):** esta tabla estaba
+desactualizada respecto al estado real de los tres repos — `git log` en
+`frontend/` y `backend/` muestra I, J, L y la adenda de ADR-0029 ya
+implementadas, testeadas y desplegadas a producción (`development` = `main`
+en ambos repos, working tree limpio). Fase K sigue bloqueada por la elección
+de pasarela de pago, como estaba planeado. Fase M — la que cierra la
+iteración — es la única fase de esta lista que sigue sin arrancar, y es
+justamente donde vive la deuda que `architecture.md` documenta explícitamente:
+ninguna de las pantallas de L0/H/I/J/L fue vista renderizada por un agente
+con sesión real (ningún agente tuvo `next dev` disponible), la densidad
+`touch` del panel admin quedó aplicada solo parcialmente, y el
+swipe-to-dismiss del `Sheet` nunca se verificó. Esto es relevante para
+cualquier pedido de "mejorar la UI/UX": la pieza que falta no es (solo)
+diseñar más pantallas, es **verificar con los ojos las que ya existen**.
 
 L0 va primero a propósito: las pantallas de H, I y J son nuevas, y
 construirlas sobre las 5 primitivas actuales obligaría a rehacerlas en L.

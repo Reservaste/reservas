@@ -328,6 +328,53 @@ leyendo esto en vez de adivinar de nuevo.
     fechas a la vez y la categorización de tres vías ahí sería ruido, no
     señal.
 
+## Pase de corrección post-Fase L (2026-09-22)
+
+Una auditoría de UX (`ux-ui-designer`, revisión estática, sin `next dev`) sobre
+las pantallas ya desplegadas encontró bugs reales, no solo pulido: dos server
+actions (`setSubscription`, `markAttendance`) ignoraban el `error` del
+`.rpc()` y fallaban en silencio, `SubscriptionControls` suspendía/reactivaba
+una organización sin confirmación ni feedback de error, y el roll-call de
+asistencia no revertía ni avisaba si `markAttendance` fallaba. Corregido con
+el mismo patrón `{ error: string | null }` que ya usa `services.ts`.
+
+Un detalle vale la pena dejar escrito porque puede repetirse: al arreglar el
+revert de `RollCall`, el primer intento cambió `useOptimistic` por
+`useState(initialAttendees)` para poder revertir a mano con un `previous`
+capturado. `security-engineer` y `qa-engineer`, en paralelo y sin verse,
+encontraron el mismo problema: sin `key` en el padre, `useState` nunca vuelve
+a leer la prop después del mount, así que la pantalla queda congelada frente
+a cualquier `revalidatePath` ajeno (otra cancelación, otro dispositivo
+marcando el mismo turno). La solución correcta no fue agregar un `key` ni un
+efecto de resync manual: fue **no abandonar `useOptimistic`** — se re-basa en
+la prop en cada render fuera de una transición, y al fallar cae solo al valor
+real sin revert manual ni riesgo de que una respuesta fuera de orden pise una
+marca posterior. El error se guarda aparte, en un `useState` propio que no
+participa del reducer optimista. Regla general: si una pantalla ya usa
+`useOptimistic` y hace falta agregar manejo de error, la respuesta casi nunca
+es reemplazarlo por `useState` — es sumarle un estado de error al lado.
+
+También se corrigió el copy de confirmación de suspender/reactivar una
+organización: decía que cortaba el panel y las reservas existentes, y
+`subscription_status` en realidad solo bloquea **crear** entidades nuevas
+(triggers `BEFORE INSERT`) — el panel y las reservas ya confirmadas siguen
+funcionando. Qué debería significar "suspender" de verdad queda como pregunta
+de producto abierta, no resuelta acá.
+
+Se agregaron `app/error.tsx`/`app/not-found.tsx` (no existían: cualquier
+fallo no controlado caía en la página default de Next, sin marca) y
+`loading.tsx` en las 9 rutas de mayor tráfico que no tenían ningún estado de
+carga — de ~60 pantallas, antes de este pase solo `plans/page.tsx` manejaba
+los 4 estados (loading/error/vacío/éxito) completos. Se terminó la migración
+a `DataList` que el punto 10 de arriba dejó incompleta (`me/page.tsx`,
+`me/servicios/page.tsx`, lista de organizaciones en `admin/page.tsx`), y se
+sumó densidad `touch` en `activation-panel.tsx` y la consola de plataforma —
+instancias nuevas de esa deuda, construidas después del barrido original.
+
+Sigue pendiente, sin cambios por este pase: verificación visual con
+`next dev`/sesión real (Fase M), y el resto de la densidad `touch` del panel
+admin (Clientes, Pagos, Servicios, Recursos, Equipo como listas).
+
 ## Próximos pasos
 
 Arrancar Phase 1 (`roadmap.md`): Auth + Organizations + Roles, con el
