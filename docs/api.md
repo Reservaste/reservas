@@ -128,3 +128,84 @@ el `organizationId` del recurso, no solo que el usuario esté autenticado.
   como ADR una vez elegido el stack).
 - Shapes exactos de request/response por endpoint (se agregan acá a medida
   que se implementan, fase por fase).
+
+---
+
+## Fase 25 — cambios de contrato en server actions (`frontend/app/actions/`)
+
+Todos aditivos o compatibles hacia atrás. Lo que necesita trabajo de
+`frontend-engineer` está marcado.
+
+### `service-plans.ts` — `listPaymentPlanOptions(organizationSlug, month?)`
+
+Parámetro nuevo **opcional** `month` (`"YYYY-MM"`). Sin él se comporta
+exactamente como antes.
+
+El motivo es el reporte 3 del cliente. La pantalla de pagos es una pantalla
+*sobre un mes* (`/org/[slug]/payments/[customerId]?mes=YYYY-MM`) y el
+formulario "Agregar pago" que vive abajo resolvía el período desde **hoy**,
+sin importar qué mes estuviera en pantalla. Parado en octubre y registrando
+un pago, el período que se mandaba era el de septiembre: con septiembre ya
+`PAID` el `EXCLUDE` lo rechazaba ("ya hay un pago que cubre ese período" —
+de un mes que el mostrador ni estaba mirando), y con `PENDING` entraba en un
+mes que esa pantalla no lista, así que parecía que lo habían rechazado.
+
+**Resuelto:** `app/org/[slug]/payments/[customerId]/page.tsx` pasa `mes`,
+y `RegisterPaymentForm` lo usa como default en vez de
+`firstOfMonth`/`lastOfMonth` calculados en el browser.
+
+### `standing.ts` — `StandingReservation.upcomingBeyondPeriod`
+
+Campo nuevo. Cambia además el **significado** de `upcomingUnpaid`: ahora son
+sólo las fechas que se pueden cobrar hoy, no todas las de la ventana rodante
+de 90 días (ver `database.md` §Fase 25.3).
+
+**Resuelto:** la etiqueta roja "Falta el pago" de `standing-reservations.tsx`
+ya se apaga sola para un cliente al día. Las fechas de `upcomingBeyondPeriod`
+tienen su propio badge neutro ("N fuera del período") con una línea que
+explica que se confirman solas cuando llegue ese pago — no una nueva alerta.
+
+### `customer.ts` — `checkCanBookDetail(slotOccurrenceId)`
+
+Función nueva; `checkCanBook` no se toca. Devuelve
+`{ reason, makeupCreditId, makeupCreditExpiresOn }` sobre la RPC
+`can_customer_book_detail()`.
+
+**Resuelto:** `reservar/confirmar/page.tsx` muestra "esta reserva usa tu
+crédito de recupero, vence el DD/MM" antes del botón de confirmar, sólo
+cuando `makeupCreditExpiresOn` viene informado (sin ruido en el camino
+normal).
+
+`CanBookResult` suma `OUTSIDE_PLAN_QUOTA`, `OVER_PLAN_QUOTA` y
+`SERVICE_HAS_NO_PLAN`: la RPC ya los devolvía desde ADR-0024 y el tipo
+prometía menos motivos de los reales (`BOOKING_REASONS` ya sabía decirlos).
+
+### `customer.ts` — `releaseMyBooking` deja de afirmar un éxito que no ocurrió
+
+Ignoraba el error de la RPC y redirigía igual con `?liberado=1`. Ahora, si
+la llamada falla, redirige a `/me` sin ese parámetro.
+
+**Resuelto:** `/me` lee `?liberar_error=1` y muestra un `Alert` de error de
+verdad en vez de asumir éxito.
+
+### `settings.ts` — configuración del crédito de recupero
+
+`updateOrganizationSettings` acepta (opcionalmente, campo por campo)
+`makeupCreditsEnabled`, `releaseDeadlineHours`, `makeupCreditExpiry` y
+`makeupCreditExpiryDays`. Un formulario que no los manda deja la
+configuración como está.
+
+Es el reporte 4: ADR-0025 resolución 3 hizo el crédito **opt-in**
+(`organizations.makeup_credits_enabled` default `false`) y **nada en el
+producto lo escribía nunca** — ni una acción, ni un formulario. Así que para
+toda organización real el flag está en `false`, `issue_makeup_credit()` sale
+en su condición 1 y "liberar cupo" cancela la fecha sin emitir nada.
+
+**Resuelto:** controles nuevos en `/org/[slug]/settings/settings-form.tsx`
+(toggle + anticipación mínima + tipo de vencimiento), gateados a OWNER.
+
+### `billing.ts` — mensajes para los rechazos nuevos
+
+`PAYMENT_DUPLICATE_PERIOD`, `PAYMENT_DUPLICATE_OCCURRENCE` y
+`SERVICE_PLAN_SCOPE_EMPTY` se traducen a texto de mostrador en vez de caer
+en el genérico "No se pudo registrar el pago".

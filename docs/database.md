@@ -589,3 +589,234 @@ por la misma razón que antes (sin eso, sus propias filas seguirían dentro
 de la ventana de 1h en la corrida siguiente). Verificado corriendo la
 suite completa de integración (164 tests, 18 archivos) contra
 `supabase db reset` local.
+
+---
+
+## Fase 25 — correcciones sobre el feedback del primer cliente en producción
+
+Migración: `20260923120000_phase25_payment_duplicates_and_billing_horizon.sql`.
+Ninguna decisión nueva: cada bloque repara una implementación que se había
+apartado del ADR que la define. Test: `test/phase25.production-feedback.test.ts`.
+
+### 1. `check_payment_same_org()` — un plan multi-servicio era invendible
+
+ADR-0029 dejó `payments.service_id` como columna **derivada y nullable**:
+`check_payment_plan_consistency()` la completa sólo cuando el plan cubre
+exactamente un servicio, y la deja en `NULL` cuando cubre varios (la
+cobertura real vive en `payment_service_coverage`).
+`check_payment_same_org()` es de la Fase 7, de cuando `service_id` era
+obligatorio, y hacía `if v_service_org is null ... raise`. Los dos triggers
+son `BEFORE INSERT` y corren en orden alfabético
+(`payments_plan_consistency` < `payments_same_org`), así que el segundo veía
+el `NULL` que el primero acababa de poner **a propósito** y rechazaba el
+insert. Resultado verificado contra la base local: **todo** pago de un plan
+`applies_to_all_services` (o con dos o más servicios) fallaba con
+`Payment organization_id must match its Customer and Service`, que en la
+pantalla se lee como el genérico "No se pudo registrar el pago".
+
+Ahora, con `service_id` nulo, se valida el conjunto cubierto por el plan
+contra la organización del pago (`SERVICE_PLAN_SCOPE_EMPTY` si el plan no
+cubre nada). La garantía de tenant es la misma; lo que cambia es sobre qué
+se expresa.
+
+### 2. `check_payment_no_duplicate()` — doble cobro sin depender de `PAID`
+
+El `EXCLUDE` de ADR-0024 (hoy `payment_service_coverage_no_overlap`) y el
+índice único por ocurrencia filtran por `status = 'PAID'`. Dos pagos
+`PENDING` idénticos del mismo cliente, servicio y período entraban sin
+ninguna protección, y dos pagos de turno suelto sobre la misma ocurrencia
+también mientras no fueran `PAID` — el hueco que ADR-0027 ya tenía anotado.
+
+Trigger nuevo `payments_no_duplicate` (`AFTER INSERT`), que rechaza con
+`PAYMENT_DUPLICATE_PERIOD` / `PAYMENT_DUPLICATE_OCCURRENCE`. Dos decisiones
+de implementación, con su motivo:
+
+- **Trigger y no ampliar el `EXCLUDE` a `status <> 'VOID'`.** Ampliar el
+  predicado obliga a validar todas las filas históricas en el deploy, y una
+  organización que ya tenga dos `PENDING` solapados (exactamente el bug que
+  se corrige) haría fallar la migración o forzaría a anular datos reales sin
+  que nadie los mire. "Nada se borra" incluye "nada se anula solo". Los dos
+  mecanismos de ADR-0024 quedan **intactos**: siguen siendo la defensa a
+  prueba de carreras del caso que mueve plata.
+- **Sólo `INSERT`.** En `UPDATE`, marcar pagado un `PENDING` que solapa con
+  otro ya lo rechaza el `EXCLUDE`; agregar un rechazo nuevo sobre ese camino
+  —cuya acción de frontend hoy ignora el error— convertiría un error visible
+  en un botón que no hace nada.
+
+Un pago `VOID` no cuenta: corregir un error de carga sigue siendo
+anular y volver a cargar.
+
+### 3. `customer_billing_horizon()` + `schedule_rule_standing_reservations()`
+
+`upcoming_unpaid` contaba **todas** las fechas futuras `NOT_GENERATED /
+PAYMENT_REQUIRED` de la ventana rodante (90 días, ADR-0009). Un pago mensual
+nunca cubre noventa días, así que el contador era `> 0` para toda reserva
+fija de todo cliente, siempre, y la etiqueta roja "Falta el pago" no tenía
+forma de apagarse ni para alguien al día. Es el reporte 1 del cliente.
+
+`customer_billing_horizon(customer, service, hoy)` devuelve hasta cuándo
+alcanza lo que el cliente ya compró: el `period_end` de su cobertura `PAID`
+vigente; si no tiene, el `period_end` que `billing_period_for()` da para el
+plan de su último pago no anulado; y si nunca pagó nada de ese servicio, el
+fin del mes calendario. `upcoming_unpaid` se corta ahí y la función devuelve
+una columna nueva, **`upcoming_beyond_period`**, con las fechas de más
+adelante: no son deuda, todavía no se facturan.
+
+**El motor de decisión no tenía este problema y quedó verificado**: con un
+pago que cubre 60 días, `evaluate_customer_booking()` responde `OK` para
+cada fecha dentro del período, incluida una clase de las 21:00 del último
+día del mes (00:00 UTC del día 1 siguiente, ADR-0014). El bug estaba en el
+contador de la pantalla, no en la cobertura.
+
+### 4. `customer_payment_detail()` — `LEFT JOIN`, no `INNER`
+
+Joineaba `services` por `payments.service_id` con `INNER JOIN`, así que un
+pago de plan multi-servicio (`service_id` nulo, §1) desaparecía de la
+pantalla de pagos. Un pago invisible es indistinguible de uno que no se
+registró. Ahora el nombre cae al del plan.
+
+### 5. `can_customer_book_detail()` — el veredicto positivo, con su crédito
+
+ADR-0025 §2.4.3 hace viajar el veredicto como par `(reason,
+makeup_credit_id)` porque seis funciones comparan `= 'OK'`.
+`can_customer_book()` devuelve sólo el enum, así que el portal mostraba
+"Reservar" y **gastaba el crédito de recupero en silencio**. La RPC nueva
+devuelve `(reason, makeup_credit_id, makeup_credit_expires_on)` y sólo
+informa el crédito cuando la cobertura por sí sola no alcanzaba — nunca se
+gasta un crédito si otra cobertura llegaba, así que un `OK` común no informa
+ninguno. No reimplementa ninguna regla: llama a las mismas funciones que
+`book_slot()`. `revoke ... from public, anon` + `grant to authenticated`
+(ADR-0028).
+
+### Revisión de `security-engineer` — cuatro fixes sobre la migración de arriba
+
+`security-engineer` verificó **empíricamente** (transacciones `psql`
+concurrentes reales) que la versión inicial de `check_payment_no_duplicate()`
+(§2) no era atómica. Cuatro fixes, todos en la misma migración:
+
+**Fix 1 — `check_payment_no_duplicate()` no era atómica.** Bajo Read
+Committed, dos `INSERT` concurrentes del mismo pago `PENDING` pasaban los
+dos: mismo TOCTOU que ADR-0004 cazó en `book_slot()`. El caso que mueve
+plata (`PAID`) sigue protegido por el `EXCLUDE` declarativo de ADR-0024, sin
+tocar.
+
+Serializa con `pg_advisory_xact_lock(hashtext(new.customer_id::text))`. La
+primera versión probada usaba `select ... from customers where id = ... for
+update` (lock de fila real sobre el `Customer` padre, sin advisory lock
+"porque hay fila padre real") — y **deadlockeaba** bajo el test de
+concurrencia (`Promise.all` con 6 inserts): el trigger corre `AFTER INSERT`,
+así que para cuando llega ahí el chequeo de FK de `payments.customer_id` ya
+tomó un `FOR KEY SHARE` implícito sobre esa fila **en la misma transacción**;
+pedir después un `FOR UPDATE` sobre la misma fila es un *upgrade* de lock, y
+con varias transacciones concurrentes cada una ya sosteniendo su propio `FOR
+KEY SHARE` y esperando que las demás lo suelten para subir a `FOR UPDATE`, la
+espera es circular → `deadlock detected`, reproducido de verdad, no en
+teoría. El advisory lock es una primitiva aparte que no interactúa con el
+locking de fila/FK de Postgres — mismo patrón que
+`generate_all_slot_occurrences()` (Fase 3) y
+`submit_platform_contact_request()` (Fase 24), pero acotado por
+`customer_id` en vez de global, para no serializar clientes sin relación
+entre sí.
+
+Test de concurrencia (mismo patrón que Fase 24): `Promise.all` con 6 inserts
+simultáneos del mismo pago `PENDING`, verifica que entra exactamente 1 y el
+resto rechaza con `PAYMENT_DUPLICATE_PERIOD`.
+
+**Fix 2 — evasión por `VOID` → `PENDING`.** El trigger sólo corría en
+`INSERT`, así que un pago se podía insertar como `VOID` (aceptado, correcto)
+y después revivir a `PENDING` vía `set_payment_status()` o un `PATCH`
+directo, dejando un duplicado sin que nada lo note. Dos triggers en vez de
+uno con `INSERT OR UPDATE`: Postgres rechaza (`SQLSTATE 42P17`) un `WHEN` que
+referencia `OLD` en un trigger cuyo conjunto de eventos incluye `INSERT`,
+aunque el evento combinado también incluya `UPDATE` — confirmado corriendo la
+migración. `payments_no_duplicate` sigue siendo `AFTER INSERT WHEN (new.status
+<> 'VOID')`; `payments_no_duplicate_on_resurrect` es nuevo, `AFTER UPDATE
+WHEN (old.status = 'VOID' and new.status <> 'VOID')` — no dispara en
+transiciones normales (p. ej. `PENDING` → `PAID`) que no reviven nada.
+
+**Fix 3 — `can_customer_book_detail()` re-derivaba la compuerta de
+crédito.** Comparaba `evaluate_payment_coverage(...) <> 'OK'` a mano en vez
+de leer el veredicto de `evaluate_payment_coverage_with_credit()`, el
+resolutor canónico. No era explotable (la condición daba el mismo resultado),
+pero era riesgo de divergencia silenciosa si algún día cambia la lista blanca
+de motivos que habilitan el crédito. Ahora llama directo a
+`evaluate_payment_coverage_with_credit(v_customer_id, v_service_id,
+p_slot_occurrence_id, null, false, true)` y lee `makeup_credit_id` de su
+resultado.
+
+**Fix 4 — piso del `CHECK` de `release_deadline_hours`.** El action
+`updateOrganizationSettings` valida 1–720, pero el `CHECK` de la tabla
+(Fase 20) permitía 0–720, y `organizations` es editable directo por el OWNER
+vía PostgREST (`organizations_update_owner`, ADR-0013) — el piso real era 0,
+no 1: un OWNER podía poner `release_deadline_hours = 0` sin pasar por el
+action, vaciando la política de ADR-0025 (el crédito se emitiría cancelando
+en la puerta). `organizations_release_deadline_hours_range` ahora exige
+`between 1 and 720`.
+
+### Ronda final — el mismo hueco, un nivel más abajo: `services`
+
+`security-engineer` verificó el estado real desplegado y encontró que el Fix 4
+de arriba dejaba a mitad de camino el mismo problema en `services`: los cuatro
+overrides de política de crédito de recupero (`makeup_credits_enabled_override`,
+`release_deadline_hours_override`, `makeup_credit_expiry_override`,
+`makeup_credit_expiry_days_override`, todos de Fase 20) heredan el `CHECK`
+laxo y, peor, son escribibles por **cualquier miembro** de la organización, no
+sólo el `OWNER`.
+
+**Fix 5 — piso del `CHECK` de `services.release_deadline_hours_override`.**
+Mismo problema que el Fix 4, un nivel más abajo:
+`services_release_deadline_hours_override_range` (Fase 20) seguía en 0–720.
+`resolve_makeup_credits_policy()` hace
+`coalesce(s.release_deadline_hours_override, o.release_deadline_hours)`, así
+que un override en `0` a nivel `Service` vacía la política exactamente igual
+que `organizations.release_deadline_hours = 0` — el Fix 4 no lo cubría porque
+es una columna distinta con su propio `CHECK`. Ahora exige `between 1 and 720`
+igual que `organizations`.
+
+**Fix 6 — los overrides de política de crédito de `services` pasan a ser de
+`OWNER`, no de `STAFF`.** `services_write_staff` (Fase 2) es `for all using
+(is_organization_member(organization_id))` — correcto para columnas
+operativas (nombre, descripción, capacidad), pero esas cuatro columnas son
+política de negocio: encienden/ajustan el crédito de recupero para **ese**
+`Service` puntual, pisando el default de la organización (ADR-0025
+resolución 3, "opt-in explícito del dueño"). Sin este fix, cualquier `STAFF`
+podía hacer
+`PATCH /rest/v1/services?id=eq.<X> {"makeup_credits_enabled_override": true, "release_deadline_hours_override": 1}`
+directo por PostgREST con su propio JWT y encender el crédito para ese
+servicio aunque el `OWNER` tuviera el interruptor general apagado, además de
+vaciar la anticipación con `1` — exactamente lo que esa resolución vino a
+impedir. La policy de `UPDATE` no puede pasar a OWNER-only completa (el resto
+de columnas de `services` sigue necesitando ser editable por `STAFF`), así
+que el chequeo va en un trigger nuevo, por columna, no en la policy:
+`check_service_billing_override_owner()` (`BEFORE UPDATE`) compara `new` vs.
+`old` de las cuatro columnas con `is distinct from` y, si alguna cambió,
+exige `is_organization_owner(new.organization_id)` — misma función que ya usa
+`organizations_update_owner` — o rechaza con `NOT_AUTHORIZED`. Cualquier otra
+columna de `services` sigue sin este chequeo.
+
+**Fix 3 (revisión), menor — comentario del test de concurrencia desactualizado.**
+El comentario de `test/phase25.production-feedback.test.ts` decía que el fix
+"lockea la fila del Customer (`for update`) antes del SELECT" — es la versión
+que se probó primero y **deadlockeaba** (ver Fix 1 arriba); la que quedó es un
+advisory lock por `customer_id`. Corregido para que el comentario del test
+describa lo mismo que este documento.
+
+No tocado (hallazgos preexistentes, anotados para una fase futura, evaluados
+y aceptados como fuera de alcance de esta ronda por `security-engineer`):
+`payments_no_duplicate_on_resurrect` (Fix 2) no cubre la edición de período de
+un pago que ya está en un estado no-`VOID` (sólo dispara en la transición
+`VOID` → no-`VOID`); staleness de `payment_service_coverage` cuando se edita
+`payments.customer_id`/`service_plan_id` (Fase 22); y el `grant PUBLIC` inerte
+en funciones de trigger (informativo).
+
+Test nuevo para el Fix 5 (mismo patrón que el de `organizations.release_deadline_hours`,
+sobre el override de `services`) y test nuevo para el Fix 6 (un `STAFF`
+intentando tocar cualquiera de las cuatro columnas de override falla con
+`NOT_AUTHORIZED`; un `OWNER` puede; una columna operativa como `name` sigue
+editable por `STAFF`), ambos en
+`test/phase25.production-feedback.test.ts`.
+
+Verificado: `npx supabase db reset` completo aplica limpio desde cero (incluido
+el `drop function schedule_rule_standing_reservations(uuid)` de §3), y la
+suite de integración completa (182 tests, 19 archivos) pasa con
+`--no-file-parallelism`.

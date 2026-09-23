@@ -368,7 +368,99 @@ tabla futura de esta clase:
    simultáneos) en `test/phase24.platform-contact-requests.test.ts`.
    **Sigue pendiente, fuera de alcance de esta ronda:**
    `issue_customer_activation()` (Fase 21) tiene el mismo patrón no
-   atómico y no se tocó acá.
+   atómico y no se tocó acá. **Y desde la Fase 25,
+   `check_payment_no_duplicate()`** — ver abajo.
+
+   **La regla no es solo del rate limit.** Vale para *cualquier*
+   invariante de unicidad que se implemente como `select ... where
+   <existe otro>` + `raise` dentro de un trigger o una función, en vez
+   de como índice único / `EXCLUDE`. Bajo Read Committed una transacción
+   no ve la fila no commiteada de la otra, así que dos requests
+   simultáneos idénticos pasan los dos. Si el invariante no puede ser
+   una restricción declarativa, el chequeo necesita
+   `pg_advisory_xact_lock()` o un `select ... for update` sobre una fila
+   padre común.
+
+   **Resuelto en `check_payment_no_duplicate()` (Fase 25), y con una
+   corrección al párrafo anterior:** la fila padre común de un `Payment`
+   es su `Customer`, pero `select ... for update` sobre ella
+   **deadlockea** — el trigger corre `AFTER INSERT`, para entonces el
+   chequeo de FK de `payments.customer_id` ya dejó a esa misma
+   transacción sosteniendo un `FOR KEY SHARE` sobre la fila, y pedir
+   después `FOR UPDATE` es un upgrade de lock que con N inserts
+   concurrentes se vuelve espera circular (reproducido, no teórico; ver
+   `docs/database.md` § Fase 25). Se usa
+   `pg_advisory_xact_lock(hashtext(customer_id::text))` **antes** del
+   `select` que detecta el duplicado y dentro de la misma transacción.
+   **Regla general que deja escrita:** para serializar un chequeo dentro
+   de un trigger `AFTER INSERT/UPDATE`, el lock de fila sobre un padre
+   referenciado por FK desde la propia fila insertada no es una opción —
+   usar advisory lock. La colisión de `hashtext` (32 bits) entre dos
+   `customer_id` distintos es sólo contención: dos filas sólo pueden ser
+   duplicadas entre sí si comparten `customer_id`, así que el par en
+   conflicto siempre cae en la misma clave y una colisión nunca deja
+   pasar un duplicado, sólo serializa de más a dos clientes que no se
+   pisaban.
+
+## Fase 25 — niveles de acceso de las funciones nuevas
+
+Ninguna decisión nueva; se registra el nivel que quedó verificado en
+base local (`pg_proc.proacl`), para que no haya que re-derivarlo.
+
+| Función | Nivel | Cómo se resuelve la identidad |
+|---|---|---|
+| `customer_billing_horizon(uuid,uuid,date)` | **interna** — `execute` solo para el owner (`postgres`); revocada de `public, anon, authenticated, service_role` | no resuelve identidad: es un helper puro, invocado owner-a-owner desde `schedule_rule_standing_reservations()`, que sí gatea con `is_organization_member()`. Mismo patrón que `service_plan_covered_service_ids()` / `resolve_usable_makeup_credit()`. No debe volverse alcanzable desde PostgREST. |
+| `can_customer_book_detail(uuid)` | **CUSTOMER** — `revoke from public, anon` + `grant to authenticated` (ADR-0028) | **solo `auth.uid()`**, igual que `can_customer_book()` (ADR-0005). El único parámetro es el `slot_occurrence_id`, que no nombra ninguna fila de cliente: la organización sale de la ocurrencia y el `Customer` sale de `(organization_id, auth.uid(), is_active)`. Con una ocurrencia de otra organización devuelve `NOT_A_CUSTOMER` y nunca llega al bloque de crédito. |
+| `schedule_rule_standing_reservations(uuid)` | **ADMIN** — `is_organization_member()` dentro del `where`; el `drop`+`create` por cambio de firma re-aplica `revoke from public, anon` + `grant to authenticated` (ADR-0028: `DROP` resetea privilegios) | membership sobre `schedule_rules.organization_id`. |
+
+**Configuración de crédito de recupero (`organizations.makeup_credits_enabled`,
+`release_deadline_hours`, `makeup_credit_expiry`,
+`makeup_credit_expiry_days`): OWNER.** El gate real no es el `if
+membership.role !== "OWNER"` del server action sino
+`organizations_update_owner` (`for update using
+is_organization_owner(id)`, sin `with check` separado, así que el `using`
+oficia de check) — un `STAFF` no puede escribir esas columnas ni por
+PostgREST directo. El server action es el mensaje de error, no la
+frontera.
+
+**Límite conocido (parcialmente resuelto en Fase 25):** los rangos que
+valida `updateOrganizationSettings` eran más estrictos que los `CHECK` de
+la tabla, y `organizations` tiene policy de UPDATE directa, así que un
+OWNER podía saltear el action por PostgREST y poner
+`release_deadline_hours = 0` —exactamente lo que el comentario del código
+llama "la política entera"—. Aplica la regla de ADR-0030 §2 (los bounds
+de la capa de aplicación espejan el `CHECK`, porque la tabla/RPC es
+alcanzable sin pasar por el Server Action).
+
+- **Resuelto:** `organizations_release_deadline_hours_range` pasó a
+  `between 1 and 720` (migración de Fase 25), igualando el action.
+- **Abierto:** `makeup_credit_expiry_days` sigue ≤ 365 en el action y sin
+  tope en el `CHECK` (sólo `>= 1`).
+- **Resuelto (ronda final de Fase 25):** los overrides por servicio de
+  esta misma política viven en `services`
+  (`makeup_credits_enabled_override`, `release_deadline_hours_override`,
+  `makeup_credit_expiry_override`, `makeup_credit_expiry_days_override`)
+  y `resolve_makeup_credits_policy()` los resuelve con `coalesce(override,
+  organización)`. Como `services_write_staff` es `for all using
+  is_organization_member(...)`, un STAFF podía antes `PATCH
+  /rest/v1/services?id=eq.<X>` con `{"makeup_credits_enabled_override":
+  true, "release_deadline_hours_override": 0}` y encender créditos de
+  recupero —opt-in del OWNER, ADR-0025 resolución 3— con anticipación
+  cero para ese servicio. **Regla que esto dejó escrita: un override por
+  servicio hereda el nivel de acceso de `services` salvo que algo lo
+  corrija explícitamente.** Cerrado con dos fixes en la misma migración
+  de Fase 25: `services_release_deadline_hours_override_range` pasó a
+  `between 1 and 720` (igual que `organizations`), y el trigger
+  `services_billing_override_owner` (`check_service_billing_override_owner()`,
+  `BEFORE UPDATE`) exige `is_organization_owner(organization_id)` cuando
+  cualquiera de las 4 columnas de override cambia — el resto de columnas
+  de `services` sigue editable por cualquier member. Con test dedicado:
+  STAFF rechazado en las 4 columnas, OWNER puede, `name` (columna
+  operativa) sigue editable por STAFF. Residual, sin cerrar a propósito
+  (alcance pedido era `BEFORE UPDATE`): un `INSERT` de `Service` no pasa
+  por este trigger — hoy no explotable porque ningún RPC/action inserta
+  un `Service` con estas columnas ya pobladas, pero si alguna vez existe
+  ese camino, el trigger necesita extenderse a `BEFORE INSERT OR UPDATE`.
 
 ## Pendiente de definir (Phase 1)
 
