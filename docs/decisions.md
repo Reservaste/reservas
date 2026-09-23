@@ -2269,3 +2269,43 @@ implementable con el enum `STAFF`/`OWNER` liso.
 **Implementación**: pendiente, con revisión obligatoria de
 `security-engineer` antes de cerrarse (token portador + acceso a datos
 de terceros).
+
+## ADR-0035 — La solicitud de cambio de plan no es el cambio
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario ("si excedo
+frecuencia de plan, ofrecer upgrade/downgrade de planes y redireccionar
+a planes"). Implementación completa en la migración Fase 28
+(`docs/database.md`).
+
+**El problema**: sin cobro online (ADR-0027 bloqueada por elección de
+pasarela), dejar que un cliente cambie de plan por su cuenta implicaría
+crear cobertura (`Payment` PAID + `payment_service_coverage`) que nadie
+cobró — exactamente lo que "pago ≠ permiso" (ADR-0005/ADR-0013) existe
+para impedir. Y relajar el `EXCLUDE` de `payment_service_coverage` para
+que el cliente pueda anular su propio pago ya fue descartado como
+alternativa en ADR-0024.
+
+**Decisión**: `plan_change_requests` registra un **hecho accionable**
+("este cliente pidió cambiarse a este plan"), no una cobertura. **Ninguna
+función de decisión de reserva la lee** — un pedido pendiente no habilita
+ni bloquea ninguna reserva. El cliente ve el catálogo público de planes
+de un servicio y pide el cambio; el mostrador lo cobra como ya cobra
+cualquier alta/cambio de plan hoy (`RegisterPaymentForm`, VOID +
+recargar de ADR-0024), y ese pago cierra el pedido solo (trigger
+`after insert on payments`). Mismo patrón que el lead de `/contacto`
+(ADR-0030, Fase 24) pero dentro del portal, con identidad real (autor
+= `Customer` autenticado, no anónimo — alcanza un índice único parcial
++ tope de 5 pendientes, sin necesitar rate limit por IP).
+
+Sin este ADR, la alternativa "el cambio se aplica solo, sin cobro" habría
+sido más rápida de construir pero rompía dos invariantes ya cerradas del
+producto — no era una opción real, era la misma pregunta de ADR-0024
+resolución 1 vuelta a abrir desde otro ángulo.
+
+**Implementación**: backend completo (Fase 28, 214/214 tests). Pendiente:
+`frontend-engineer` (pantalla de catálogo + redirigir el rechazo de
+cuota ahí, en vez de a "ver mi plan actual" como está hoy) y
+`security-engineer` (RLS de la tabla nueva, disclosure del catálogo
+público, el trigger sobre `payments`).

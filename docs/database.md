@@ -883,3 +883,154 @@ Test: `test/phase27.organization-slug-format.test.ts` (6 casos —
 caso feliz). Verificado: `npx supabase db reset` limpio desde cero y la
 suite de integración completa (194 tests, 21 archivos) pasa con
 `--no-file-parallelism`.
+
+## Fase 28 — catálogo de planes para el cliente y `plan_change_requests` (feedback de producción, migración `20260923150000_phase28_plan_catalog_and_change_requests.sql`)
+
+Feedback: *"si excedo frecuencia de plan, ofrecer upgrade/downgrade de
+planes y redireccionar a planes"*. Antes de esta fase, un rechazo
+`OVER_PLAN_QUOTA`/`OUTSIDE_PLAN_QUOTA` sólo ofrecía "Ver mi plan"
+(`/me/servicios`), que muestra el plan que ya tiene — justo el que no le
+alcanza — y el único lugar donde existían los demás planes era
+`/org/:slug/plans`, admin-only.
+
+**La migración no toca el motor de reservas.** Ni una línea de
+`evaluate_customer_booking()`, `evaluate_payment_coverage()`,
+`payment_covers_slot()` o `assert_series_within_plan_quota()`. Es
+aditiva: una función de lectura y una tabla que **ninguna función de
+decisión lee**.
+
+### `public_service_plans(p_organization_slug, p_service_id default null)`
+
+La lista de precios que la organización publica: planes `is_active`, con
+`name`, `description`, `price`, `currency` (de `organizations`, ADR-0024
+resolución 2), `plan_kind`, `weekly_quota`, `quota_scope`,
+`billing_type`/`billing_cycle`, y el conjunto cubierto ya resuelto
+(`service_ids[]`, `service_names[]`).
+
+RPC y no vista, por tres razones concretas:
+
+1. `applies_to_all_services` (ADR-0029) se resuelve en vivo contra los
+   servicios **activos**, y el helper que ya sabe hacerlo
+   (`service_plan_covered_service_ids()`) está revocado de todos los roles
+   a propósito (ADR-0026 resolución 7): resuelve contra todos los
+   servicios sin mirar quién pregunta. La función nueva es `SECURITY
+   DEFINER` y hace el mismo `union` con `s.is_active` adentro.
+2. Una selección explícita (`service_plan_services`) puede incluir un
+   servicio desactivado después. Ese servicio **no** sale al público —
+   `services_public` tampoco lo muestra.
+3. Un plan cuyos servicios cubiertos están todos inactivos se omite
+   entero (`cardinality(covered.ids) > 0`): sería un precio sin nada que
+   reservar detrás.
+
+No amplía disclosure: `service_plans_select_public` (Fase 22) ya deja leer
+los planes activos por PostgREST a `anon`. `grant execute ... to anon,
+authenticated`.
+
+`p_service_id` filtra a los planes que cubren ese servicio — la forma que
+necesitan las pantallas de rechazo, donde la persona está parada frente a
+un servicio.
+
+### `plan_change_requests` — el pedido, no el cambio
+
+El cambio de plan real sigue siendo **VOID + recargar** (ADR-0024
+resolución 1), o sea una operación de dinero del mostrador. Sin cobro
+online (ADR-0027, bloqueada por elección de pasarela), un cambio que se
+aplicara solo tendría que crear cobertura que nadie cobró — exactamente
+lo que "pago ≠ permiso" (ADR-0005/ADR-0013) existe para impedir. Así que
+la tabla registra un **hecho accionable para el negocio**, con el patrón
+de lead de `platform_contact_requests` (Fase 24) pero dentro del portal y
+con identidad real: el autor es un `Customer` autenticado, así que no hace
+falta rate limit por IP.
+
+```
+plan_change_requests(
+  id, organization_id, customer_id,
+  service_plan_id,            -- lo que pide (ON DELETE RESTRICT)
+  current_service_plan_id,    -- lo que lo cubre hoy, resuelto en la base
+  note, created_at,
+  resolved_at, resolved_by, resolution  -- APPLIED | DISMISSED
+)
+```
+
+- `current_service_plan_id` **nunca viene del caller**: lo resuelve
+  `request_plan_change()` con `resolve_covering_service_plan()` sobre los
+  servicios que cubre el plan pedido, en la **fecha local de la
+  organización** (ADR-0014). Es lo que convierte la fila en "upgrade" o
+  "downgrade" a ojos del mostrador. `null` = no tenía ninguno vigente, que
+  también es información.
+- Índice único parcial `(customer_id, service_plan_id) where resolved_at
+  is null`: el doble click y el "insisto" no son dos ventas.
+- `plan_change_requests_resolution_consistent`: nunca resuelta sin decir
+  cómo, nunca un resultado sin fecha (mismo par que
+  `cancelled_at`/`cancelled_by`).
+- Trigger `check_plan_change_request_same_org()`: cliente y planes de la
+  misma organización que la fila.
+- RLS de dos capas (ADR-0006): `select` para el propio cliente o un
+  miembro de la organización; **cero policies de escritura** — cada fila
+  nace y se cierra por RPC `SECURITY DEFINER`, igual que `makeup_credits`.
+
+### Las cuatro RPCs
+
+| Función | Nivel | Qué hace |
+|---|---|---|
+| `request_plan_change(p_service_plan_id, p_note)` | CUSTOMER | Resuelve el `Customer` desde `auth.uid()` (ADR-0005, nunca un `customerId` del caller). Rechaza plan inactivo (`SERVICE_PLAN_NOT_AVAILABLE`), no-cliente (`NOT_A_CUSTOMER`), organización inactiva, nota > 500 y pedir el plan que ya lo cubre (`ALREADY_ON_PLAN`). **Idempotente**: repetir un pedido pendiente devuelve el mismo. Tope de 5 pendientes por cliente bajo `pg_advisory_xact_lock` (mismo patrón que `submit_platform_contact_request()`). |
+| `my_plan_change_requests()` | CUSTOMER | Los propios, pendientes primero. Sin esto el botón es un agujero negro. |
+| `organization_plan_change_requests(p_organization_id, p_include_resolved)` | ADMIN | Con el plan vigente al lado del pedido. `is_organization_member()` dentro del `WHERE`: un no-miembro recibe lista vacía, nunca la de otro. |
+| `resolve_plan_change_request(p_request_id, p_resolution)` | ADMIN | `APPLIED`/`DISMISSED`. Idempotente: no pisa quién ni cuándo la cerró. Miembro (no OWNER-only): cerrar un pedido es trabajo de mostrador y no cambia ningún precio. |
+
+### El pago del plan pedido cierra el pedido
+
+Trigger `payments_close_plan_change_request` (`after insert on payments`,
+función `close_plan_change_request_on_payment()`): si el pago no es `VOID`
+y tiene `service_plan_id`, marca `APPLIED` el pedido **pendiente** de ese
+`(customer_id, service_plan_id)`. Sin esto, vender el plan nuevo deja el
+pedido abierto y la lista de pendientes se llena de trabajo ya hecho — el
+mostrador dejaría de mirarla en una semana.
+
+Sólo escribe en `plan_change_requests`: no valida el pago, no puede
+rechazarlo y no participa de ninguna decisión de cobertura. Re-cobrar el
+mismo plan más adelante no pisa una resolución anterior (el `WHERE` exige
+pendiente).
+
+Test: `test/phase28.plan-catalog-and-change-requests.test.ts` (19 casos:
+catálogo público, filtro por servicio con `applies_to_all_services`,
+aislamiento cross-tenant, `NOT_A_CUSTOMER`/`ALREADY_ON_PLAN`/plan
+inactivo/plan ajeno, idempotencia, RLS self-or-staff, escritura directa
+rechazada, cierre automático por pago, cierre manual idempotente, y que
+pedir un cambio **no mueve** lo que el cliente puede reservar).
+Verificado: `npx supabase db reset` limpio desde cero + suite de
+integración completa (214 tests, 22 archivos).
+
+## Fase 29 — `my_bookings()`: identidad de la ocurrencia y color de servicio (migración `20260923160000_phase29_my_bookings_slot_identity.sql`)
+
+Cierre pendiente de la agenda real de `/me` (Fase 23-ish): `my_bookings()`
+no traía `slot_occurrence_id` ni `service_id`, así que el frontend
+deduplicaba una reserva propia contra `get_public_availability()`
+comparando `startAt + serviceName` (`occurrenceKey()` en
+`frontend/lib/my-agenda.ts`) — un heurístico documentado como aceptable
+pero evitable. Tampoco traía `service_color`, así que no había forma de
+pintar el bloque de la reserva propia con el mismo color que la
+disponibilidad pública del mismo servicio (`services.color`, Fase 14/16).
+
+`my_bookings(p_include_past boolean)` gana tres columnas —
+`slot_occurrence_id`, `service_id`, `service_color` — sin tocar el `WHERE`
+ni ninguna regla de negocio. `DROP FUNCTION` + `CREATE` (no `CREATE OR
+REPLACE`): agrega columnas al resultado, y Postgres no permite cambiar los
+`OUT` parameters de una función con `REPLACE` (mismo motivo ya documentado
+en Fase 11 al agregar `not_generated_reason`).
+
+**Nota de seguridad:** `DROP FUNCTION` borra el objeto y con él sus
+privilegios — Postgres otorga `EXECUTE` a `PUBLIC` por default en una
+función nueva. Fase 19 (security fix) había revocado explícitamente
+`PUBLIC`/`anon` sobre `my_bookings(boolean)`; la migración repite ese
+`revoke` después del `create` para no reabrir la función a un rol anónimo.
+Verificado en local: `has_function_privilege('anon', ..., 'EXECUTE')` →
+`false`, `has_function_privilege('authenticated', ..., 'EXECUTE')` →
+`true`.
+
+No hay migración de datos ni cambio de tabla — `slot_occurrence_id` y
+`service_id` ya estaban disponibles vía los `join` existentes
+(`slot_occurrences`, `services`); solo faltaba proyectarlos.
+
+Verificado: `npx supabase db push --local` limpio + suite de integración
+completa (214 tests, 22 archivos) contra la función recreada.

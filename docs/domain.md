@@ -99,6 +99,20 @@ La plataforma es genérica. **Nunca** modelar `Gym`, `Member`, `Trainer`,
   (ADR-0004) — ese lock serializa una `SlotOccurrence`, no dos ocurrencias
   distintas que el mismo `Customer` reserve a la vez, que es justo donde
   un crédito se gastaría dos veces sin su propio candado.
+- **PlanChangeRequest** — Fase 28 (feedback de producción). El pedido de un
+  `Customer` para pasarse a otro `ServicePlan`. **No es el cambio**: el
+  cambio real sigue siendo VOID + recargar del mostrador (ADR-0024
+  resolución 1), porque es una operación de dinero y todavía no hay cobro
+  online (ADR-0027, bloqueada). Por eso **ninguna función de decisión de
+  reserva la lee**: un pedido pendiente no habilita ni bloquea una sola
+  reserva — es un hecho accionable para el negocio, no una cobertura.
+  Guarda el plan pedido y el plan **vigente resuelto en la base** al
+  momento de pedir (nunca enviado por el caller), que es lo que la
+  convierte en "upgrade" o "downgrade" a ojos del mostrador. Un solo
+  pedido pendiente por `(Customer, ServicePlan)`. Se cierra con
+  `APPLIED`/`DISMISSED`, y registrar el pago del plan pedido la cierra
+  sola. Genérica por construcción: es "quiero otro plan", no nada de
+  gimnasio.
 - **Payment** — el movimiento/estado económico real de un `Customer`
   (pagó, pendiente, vencido). Su **ancla de registro es `servicePlanId`**
   (ADR-0024): es lo que hace contestable no sólo "¿de qué servicio es este

@@ -297,3 +297,210 @@ Site URL del proyecto y la intención con la que la persona se registró se
 perdía ahí: el cliente gestionado que se registra **para** activar volvía a
 la home y nunca a `/activar/continuar`. Aplica a todo signup con
 `returnTo`, no sólo a la activación (ADR-0015 tenía el mismo agujero).
+
+---
+
+## Horario fijo — camino rápido sin preview (`standing.ts`)
+
+Pedido del usuario: asignar un cupo fijo no tiene por qué pasar por la
+lista de las próximas 8 fechas, y la serie "va a futuro
+indeterminadamente".
+
+**Nada de esto necesitó migración.** El estado real antes del cambio:
+
+- `recurring_bookings.end_date` es `date` **nullable** desde Fase 6 y
+  `admin_create_recurring_booking(p_schedule_rule_id, p_customer_id)` no
+  lo recibe ni lo escribe: **toda serie nace sin fecha de fin**, y la
+  ventana rodante de ADR-0009 le va agregando fechas mientras esté
+  `ACTIVE` (`generate_slot_occurrences_for_rule()` genera el `Booking` de
+  cada ocurrencia nueva para cada `recurring_booking` activo de la regla).
+  La pantalla nunca ofreció una fecha de corte: lo que faltaba era
+  **decirlo**, no soportarlo. Pinneado en
+  `backend/test/phase11.standing-reservations.test.ts` ("the series has no
+  end date…").
+- El preview nunca fue una validación, sólo información:
+  `createStandingReservation` sólo necesita `customerId`, y membresía,
+  pertenencia del cliente, serie duplicada y cupo del plan se verifican
+  dentro de la RPC. Saltearlo no abre ningún agujero.
+
+### `StandingActionState.summary` (campo nuevo, opcional)
+
+`createStandingReservation` devuelve ahora, cuando la serie se creó,
+`summary: StandingCreateSummary`:
+
+```ts
+{ confirmed, pending, unpaid, overQuota, beyondPeriod, unavailable }
+```
+
+`unpaid + overQuota + beyondPeriod + unavailable === pending` (las cuatro
+son disjuntas; `unavailable` se calcula por resta para que un
+`not_generated_reason` nuevo no desaparezca de la cuenta). Sale de releer
+`schedule_rule_standing_reservations()` después de crear — la RPC de
+creación devuelve la fila de `recurring_bookings`, no el estado de los
+`Booking` que generó, y cambiarle la firma rompería a sus otros callers.
+
+`success` dejó de ser el fijo `"Horario fijo asignado"`: ahora es la frase
+armada desde ese resumen ("Horario fijo asignado: 12 fechas confirmadas. Se
+repite todas las semanas, sin fecha de fin, hasta que lo quites. Quedan 3
+sin confirmar: …"). Es lo que reemplaza al preview obligatorio — sin eso,
+el camino rápido no distingue al cliente con las doce fechas confirmadas
+del que no confirmó ninguna porque debe el mes.
+
+El campo es **opcional** a propósito: `{ error: null, success: null }`
+como `initialState` sigue tipando. `previewStandingReservation` no cambió
+de firma.
+
+### Pendiente de `frontend-engineer` — `standing-reservations.tsx`
+
+Es UI, así que no la toqué. Lo que falta:
+
+1. **Botón directo "Asignar horario fijo"** en el mismo form donde se
+   elige el cliente (hoy ese form sólo puede disparar el preview, y el
+   submit de creación vive escondido detrás de `preview.dates.length > 0`).
+   El preview queda como acción secundaria del mismo form —"Ver detalle
+   antes de confirmar"— sin dejar de ser el camino que ya existe.
+2. **Decir que no hay fecha de fin** junto al botón ("Se repite todas las
+   semanas hasta que lo quites"), que es el otro medio pedido: la serie ya
+   es indefinida, pero la pantalla nunca lo dijo.
+3. Renderizar `created.summary` (o simplemente `created.success`, que ya
+   trae la frase completa) después de confirmar.
+
+**No agregar un selector de fecha de fin.** `generate_recurring_booking()`
+no mira `end_date`, así que una serie con fecha de corte seguiría
+generando `Booking` después de esa fecha: ofrecerlo hoy sería prometer
+algo que la base no cumple (ver el reporte al Orchestrator).
+
+## Fase 28 — catálogo de planes para el cliente y solicitud de cambio
+
+Contratos **nuevos** (nada existente cambió de firma). Detalle de la base
+en `docs/database.md`, Fase 28.
+
+### `public.ts` — `listPublicServicePlans(organizationSlug, serviceId?)`
+
+**Nivel PUBLIC.** Los planes activos que el negocio publica, con los
+servicios que cubre cada uno ya resueltos (RPC `public_service_plans`).
+Sin login, mismo nivel de disclosure que `service_plans_select_public`
+(Fase 22): nombre, descripción, precio, moneda, tipo, frecuencia y
+servicios cubiertos. Ningún dato de ningún `Customer`.
+
+```ts
+interface PublicServicePlan {
+  id: string;
+  name: string;
+  description: string | null;
+  price: number;
+  currency: string;                 // ISO 4217 de la Organization
+  planKind: ServicePlanKind;        // DROP_IN | WEEKLY_QUOTA | UNLIMITED
+  weeklyQuota: number | null;       // sólo WEEKLY_QUOTA
+  quotaScope: "PER_SERVICE" | "SHARED_ACROSS_SERVICES" | null;
+  billingType: "ONE_TIME" | "MONTHLY";
+  billingCycle: "CALENDAR_MONTH" | "ROLLING_MONTH" | null;
+  appliesToAllServices: boolean;
+  serviceIds: string[];
+  serviceNames: string[];
+}
+```
+
+`serviceId` la acota a los planes que cubren ese servicio — la forma que
+necesitan las pantallas de rechazo `OVER_PLAN_QUOTA`/`OUTSIDE_PLAN_QUOTA`,
+donde la persona está parada frente a un servicio concreto.
+
+Los tipos viven en `frontend/app/actions/public.ts` y **no** en
+`@reservaste/domain`, a propósito: el paquete es otro repo consumido por
+git ref (CLAUDE.md), así que agregarlos allá bloquearía esta pantalla
+detrás de un publish + bump. Mismo criterio que `PaymentPlanOption`.
+
+### `plan-changes.ts` (archivo nuevo) — pedir y atender el cambio
+
+El cambio de plan en sí sigue siendo **VOID + recargar** del mostrador
+(ADR-0024 resolución 1). Estas acciones sólo registran el pedido: un
+pedido pendiente **no habilita ni bloquea una sola reserva**.
+
+| Acción | Nivel | Firma |
+|---|---|---|
+| `requestPlanChange` | CUSTOMER | `(servicePlanId: string, _prev: ActionState, formData: FormData) => Promise<ActionState>` — nota opcional en `formData.get("note")`, máx. 500. Idempotente: repetir el pedido pendiente devuelve éxito sin duplicar. |
+| `getMyPlanChangeRequests` | CUSTOMER | `() => Promise<MyPlanChangeRequest[]>` — pendientes primero, con `currentPlanName` y `resolution`. |
+| `listPlanChangeRequests` | ADMIN | `(organizationSlug: string, includeResolved = false) => Promise<PlanChangeRequest[]>` |
+| `resolvePlanChangeRequest` | ADMIN | `(organizationSlug: string, requestId: string, resolution: "APPLIED" \| "DISMISSED") => Promise<void>` — target de `<form action>`. |
+
+Errores traducidos por `requestPlanChange`: `NOT_A_CUSTOMER` ("todavía no
+sos cliente de este negocio"), `ALREADY_ON_PLAN`,
+`SERVICE_PLAN_NOT_AVAILABLE`, `ORGANIZATION_INACTIVE`,
+`TOO_MANY_PENDING_PLAN_CHANGE_REQUESTS`, `NOTE_TOO_LONG`.
+
+Registrar el pago del plan pedido (pantalla de pagos, sin cambios) cierra
+el pedido como `APPLIED` por trigger, así que `resolvePlanChangeRequest`
+es para los casos en que la venta no pasó por ahí.
+
+### Pendiente de `frontend-engineer` (no toqué UI)
+
+1. Pantalla de catálogo por organización — p. ej.
+   `/[organizationSlug]/planes` (opcionalmente `?servicio=<serviceId>`),
+   alimentada por `listPublicServicePlans`, con un botón por plan que
+   dispare `requestPlanChange` (y el estado "ya lo pediste" desde
+   `getMyPlanChangeRequests`).
+2. **Redirigir ahí el rechazo**: en
+   `app/[organizationSlug]/reservar/confirmar/page.tsx` el link de
+   `OVER_PLAN_QUOTA`/`OUTSIDE_PLAN_QUOTA` hoy va a `/me/servicios` (el
+   plan que ya tiene). Debería ir al catálogo con el servicio del slot.
+   `SlotDetail` ya trae `organizationSlug` y `serviceId`.
+3. `/me/servicios`: mostrar el pedido pendiente y un acceso al catálogo
+   del negocio.
+4. Admin: listar los pedidos pendientes (`listPlanChangeRequests`) donde
+   el mostrador ya mira planes/pagos, con "marcar como atendido"
+   (`resolvePlanChangeRequest`) — recordando que cobrar el plan pedido ya
+   lo cierra solo.
+
+## Fase 29 — cierres chicos de la agenda real de `/me`
+
+Dos huecos que dejó la ronda que construyó la agenda con grilla en `/me`
+(Fase 23-ish, `frontend/lib/my-agenda.ts` + `docs/database.md`).
+
+### `customer.ts` — `MyBooking` trae identidad de la ocurrencia y color
+
+**Contrato ampliado, no roto** (agrega campos, no quita ni renombra
+ninguno). RPC `my_bookings()` (`docs/database.md`, Fase 29) ahora devuelve
+`slot_occurrence_id`, `service_id` y `service_color` además de lo que ya
+traía:
+
+```ts
+interface MyBooking {
+  // ...igual que antes...
+  slotOccurrenceId: string;
+  serviceId: string;
+  serviceColor: string | null;   // mismo color que get_public_availability() para el mismo servicio
+}
+```
+
+Antes de esto, `/me` deduplicaba una reserva propia contra la
+disponibilidad pública comparando `startAt + serviceName`
+(`occurrenceKey()` en `frontend/lib/my-agenda.ts`) porque no había ningún
+id en común entre `my_bookings()` y `get_public_availability()`. El
+heurístico sigue funcionando (nunca dejó de ser correcto, solo evitable) —
+queda **pendiente de `frontend-engineer`** migrar `occurrenceKey()`/el
+componente que lo usa a comparar `slotOccurrenceId` directo y a pintar el
+bloque propio con `serviceColor`, sin tocar la regla de negocio de ningún
+lado. No lo hice yo: la consigna de esta fase fue no tocar `app/me/*`.
+
+### `customer.ts` — `confirmBooking`/`releaseMyBooking` ahora redirigen con `org=`
+
+Ambos volvían a `/me` (o `/me?liberado=1`, `/me?liberar_error=1`) sin el
+`?org=<slug>` que `/me` usa para elegir qué organización mostrar
+(`pickCustomerOrganization`, `frontend/lib/my-agenda.ts`). Sin él, alguien
+cliente de varias organizaciones podía reservar/liberar en una y terminar
+viendo la agenda de otra (la de la próxima clase más próxima, que no es
+necesariamente la que acaba de tocar).
+
+- `confirmBooking`: reusa `getSlotDetail(slotOccurrenceId)` (ya existía en
+  el mismo archivo, RPC `public_slot_detail`, ADR-0015) para resolver el
+  slug — no hizo falta ninguna consulta nueva.
+- `releaseMyBooking`: reusa `getMyBookings()` — `my_bookings()` ya traía
+  `organization_slug` (usado para `organizationName`) — resuelto *antes*
+  de llamar a `release_my_booking()`, así el redirect de error
+  (`?liberar_error=1`) también lleva `org=` cuando la reserva es del
+  cliente. Una reserva ajena o inexistente no aparece en `getMyBookings()`
+  y cae al fallback sin `org=` (mismo comportamiento que antes de esta
+  fase, no un caso nuevo).
+
+Ninguna firma de función cambió (siguen `(slotOccurrenceId, prevState)` y
+`(bookingId)`); solo cambió el string al que redirigen.

@@ -573,6 +573,129 @@ alcanzable sin pasar por el Server Action).
   un `Service` con estas columnas ya pobladas, pero si alguna vez existe
   ese camino, el trigger necesita extenderse a `BEFORE INSERT OR UPDATE`.
 
+## Fase 28 — catálogo público de planes y `plan_change_requests` (ADR-0035)
+
+Migración: `20260923150000_phase28_plan_catalog_and_change_requests.sql`.
+Revisado y verificado contra base local (`npx supabase db reset` +
+`pg_policy`/`has_function_privilege`/sondas con clientes reales), no contra
+el reporte del agente.
+
+**Niveles de acceso que quedan fijados.**
+
+| Función | Nivel | Verificado |
+|---|---|---|
+| `public_service_plans(text,uuid)` | **PUBLIC** | `anon=t, authenticated=t, PUBLIC=f` |
+| `request_plan_change(uuid,text)` | **CUSTOMER** | `anon=f, authenticated=t, PUBLIC=f` |
+| `my_plan_change_requests()` | **CUSTOMER** | ídem |
+| `organization_plan_change_requests(uuid,boolean)` | **ADMIN** | ídem; `is_organization_member()` dentro del `WHERE` (no-miembro → lista vacía) |
+| `resolve_plan_change_request(uuid,enum)` | **ADMIN** | ídem; gate por `is_organization_member(v_row.organization_id)`, o sea por la organización **de la fila**, nunca por un parámetro del caller |
+
+**`organizations.currency` pasa a ser un campo PUBLIC.** Es el único campo
+que `public_service_plans()` expone y que `anon` no podía leer antes:
+`service_plans_select_public` (Fase 22, `using (is_active or member)`) ya
+daba a `anon` todas las columnas de un plan activo —`price` incluido—, pero
+`organizations_public` (Fase 4) es `id, slug, name, timezone, brand_color,
+logo_path` y la RLS de `organizations` bloquea el `SELECT` directo.
+Se acepta: `currency` es la unidad de un número que ya era público, y una
+lista de precios sin moneda no es una lista de precios. **Queda escrito
+para que haya una sola respuesta**: `currency` es público; si otra
+superficie pública lo necesita, va en `organizations_public`, no en una RPC
+nueva. El resto de la configuración de `organizations` sigue siendo
+member-only.
+
+**`plan_change_requests` — RLS de dos capas (ADR-0006), idéntica al resto.**
+`plan_change_requests_select_self_or_staff` es, expresión por expresión, la
+misma que `bookings_select_self_or_staff`, `payments_select_self_or_staff`,
+`makeup_credits_select_self_or_staff` y
+`service_entitlements_select_self_or_staff` (comparadas con
+`pg_get_expr(polqual)` en base real). **Cero policies de escritura**: como
+en `platform_contact_requests` (ADR-0030 §1), las *default privileges* de
+Supabase sí otorgan `INSERT/UPDATE/DELETE` a `anon` y `authenticated` sobre
+la tabla nueva —verificado en `information_schema.role_table_grants`— y el
+que deniega es RLS, no la ausencia de grant. Comprobado con clientes
+reales: `anon` insert → *"new row violates row-level security policy"*; un
+cliente resolviéndose su propio pedido por `PATCH` directo → 0 filas
+afectadas.
+
+**`request_plan_change()` aplica ADR-0005 al pie.** No recibe ningún
+`customerId`: resuelve el `Customer` desde `(plan.organization_id,
+auth.uid(), is_active)`, y `current_service_plan_id` lo calcula la base con
+`resolve_covering_service_plan()` en la fecha local de la organización. El
+único input que nombra una fila es el `service_plan_id`, que no pertenece a
+ningún cliente. El tope de 5 pendientes corre bajo
+`pg_advisory_xact_lock(hashtext('plan_change_request:' || customer_id))` —
+**clave por-cliente, no global**, así que dos clientes distintos no se
+serializan entre sí. Probado con 8 pedidos simultáneos del mismo cliente:
+5 aceptados, 3 con `TOO_MANY_PENDING_PLAN_CHANGE_REQUESTS`, 5 filas
+pendientes en la tabla.
+
+**Regla nueva — un trigger de integridad no puede abortar la escritura de
+otra tabla.** `payments_close_plan_change_request` (`AFTER INSERT ON
+payments`) hace un `UPDATE` de `plan_change_requests` **dentro de la
+transacción del pago**. Con `plan_change_requests_same_org` declarado como
+`BEFORE INSERT OR UPDATE` a secas, cualquier `raise` de
+`check_plan_change_request_same_org()` sube hasta el `INSERT` del pago y lo
+aborta: reproducido en base local (fila derivada a otra organización → el
+`UPDATE` de resolución falla con
+`PLAN_CHANGE_REQUEST_CUSTOMER_ORG_MISMATCH`). Llegar a ese estado exige que
+alguien con membresía en dos organizaciones mueva el `Customer` y el
+`ServicePlan` a la vez (`customers_write_staff`/`service_plans_update_staff`
+son `for all using is_organization_member(...)`, sin `with check` aparte),
+así que la severidad real era baja — pero el costo del arreglo es una
+cláusula. **Corregido en la misma migración**: el trigger pasa a
+`before insert or update of organization_id, customer_id, service_plan_id,
+current_service_plan_id`, con lo que el `UPDATE` de resolución
+(`resolved_at`/`resolved_by`/`resolution`) ni siquiera lo dispara y la
+integridad que protege queda igual de cubierta. **Regla general: si un
+trigger escribe en la tabla B desde una escritura en la tabla A, ningún
+`BEFORE` de B puede quedar habilitado para columnas que A toca — o el
+invariante de B se vuelve un modo de falla de A.**
+
+**El texto libre de `note` hereda ADR-0030 §4**: se guarda crudo
+(`CHECK length(trim(note)) between 1 and 500`, espejado en la RPC y en el
+server action) y se escapa en la salida. Hoy sólo lo renderiza React en
+`/org/:slug/plans`; si alguna vez sale de React (mail al mostrador, export
+CSV), aplica la misma prohibición de `dangerouslySetInnerHTML` /
+interpolación en HTML / celda CSV sin prefijar `'`.
+
+**Riesgo residual aceptado: `request_plan_change()` no tiene rate limit.**
+El tope de 5 pendientes limita las *filas*, no las *llamadas*: cada
+invocación —incluida la idempotente, que devuelve el pedido ya existente—
+recorre los servicios cubiertos por el plan resolviendo cobertura, y un
+cliente autenticado puede repetirla sin costo. Es abuso de CPU, no de
+datos, y requiere ser `Customer` activo de la organización. Queda dentro de
+la infraestructura de rate limiting que sigue pendiente desde ADR-0008.
+
+**Oráculo de existencia (informativo).** `resolve_plan_change_request()`
+distingue `PLAN_CHANGE_REQUEST_NOT_FOUND` de `NOT_AUTHORIZED`, o sea que un
+autenticado puede saber si un UUID existe. Con UUID v4 no es explotable; se
+deja anotado por si alguna vez se decide unificar el mensaje.
+
+## Fase 29 — `my_bookings()` recreada con `DROP` + `CREATE`
+
+Migración: `20260923160000_phase29_my_bookings_slot_identity.sql`.
+
+`DROP FUNCTION` borra el objeto **y sus privilegios**, y Postgres otorga
+`EXECUTE` a `PUBLIC` por default en la función nueva — la trampa que
+ADR-0028 ya documentó. La migración repite el `revoke execute ... from
+public, anon` + `grant ... to authenticated` de Fase 19 después del
+`create`. **Verificado en base real tras `npx supabase db reset` completo**
+(no en el reporte del agente): `has_function_privilege` da `anon=false`,
+`PUBLIC=false`, `authenticated=true`, y una llamada real con la clave
+`anon` responde `permission denied for function my_bookings`.
+
+Las tres columnas nuevas (`slot_occurrence_id`, `service_id`,
+`service_color`) no amplían disclosure: el `WHERE` no cambia
+(`join customers c on c.id = b.customer_id and c.profile_id = auth.uid()`,
+que además deniega correctamente a un cliente gestionado con `profile_id
+is null`), y `service_color` ya viaja al anónimo en
+`get_public_availability()`.
+
+**Regla que se repite y conviene automatizar**: todo `DROP FUNCTION` +
+`CREATE` sobre una función que tenía `revoke` explícito debe reaplicarlo en
+la misma migración, y la verificación que vale es
+`has_function_privilege()` contra la base reseteada, no la lectura del SQL.
+
 ## Pendiente de definir (Phase 1)
 
 - Proveedor de auth concreto: **Supabase Auth** (ADR-0002, cerrado).
