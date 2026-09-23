@@ -2162,3 +2162,110 @@ logins y lecturas.
 **Implementación**: pendiente, próxima ronda (backend: schema + 4
 triggers + policy, con revisión obligatoria de `security-engineer`;
 frontend: pantalla de solo lectura para el `OWNER`).
+
+## ADR-0033 — Roles configurables por organización
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario (feedback de
+producción — un rol de "profesor" no debería ver pagos, configurable por
+organización). Propuesta completa en
+`docs/proposals/adr-0033-roles-configurables.md`.
+
+`OWNER` se mantiene como enum fijo, no configurable — es la raíz de
+confianza (evita el ciclo "me edito el rol para poder editar roles",
+corta antes de mirar permisos así que un rol mal configurado nunca deja
+a la organización sin quien lo arregle, y cero riesgo de migración sobre
+las policies/RPCs que ya usan `is_organization_owner()`). Lo nuevo es una
+capa de roles configurables **dentro** de `STAFF`: tabla
+`organization_roles` (por organización, nombre libre, uno default) +
+`organization_members.role_id` nullable con fallback al default.
+Permisos como columnas booleanas (no jsonb, para no reintroducir lógica
+de tres valores — la causa de un bypass de autorización ya documentado
+en ADR-0026/ADR-0028) con clave de permiso en enum.
+
+### Resoluciones del Orchestrator a las preguntas abiertas
+
+1. **`VIEW_PAYMENTS` y `MANAGE_PAYMENTS` separados**, no un solo permiso
+   — con `CHECK` de que `MANAGE` implica `VIEW`.
+2. **Se acepta la fuga residual de `upcoming_unpaid`/`PAYMENT_REQUIRED`**
+   en pantallas operativas (asistencia, horario fijo) para un rol sin
+   `VIEW_PAYMENTS` — documentada, no oculta: sin ese dato un rol no
+   entiende por qué no puede anotar a alguien. "No ver pagos" no es "no
+   ver que algo depende de un pago".
+3. **Se cierra ahora, en la misma migración, el hueco ya existente** de
+   que el precio/nombre de un `ServicePlan` solo está protegido a nivel
+   `OWNER` en TypeScript (`frontend/app/actions/service-plans.ts`), no en
+   la base — cualquier `STAFF` puede cambiarlo hoy por PostgREST directo.
+   No es parte del pedido original pero la propuesta no se puede
+   construir con ese hueco abierto debajo.
+4. **Asistencia (`MANAGE_ATTENDANCE`) es un permiso configurable.**
+5. **Sin tope de cantidad de roles por organización.**
+
+Alcance del primer corte, sin más: `VIEW_PAYMENTS`, `MANAGE_PAYMENTS`,
+`MANAGE_BOOKINGS`, `MANAGE_CUSTOMERS`, `MANAGE_ATTENDANCE`. Fuera:
+invitar equipo/administrar roles (`OWNER` únicamente — un rol no puede
+ampliarse a sí mismo), configuración/branding, planes y precios,
+suscripción SaaS, créditos manuales.
+
+**Migración**: un rol "Equipo" por organización con los cinco booleanos
+en `true` + backfill de `role_id` — comportamiento idéntico el día del
+deploy para todo `STAFF` existente.
+
+**Implementación**: pendiente, con revisión obligatoria de
+`security-engineer` antes de cerrarse (toca auth y roles).
+
+## ADR-0034 — Alta de equipo (STAFF) sin registro previo
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario (feedback de
+producción — invitar a alguien al equipo hoy exige que ya tenga cuenta;
+extender el patrón de activación por WhatsApp de ADR-0026 al personal).
+Propuesta completa en `docs/proposals/adr-0034-team-invitations.md`.
+
+Mecanismo **separado** de `customer_activations` (tabla propia
+`team_invitations`), aunque comparte el acuñado del token: el destino
+del token no existe todavía como fila operable (a diferencia de un
+cliente gestionado), otorga acceso a datos de terceros con mayor radio
+de explosión, y la unicidad de "un link vivo" es por `(organización,
+email)`, no por fila. **Link de activación, no contraseña temporal**: una
+contraseña obligaría a usar la Admin API de Supabase con la
+`service_role` key fuera de todo camino de request normal, seguiría
+viva después de la ventana de 24h salvo rotación forzada, y no sirve si
+la persona entra por Google OAuth. El canje exige que el email de la
+sesión coincida con el de la invitación (mismo precedente que
+`INVITE_WRONG_EMAIL` de `create_organization_with_owner()`) — el canal
+es WhatsApp, el vínculo real es el email.
+
+### Resoluciones del Orchestrator a las preguntas abiertas
+
+1. **Se conserva `invite_member_by_email()`** como camino rápido cuando
+   la persona ya tiene cuenta — elegido explícitamente por quien invita,
+   nunca automático (automático reintroduciría el oráculo de
+   `PROFILE_NOT_FOUND` que ya existe).
+2. **El canje exige coincidencia de email**, sin excepción.
+3. **TTL de 24 horas** (el pedido original del usuario, textual).
+4. **Se guarda el teléfono en la invitación**, para el link de WhatsApp.
+5. **Una invitación nunca puede crear un `OWNER`** — `CHECK` en la tabla,
+   no una convención que la RPC deba recordar.
+
+Riesgos ya identificados y aceptados con su mitigación: `enforce_plan_limit()`
+se chequea también al **emitir** la invitación además de al canjearla (si
+no, se pueden emitir más invitaciones que cupo libre); el canje **nunca**
+pisa el rol de un miembro que ya existe (a diferencia de
+`invite_member_by_email()`, que si lo hace, y ahí es correcto porque es
+sincrónico y `OWNER`-gated); `organization_team_invitations()` como read
+model nuevo para que el dueño vea a quién invitó, no solo a quién ya se
+sumó; cookie/ruta propia (`/equipo/[token]`) para no pisar el token de
+activación de un cliente que además fue invitado al equipo.
+
+**Orden de implementación: ADR-0033 primero, después ADR-0034** — si se
+implementan las dos, conviene que `team_invitations` nazca con
+`role_id` en vez de una segunda migración sobre una tabla con tokens
+vivos. Si ADR-0033 nunca se implementara, ADR-0034 es igual de
+implementable con el enum `STAFF`/`OWNER` liso.
+
+**Implementación**: pendiente, con revisión obligatoria de
+`security-engineer` antes de cerrarse (token portador + acceso a datos
+de terceros).
