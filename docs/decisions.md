@@ -1993,3 +1993,77 @@ prueba contra una copia de los datos reales, no solo contra `db reset`
 sobre una base vacía — es la primera de esta iteración con ese requisito,
 porque es la primera que retrofitea una tabla que ya tiene filas de un
 cliente real.
+
+## ADR-0030 — Refresh visual: marca de plataforma (violeta/cian), landing tipo funnel
+
+Fecha: 2026-09-22
+Estado: **Aceptada**
+Propuesta por: `ux-ui-designer`, a pedido del usuario ("mejorar el diseño y
+la UX de todo el producto" tomando `https://turnito.app/uy/` como
+referencia de nivel). Propuesta completa en
+`docs/proposals/adr-0030-visual-refresh.md` — este ADR registra la
+decisión, no la repite.
+
+**El hallazgo que reordenó la propuesta**: `--primary` significaba a la vez
+"acento de esta pantalla" y "color de Reservaste", así que el logo de la
+plataforma se pintaba con el `accent_color` de cada organización dentro de
+`[data-brand]` — lo opuesto a lo que ADR-0020 decidió ("la consola de
+plataforma es nuestra marca, no la del cliente"). Se separa en tres capas:
+**P** (`--brand-violet`/`-strong`/`-deep`, `--brand-cyan`/`-deep`, fijos,
+nunca sobreescribibles por un tenant — logo, landing, `/admin`), **S**
+(semánticos success/warning/destructive, sin cambios), **T** (`--primary`,
+default = violeta, pisado por `[data-brand]` exactamente igual que hoy). Una
+organización con acento configurado no ve cambiar su página; una sin acento
+pasa de índigo a violeta junto con el resto del producto sin marca de
+tenant.
+
+### Resoluciones a las preguntas abiertas de la propuesta (decididas con el usuario, 2026-09-22)
+
+1. **Violeta `#7c3aed`: aprobado tal cual propuesto.**
+2. **CTA principal de la landing → página `/contacto` con formulario**, no
+   el link directo a WhatsApp que recomendaba la propuesta por ser el de
+   menor esfuerzo. Es la opción de mayor alcance de las tres — genera un
+   lead real, no solo abre un chat — y el usuario la eligió a sabiendas de
+   que implica capturar el envío en algún lado, no solo maquetar un
+   formulario. Alcance mínimo: una tabla nueva y chica para las
+   submissions (`backend-engineer` define el shape exacto — algo en la
+   línea de `platform_contact_requests`, `INSERT` público vía RPC o policy
+   estricta, `SELECT` solo `is_platform_admin()`), visible desde `/admin`.
+   No es alta de organización ni toca `ServicePlan`/booking — no arrastra
+   ninguna otra decisión estructural.
+3. **Precios: USD tal cual**, sin aclaración de IVA ni conversión a UYU.
+4. **Dominio: todavía no hay uno real.** La landing y el copy de onboarding
+   no deben prometer `reservaste.app` — ajustar para no citar un dominio
+   que no resuelve, hasta que haya uno comprado.
+
+### Resoluciones del Orchestrator sobre las preguntas menores (no bloqueantes, criterio de bajo riesgo)
+
+5. **Testimonios: sin fabricar ninguno**, tal como ya proponía §3.6 —
+   señales factuales verificables hasta que el cliente real autorice ser
+   nombrado.
+6. **`.brand-band` (banda oscura acotada de la landing): aprobada tal como
+   está escrita en §1.6** — no es dark mode (sin toggle, sin persistencia,
+   sin inputs adentro), es una sección con fondo literal de capa P.
+7. **`font-optical-sizing: auto` global: no por ahora.** Queda confinado a
+   la landing (la escala `.display-*`/`.lead` ya vive solo en
+   `components/marketing/`) para no tocar la tipografía de las 60
+   pantallas de producto en un pase que ya es grande.
+8. **Vocabulario de rubro filtrado ("la clase" en copy de `/me` y
+   asistencia): corrección mínima ahora** (neutralizar a "la fecha"/"el
+   turno"), **no** la columna configurable por `Organization` que
+   proponía la propuesta como alternativa — eso es un cambio de dominio
+   nuevo y por lo tanto su propio ADR si se decide encararlo, no algo que
+   se cuela dentro de un pase de diseño visual.
+
+### Plan de fases (de la propuesta, sin cambios)
+
+Fase 1 (tokens, aditiva, riesgo nulo) → Fase 2 (landing + `/contacto`) →
+Fase 3 (de-fuga de `Brand`/`BrandMark` a capa P — **visible para tenants
+con acento configurado, avisar al cliente actual antes de desplegar**) →
+Fase 4 (flip de `--primary` + neutros, requiere pasada visual con
+`next dev`) → Fase 5 (superficies de cliente, verificar con ≥3 acentos de
+tenant distintos) → Fase 6 (deuda de densidad del panel admin, no arranca
+sin `next dev`) → Fase 7 (`/admin`). Se arranca por la Fase 1 y 2 ahora;
+3-7 quedan para las próximas rondas de este mismo ADR, no para fases
+nuevas del roadmap — es un solo cambio de identidad visual ejecutado en
+etapas por riesgo, no siete features distintas.
