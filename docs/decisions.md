@@ -2505,3 +2505,57 @@ corresponde revisar `audit_log` y los conteos de `organizations`/
 `services` contra lo esperado una vez aplicado el fix, para descartar
 que haya sido explotada antes de encontrarla hoy. La `anon key` es
 pública por diseño (no hay secreto que rotar).
+
+## ADR-0038 — El monto sugerido se recalcula por días cuando se edita el período de un pago
+
+Fecha: 2026-09-24
+Estado: **Aceptada**
+Propuesta por: usuario en producción, reportando una captura de
+`/payments/[customerId]`: un plan mensual (Pilates, $1.700) con el
+período acortado a mano de 03-01→03-31 a 03-01→03-10 seguía mostrando
+$1.700 al registrar el pago. Decisión tomada por el Orchestrator
+después de presentar tres opciones (recalcular por días, sólo avisar,
+dejarlo manual) — el usuario eligió recalcular.
+
+**El hallazgo**: en `RegisterPaymentForm`, "Período desde/hasta" y
+"Monto" son dos inputs independientes que sólo se precargan **una vez**
+al elegir el plan (`selectedPlan.periodStart/periodEnd` y
+`suggestion.amount`). Después de eso no hay ningún vínculo entre
+ellos — es a propósito, el hint dice literalmente "podés ajustarlos" —
+pero nada distingue "edité el monto a propósito" de "acorté el período
+y me olvidé de tocar el monto", y el segundo caso queda en pantalla
+como una inconsistencia que parece un bug.
+
+### Decisión
+
+El monto sugerido se **recalcula en el cliente, proporcional a los
+días**, cada vez que se edita "Período desde" o "Período hasta" —
+**solo para planes de un mes** (`billingPeriodMonths` ausente o `1`,
+es decir, fuera del flujo de `LongPeriodQuote`):
+
+```
+tarifaDiaria = selectedPlan.price / díasEnElPeríodoCompletoDelPlan
+montoSugerido = round2(tarifaDiaria × díasEnElPeríodoEditado)
+```
+
+- `díasEnElPeríodoCompletoDelPlan` se congela al elegir el plan (el
+  `periodStart`/`periodEnd` que ya resuelve `billing_period_for()` en
+  el servidor), no se recalcula con cada tecla — es el denominador
+  estable de la proporción.
+- Sigue siendo **una sugerencia editable**, nunca algo que el backend
+  imponga: el campo `amount` se puede pisar a mano después, igual que
+  hoy. `registerPayment()` no cambia — sigue grabando el `amount` que
+  llegue en el `FormData`, sin volver a calcularlo ni validarlo contra
+  el período.
+- **No toca el flujo de ciclos largos de ADR-0031.** Ese prorrateo es
+  por meses enteros y sólo aplica al alta inicial — mezclarlo con un
+  prorrateo por días aquí contradiría esa decisión ya cerrada. Un plan
+  con `billingPeriodMonths > 1` sigue mostrando su `LongPeriodQuote`
+  sin este recálculo.
+- No requiere cambios de schema, RPC ni server action: es lógica
+  puramente de presentación, igual que `suggestedAmount()`
+  (ADR-0031) — vive en el mismo componente cliente.
+
+**Implementación**: pendiente, delegada a `frontend-engineer`
+(`app/org/[slug]/customers/[customerId]/customer-forms.tsx`,
+`RegisterPaymentForm`).

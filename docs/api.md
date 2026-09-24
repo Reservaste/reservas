@@ -628,7 +628,27 @@ trimestre, contando el mes de alta como completo, redondeado a la unidad
 entera de moneda" es una regla de negocio, y una segunda implementación en
 el cliente derivaría (CLAUDE.md). Es una **sugerencia**: el campo de monto
 sigue editable y `Payment.amount` sigue libre (ADR-0024 resolución 5).
-`registerPayment()` **no cambia**.
+
+### Fase 25/38 — `registerPayment()` gana un `viewedMonth` opcional y el front recalcula el monto por días (ADR-0038)
+
+`registerPayment(organizationSlug, customerId, prev, formData)` sigue sin
+tocar su firma, pero el `FormData` admite un campo nuevo, opcional:
+`viewedMonth` (`"YYYY-MM"`). Solo lo manda `RegisterPaymentForm` cuando la
+pantalla está parada sobre un mes (`/payments/[customerId]?mes=`), como un
+input hidden. Si el período que se acaba de guardar no se solapa con ese
+mes, el mensaje de éxito lo dice explícitamente (`"... · no vas a verlo en
+este mes: cubre oct–dic 2026"`) en vez del genérico "Pago registrado" —
+evita que un pago de un período distinto al que se está mirando parezca
+que no se guardó. `registerPayment()` sigue grabando `amount` tal cual
+llega, sin recalcularlo ni validarlo contra el período.
+
+Del lado de `RegisterPaymentForm` (sin cambio de contrato con el server,
+solo de UI): para un plan de **un mes** (fuera del territorio de
+`LongPeriodQuote`/ADR-0031), editar a mano "Período desde/hasta" recalcula
+el monto sugerido proporcional a los días, con el período completo que el
+plan sugirió al elegirlo como denominador fijo (`lib/billing-period.ts`:
+`inclusiveDays()`, `round2()`). Sigue siendo una sugerencia editable —
+igual que el prorrateo de ADR-0031, nunca algo que el backend imponga.
 
 ### `service-plans.ts` — `createServicePlan` acepta el ciclo largo
 
