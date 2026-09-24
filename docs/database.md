@@ -2341,3 +2341,58 @@ la hora del día en que corriera la suite. Techo corregido a `firstOfMonth(1)`.
 corresponde revisar `audit_log` y los conteos de `organizations`/`services` contra
 lo esperado una vez aplicado el fix, para descartar que haya sido explotada antes
 de encontrarla. La `anon key` es pública por diseño: no hay secreto que rotar.
+
+## Fase 30b — cursor compuesto de `organization_audit_log()` (migración `20260924100000_phase30b_audit_log_composite_cursor.sql`)
+
+Hallazgo de `qa-engineer`. `audit_log.created_at default now()` = hora de **inicio de
+la transacción**, así que un `UPDATE` que cancela N reservas (`cancel_slot_occurrence()`,
+`discontinue_schedule_rule()`) deja N filas con el mismo `created_at`. El corte
+`created_at < p_before` perdía el resto del grupo cuando el límite de página caía
+adentro.
+
+- `drop function organization_audit_log(uuid, int, timestamptz)` + `create` con
+  `(p_organization_id uuid, p_limit int, p_before_created_at timestamptz, p_before_id uuid)`.
+  Drop y no overload: dejar la firma vieja invocable dejaba vivo el camino con el bug.
+  Grants re-declarados (`revoke from public, anon`; `grant to authenticated`).
+- Corte `(a.created_at, a.id) < (p_before_created_at, p_before_id)`, orden
+  `created_at desc, id desc` (misma clave, mismo sentido). Cursor a medias →
+  `INVALID_CURSOR`.
+- `audit_log_org_time_idx` se recrea como `(organization_id, created_at desc, id desc)`.
+- Resto del cuerpo (autorización, enmascarado del actor de plataforma) idéntico a la Fase 30.
+
+**No** se cambió `created_at` a `clock_timestamp()`: distinguiría las filas de una misma
+transacción pero no arregla el caso general (dos transacciones distintas también pueden
+coincidir al microsegundo). El cursor compuesto es el arreglo correcto; el timestamp
+compartido es un dato verdadero ("pasó todo junto").
+
+Test: `backend/test/phase30b.audit-log-cursor.test.ts` (4 casos: precondición de
+timestamp compartido entre 7 cancelaciones, paginación con límite 3 sin faltantes ni
+duplicados y en orden total, `INVALID_CURSOR`, firma vieja inexistente).
+
+## Fase 27b — slugs reservados (migración `20260924100100_phase27b_reserved_organization_slugs.sql`)
+
+Hallazgo de `security-engineer`. Constraint nuevo, **aparte** del de formato:
+
+```sql
+alter table public.organizations
+  add constraint organizations_slug_not_reserved_check
+  check (slug not in ('_next','activar','admin','api','auth','contacto','dashboard',
+                      'equipo','login','me','onboarding','org','signup'));
+```
+
+- Lista = árbol top-level real de `frontend/app/` al 2026-09-24 (verificado: `activar`,
+  `admin`, `auth`, `contacto`, `dashboard`, `equipo`, `login`, `me`, `onboarding`, `org`,
+  `signup`, más `[organizationSlug]`) + `api` + `_next`. `_next` ya lo rechaza el regex
+  de formato; se lista para que el `CHECK` sea la referencia completa.
+- `CHECK` y no sólo validación en la RPC: no se saltea con ningún camino de escritura
+  futuro. Aparte del de formato para que la RPC distinga los dos casos.
+- `create_organization_with_owner()`: `create or replace`, misma firma y cuerpo de la
+  Fase 27 + `organizations_slug_not_reserved_check` → `SLUG_RESERVED`.
+- Validado en el acto (no `NOT VALID`): si una organización existente tuviera uno de
+  estos slugs la migración falla — preferible a que capture una ruta en silencio.
+- Espejo exacto: `RESERVED_ORGANIZATION_SLUGS` en `backend/src/schemas.ts`.
+  **Ruta top-level nueva = migración nueva que la agrega acá.**
+
+Test: `backend/test/phase27b.reserved-organization-slugs.test.ts` (3 casos: cada slug
+reservado rechazado por la RPC, `INSERT` directo con `service_role` rechazado por el
+`CHECK`, slug que sólo *contiene* una palabra reservada aceptado).

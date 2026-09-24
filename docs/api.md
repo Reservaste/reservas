@@ -515,6 +515,9 @@ base en `docs/database.md`, Fase 30.
 
 ### RPC nueva — `organization_audit_log(p_organization_id, p_limit, p_before)`
 
+> **Firma reemplazada en la Fase 30b** (cursor compuesto `(created_at, id)`):
+> ver "Fase 30b" al final de este documento. `p_before` ya no existe.
+
 **Nivel ADMIN, restringido a OWNER.** `grant execute to authenticated` +
 `revoke from public, anon`. Devuelve `NOT_AUTHORIZED` para `STAFF` y para
 un `OWNER` de otra organización (no una lista vacía: acá "no sos dueño" y
@@ -1015,7 +1018,9 @@ valiendo):
   cookie de path `/`, que es otra cookie distinta.
 
 ```ts
-/** Server component helper: ¿hay un token de equipo en vuelo? */
+// Server component helper -- desde el hardening de 2026-09-24 vive en
+// `frontend/lib/server-cookies.ts` (`import "server-only"`), NO en el módulo
+// "use server" de las actions: ver "Hardening 2026-09-24" al final.
 export async function readTeamInvitationToken(): Promise<string | null>;
 
 /** El canje. La RPC recibe SÓLO el token, leído de la cookie httpOnly. */
@@ -1117,3 +1122,95 @@ frontend.**
 Requiere que `frontend/package.json` apunte a una versión de
 `@reservaste/domain` que incluya estos tipos (commit de `backend#main`
 posterior a la Fase 33) — orden de publicación en `CHARTER.md`.
+
+## Fase 30b — `organization_audit_log()`: cursor compuesto (CAMBIO DE CONTRATO)
+
+Migración `20260924100000_phase30b_audit_log_composite_cursor.sql`. Hallazgo de
+`qa-engineer`: el corte `created_at < p_before` perdía filas. `audit_log.created_at`
+es `default now()` (inicio de la transacción), y `cancel_slot_occurrence()` /
+`discontinue_schedule_rule()` cancelan N reservas en un solo `UPDATE`: N filas con
+el **mismo timestamp exacto**. Si el límite de página caía dentro de ese grupo, el
+resto del grupo no aparecía en ninguna página, sin error.
+
+**Firma nueva** (la vieja se dropea; no queda como overload):
+
+```sql
+organization_audit_log(
+  p_organization_id   uuid,
+  p_limit             int         default 100,   -- acotado 1..200
+  p_before_created_at timestamptz default null,  -- created_at de la ÚLTIMA fila de la página anterior
+  p_before_id         uuid        default null   -- id de esa misma fila
+)
+```
+
+- Keyset por la clave total: `where (created_at, id) < (p_before_created_at, p_before_id)
+  order by created_at desc, id desc`. Cada fila cae en exactamente una página.
+- **Los dos o ninguno.** Uno solo → `INVALID_CURSOR` (con sólo la fecha volvería el
+  bug). Primera página: los dos `null`.
+- Shape de respuesta **sin cambios** (`AuditLogEntry`). Tipo nuevo en
+  `@reservaste/domain`: `AuditLogCursor { beforeCreatedAt: string; beforeId: string }`.
+- **El cursor se pasa tal cual vino de la RPC (string).** `created_at` tiene
+  microsegundos; pasarlo por `new Date()` / `Date.parse` / `toISOString()` lo trunca
+  a milisegundos, el cursor queda antes del grupo real y se vuelven a perder filas.
+
+### Qué tiene que cambiar en `frontend/` (pendiente de `frontend-engineer`)
+
+La base ya tiene la firma nueva: **hasta que esto se haga, `/org/[slug]/settings/registro`
+muestra "No pudimos cargar el registro"** (PostgREST no encuentra una función con
+`p_before`). Deploy coordinado: backend y frontend juntos.
+
+1. `frontend/app/actions/audit.ts` — `getOrganizationAuditLog`:
+   ```ts
+   export async function getOrganizationAuditLog(
+     organizationSlug: string,
+     options?: { limit?: number; cursor?: AuditLogCursor },   // AuditLogCursor de @reservaste/domain
+   ): Promise<AuditLogResult>
+   // ...
+   supabase.rpc("organization_audit_log", {
+     p_organization_id: organization.id,
+     p_limit: options?.limit ?? 50,
+     p_before_created_at: options?.cursor?.beforeCreatedAt ?? null,
+     p_before_id: options?.cursor?.beforeId ?? null,
+   });
+   ```
+   Traducir `INVALID_CURSOR` a volver a la primera página (o a un mensaje neutro),
+   no a "sólo el dueño puede ver".
+2. `frontend/app/org/[slug]/settings/registro/page.tsx` — hoy lee `?antes=<fecha>` y lo
+   valida con `Date.parse`. Pasa a necesitar **dos** parámetros (p. ej.
+   `?antes=<createdAt>&antesId=<id>`), armados con `last.createdAt` y `last.id` **sin
+   transformar** (`encodeURIComponent` sí, `Date` no). Si falta uno, o el id no es un
+   uuid, se ignora el cursor y se muestra la primera página. `Date.parse` puede quedar
+   solo como validación, nunca para reconstruir el valor.
+3. Bump de `@reservaste/domain` a un commit de `backend` que incluya `AuditLogCursor`
+   (orden de publicación de `CHARTER.md`).
+
+## Fase 27b — slugs reservados
+
+Migración `20260924100100_phase27b_reserved_organization_slugs.sql`.
+`create_organization_with_owner()` mantiene su firma; **código de error nuevo**:
+`SLUG_RESERVED` cuando el slug es un segmento top-level de `frontend/app/` (`_next`,
+`activar`, `admin`, `api`, `auth`, `contacto`, `dashboard`, `equipo`, `login`, `me`,
+`onboarding`, `org`, `signup`). `INVALID_SLUG` sigue siendo el de formato.
+
+`createOrganization` (`frontend/app/actions/organizations.ts`) ahora traduce
+`SLUG_RESERVED` → "Ese nombre está reservado, elegí otro" e `INVALID_SLUG` → el mismo
+texto de formato que Zod (antes los dos caían en "No se pudo crear la organización").
+Firma y shape de la acción sin cambios. `organizationSlugSchema` (Zod) rechaza la misma
+lista (`RESERVED_ORGANIZATION_SLUGS`, exportada), así que con el paquete de dominio
+actualizado el formulario lo corta antes de llegar a la base.
+
+**Regla de mantenimiento:** una ruta top-level nueva en `frontend/app/` = una migración
+que la agrega al `CHECK` + el valor en `RESERVED_ORGANIZATION_SLUGS`, **antes** de
+publicar la ruta.
+
+## Hardening 2026-09-24 — lectores de cookie fuera de módulos `"use server"`
+
+`readActivationToken()` (antes en `app/actions/activation.ts`) y
+`readTeamInvitationToken()` (antes en `app/actions/team-invitations.ts`) se mudaron a
+`frontend/lib/server-cookies.ts` (sin `"use server"`, con `import "server-only"`;
+dependencia `server-only` agregada a `frontend/package.json`). Misma firma
+(`() => Promise<string | null>`). Motivo: todo export de un módulo `"use server"` es una
+server action invocable por `POST` — una que devuelve el valor de una cookie `httpOnly`
+deshace el `httpOnly`. **Regla:** un helper que devuelve un secreto nunca vive en un
+módulo `"use server"`. Consumidores actualizados: `app/activar/continuar/page.tsx` y
+`app/equipo/continuar/page.tsx` (sólo el import).

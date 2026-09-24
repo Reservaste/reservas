@@ -1456,6 +1456,45 @@ que es exactamente para lo que existe. **Regla: antes de un `create or replace`
 sobre una función existente, buscar todas las migraciones que la tocan y partir
 de la última.**
 
+### Revisión del frontend de ADR-0031/0032/0033/0034 (security-engineer, 2026-09-24)
+
+Verificado sobre el código (y contra el `server-reference-manifest.json` del
+build), no supuesto: cookie `team_invitation_token` con `path: "/equipo"`,
+`maxAge` 24 h = `interval '24 hours'` de `issue_team_invitation()`
+(`phase33:470`), `httpOnly`, `sameSite: lax`, `secure` en producción, nombre
+y path distintos de `activation_token`/`/activar`; el `GET /equipo/[token]`
+no toca la base; `INVITE_WRONG_EMAIL` muestra sólo el email de la sesión; el
+mensaje de WhatsApp nombra sólo a la organización; el token no se loguea ni
+vuelve en ningún error. Ocultar por permiso no es la defensa: `mark_attendance`
+(`MANAGE_ATTENDANCE`), `payments` (RLS `VIEW_PAYMENTS`/`MANAGE_PAYMENTS`),
+`discontinue_schedule_rule[_group]` (`MANAGE_BOOKINGS`, Fase 34), las RPCs de
+roles (`is_organization_owner()` sobre la organización **del rol/miembro**, no
+la del slug) y `organization_audit_log()` rechazan en la base.
+
+**Regla nueva — un helper que devuelve un secreto no vive en un módulo
+`"use server"`.** Toda función `export async` de un archivo `"use server"` se
+registra como server action invocable por `POST` con su id, aunque sólo la
+llame un server component. `readTeamInvitationToken()` (y
+`readActivationToken()`, preexistente) figuran en el manifest: devuelven al
+navegador el valor de una cookie `httpOnly`, o sea que deshacen el `httpOnly`
+para cualquier JS del mismo origen que conozca el id (hoy el id no está en
+ningún bundle de `.next/static`, por eso es **bajo** y no bloquea). Arreglo:
+mover esos lectores a un módulo sin `"use server"` con `import "server-only"`.
+**Resuelto (2026-09-24):** los dos viven ahora en `frontend/lib/server-cookies.ts`
+(`import "server-only"`, sin `"use server"`); ya no figuran en el manifest de actions.
+
+**Deuda (bajo): slugs reservados.** `organizations_slug_format_check` no
+excluye los segmentos de primer nivel de la app (`equipo`, `activar`, `login`,
+`signup`, `dashboard`, `org`, `me`, `auth`, `onboarding`, ...). Una organización
+con slug `equipo` tendría su `/equipo/planes` capturado por
+`/equipo/[token]`, que pisaría la cookie de una invitación en vuelo con
+`"planes"`. Requiere un alta aprobada por la plataforma, así que es sabotaje
+de baja probabilidad, no escalada.
+**Resuelto (Fase 27b, `20260924100100_phase27b_reserved_organization_slugs.sql`):**
+`organizations_slug_not_reserved_check` rechaza los segmentos top-level de
+`frontend/app/` (+ `api`, `_next`); la RPC lo traduce a `SLUG_RESERVED`. Ruta
+top-level nueva = migración nueva que la agrega al `CHECK`.
+
 ## Fase 34 — dónde va la autorización (cierre de la revisión de las Fases 30/31/32)
 
 Migración: `20260923210000_phase34_permission_boundary_fixes.sql`.
