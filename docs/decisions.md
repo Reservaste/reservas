@@ -2111,8 +2111,10 @@ cotiza — el mostrador sigue registrando el pago con `amount` libre.
    capacidad real). `END_OF_BILLING_PERIOD` sigue siendo válido para
    ciclos mensuales, donde no cambia nada de lo ya aceptado.
 
-**Implementación**: pendiente, próxima ronda (backend: schema + función
-de cotización; frontend: formulario de plan + formulario de pago).
+**Implementación**: backend completo (2026-09-23) — Fase 31,
+`20260923180000_phase31_long_billing_periods.sql`. Pendiente: revisión
+de `security-engineer`, formulario de plan + formulario de pago
+(`frontend-engineer`, especificado en `docs/api.md` §Fase 31).
 
 ## ADR-0032 — `audit_log`: registro de acciones sensibles
 
@@ -2159,9 +2161,16 @@ créditos de recupero (ya tienen su propio log en `makeup_credits`),
 acciones del propio cliente, altas de cliente/servicio/horario/branding,
 logins y lecturas.
 
-**Implementación**: pendiente, próxima ronda (backend: schema + 4
-triggers + policy, con revisión obligatoria de `security-engineer`;
-frontend: pantalla de solo lectura para el `OWNER`).
+**Implementación**: backend completo (Fase 30,
+`20260923170000_phase30_audit_log.sql`, 226/226 tests de integración) —
+tabla + enum + 4 triggers de auditoría + trigger de inmutabilidad +
+policy de `SELECT` + `organization_audit_log()` como lectura que
+enmascara al actor de plataforma (resolución 2). Detalle en
+`docs/database.md` (Fase 30), `docs/security.md` y `docs/api.md`.
+Pendiente: revisión de `security-engineer` (obligatoria por el propio
+ADR), la server action `getOrganizationAuditLog()` y la pantalla de solo
+lectura del `OWNER` en `/org/[slug]/configuracion` (especificada en
+`docs/api.md`).
 
 ## ADR-0033 — Roles configurables por organización
 
@@ -2211,6 +2220,14 @@ suscripción SaaS, créditos manuales.
 **Migración**: un rol "Equipo" por organización con los cinco booleanos
 en `true` + backfill de `role_id` — comportamiento idéntico el día del
 deploy para todo `STAFF` existente.
+
+**Implementación**: backend completo (2026-09-23) — Fase 32,
+`20260923190000_phase32_configurable_roles.sql`, 255/255 tests de
+integración, 17 RPCs endurecidas (más allá de las 8 mínimas de la
+propuesta) y el hueco preexistente de precio de plan editable por
+`STAFF` cerrado en la misma migración. Pendiente: revisión de
+`security-engineer` (obligatoria), pantalla de roles + esconder por
+permiso (`frontend-engineer`, especificado en `docs/api.md` §Fase 32).
 
 **Implementación**: pendiente, con revisión obligatoria de
 `security-engineer` antes de cerrarse (toca auth y roles).
@@ -2266,9 +2283,12 @@ implementan las dos, conviene que `team_invitations` nazca con
 vivos. Si ADR-0033 nunca se implementara, ADR-0034 es igual de
 implementable con el enum `STAFF`/`OWNER` liso.
 
-**Implementación**: pendiente, con revisión obligatoria de
-`security-engineer` antes de cerrarse (token portador + acceso a datos
-de terceros).
+**Implementación**: backend completo (2026-09-23) — Fase 33,
+`20260923200000_phase33_team_invitations.sql`, 276/276 tests de
+integración (21 nuevos), nace con `role_id` sobre ADR-0033 ya aplicada.
+Pendiente: revisión de `security-engineer` (obligatoria por este mismo
+ADR), server actions y UI (`frontend-engineer`, especificado en
+`docs/api.md` §Fase 33).
 
 ## ADR-0035 — La solicitud de cambio de plan no es el cambio
 
@@ -2309,3 +2329,179 @@ resolución 1 vuelta a abrir desde otro ángulo.
 cuota ahí, en vez de a "ver mi plan actual" como está hoy) y
 `security-engineer` (RLS de la tabla nueva, disclosure del catálogo
 público, el trigger sobre `payments`).
+
+## ADR-0036 — `DELETE` por la Data API queda cerrado en tablas con hijos en cascada
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `security-engineer`, verificación independiente de la
+Fase 34 (ADR-0033). No es un hallazgo de ADR-0033 — es preexistente
+desde que esas tablas tienen policy `ALL using is_organization_member()`
+— pero ADR-0033 lo vuelve urgente: el valor entero de un rol restringido
+(`MANAGE_BOOKINGS`/`MANAGE_PAYMENTS` en `false`) queda vacío si el mismo
+actor puede lograr el mismo efecto con un `DELETE` directo por
+PostgREST, que **no evalúa RLS en la cascada de FK**.
+
+**El problema, verificado con reproducción real**: `schedule_rules`,
+`services`, `resources` (y probablemente `customers`) tienen policy
+`ALL` para cualquier miembro activo, con hijos `ON DELETE CASCADE`
+(`schedule_rules → slot_occurrences → bookings`,
+`services → payments`). Un `DELETE /rest/v1/schedule_rules?id=eq.<X>`
+por un STAFF con los cinco permisos de ADR-0033 en `false` borra en
+cascada `Booking`s `CONFIRMED` — no las cancela, las **borra**: sin
+`cancelled_at`/`cancelled_by`, sin `MakeupCredit`, sin fila en
+`audit_log`. Rompe directamente el invariante de negocio ya escrito en
+`CLAUDE.md` ("las reservas canceladas nunca se borran"). Un
+`DELETE /rest/v1/services` con un `ServicePlan` de alcance global borra
+en cascada pagos `PAID` — historial financiero destruido por un rol sin
+`VIEW_PAYMENTS` ni `MANAGE_PAYMENTS`.
+
+### Decisión
+
+**Ninguna de estas tablas tiene un caso de uso legítimo para `DELETE`
+por la Data API.** Todo lo que hoy se "borra" en el producto ya tiene su
+camino correcto: `discontinue_schedule_rule()` (cancela y libera, no
+borra), desactivar (`is_active = false`) para `Service`/`Resource`,
+`revoke_member()` para equipo. Ninguna pantalla del panel ofrece un
+botón "eliminar" sobre estas tablas — lo confirmé revisando `docs/api.md`
+antes de aceptar esto como decisión, no lo asumí.
+
+**Se cierra el `DELETE` de la Data API para `schedule_rules`,
+`services`, `resources`, `customers`, `schedule_exceptions`,
+`service_entitlements`, `service_resources`** — las policies `ALL`
+pasan a `SELECT`/`INSERT`/`UPDATE` explícitos, sin `DELETE`. Bajo RLS,
+la ausencia de policy de `DELETE` deniega por default: no hace falta
+ningún trigger nuevo, es remover el comando de la policy existente.
+`OWNER` tampoco tiene `DELETE` directo — si algún día se necesita borrar
+de verdad (no cancelar/desactivar), es una RPC nueva con su propia
+decisión explícita, no un `DELETE` genérico.
+
+**No se toca** ninguna FK `ON DELETE CASCADE` existente (siguen siendo
+correctas para cuando la fila padre sí se borra por una vía legítima
+futura) ni ninguna RPC ya gateada (`discontinue_schedule_rule()` sigue
+usando `UPDATE`, no `DELETE`, así que no se ve afectada).
+
+**Implementación**: backend completo (2026-09-23) — Fase 35,
+`20260923220000_phase35_close_data_api_delete.sql`, 301/301 tests de
+integración (11 nuevos). Las 7 policies `ALL` pasan a `INSERT`/`UPDATE`
+explícitos, sin `SELECT` duplicado (las tablas ya tenían policy de
+lectura propia, subconjunto o igual a la que se retiró — verificado
+tabla por tabla, no se agregó una policy redundante). Confirmado que
+ninguna de las 7 tenía un `DELETE` legítimo en todo el código (grep
+completo en `backend/` y `frontend/`) y que ningún RPC interno usa
+`DELETE FROM` sobre ellas. El test se validó al revés (restaurando las
+policies viejas temporalmente): sin el fix, 8 de los 11 casos fallan,
+incluidos los dos escenarios exactos que encontró `security-engineer`.
+Pendiente: barrido de `security-engineer` sobre el resto del schema por
+otras policies `FOR ALL` con hijos en cascada fuera de estas 7 tablas.
+**Hecho, ver ADR-0037 — encontró algo peor.**
+
+## ADR-0037 — Las vistas públicas dejan de ser escribibles por `anon`
+
+Fecha: 2026-09-23
+Estado: **Aceptada, urgente**
+Propuesta por: `security-engineer`, en el barrido que pidió ADR-0036.
+**Vulnerabilidad crítica preexistente, no introducida por ninguna ADR de
+hoy** — existe desde la Fase 4 (ADR-0008, hace meses), recién detectada.
+
+**El hallazgo, reproducido contra la base real, actor `anon` sin
+sesión**: `organizations_public`/`services_public` se crearon sin
+`security_invoker` a propósito (el calendario público necesita saltear
+RLS en **lectura**), pero el bypass alcanza los cuatro comandos, y
+`anon`/`authenticated` tienen `INSERT`/`UPDATE`/`DELETE` sobre las dos
+vistas por default privileges de Postgres (el `grant select` explícito
+de la migración es decorativo, ya tenían todo). Confirmado con requests
+reales, sin autenticar:
+
+- `DELETE services_public` sobre un servicio sin plan → **borra en
+  cascada una `Booking` `CONFIRMED`** (sin `cancelled_at`, sin
+  `MakeupCredit`, sin auditoría).
+- Lo mismo sobre un servicio cubierto por un plan
+  `applies_to_all_services` → **borra un `Payment` `PAID`**.
+- `PATCH organizations_public` sobre otro tenant → reescribe
+  `slug`/`name`/`timezone` de una organización ajena.
+- `POST organizations_public` → **crea una organización saltando
+  `create_organization_with_owner()`**, el gate de invitación
+  (ADR-0017) y `enforce_plan_limit()`.
+- Encadenado (`PATCH` para liberar un slug + `POST` para reclamarlo) →
+  **secuestro completo del slug de un negocio real**: su URL pública
+  pasa a resolver a la organización falsa del atacante.
+- `GET services_public` sin filtro → enumera servicios de **154
+  organizaciones** en un solo request, sin necesidad de adivinar nada.
+
+### Decisión
+
+```sql
+revoke insert, update, delete, truncate on public.organizations_public from anon, authenticated;
+revoke insert, update, delete, truncate on public.services_public  from anon, authenticated;
+```
+
+**`security_invoker = on` es el fix equivocado** — haría que el
+`SELECT` evaluara RLS con los privilegios del llamador y el calendario
+público (todo el punto de ADR-0008) dejaría de funcionar para un
+visitante anónimo. Se cierra la escritura, se conserva la lectura
+intacta.
+
+**De paso, mismo barrido, dos hallazgos menores en el mismo lote**:
+`organization_members_write_owner` (policy `ALL`) permite que el propio
+`OWNER` se borre a sí mismo por `DELETE` directo saltando el guard
+`LAST_OWNER` de `revoke_member()` — deja la organización sin ningún
+`OWNER`, inadministrable para siempre salvo por un platform admin.
+Mismo fix que ADR-0036 (`ALL` → `INSERT`+`UPDATE`, misma expresión). Y,
+como defensa en profundidad de bajo riesgo, la misma partición en
+`organization_roles`/`service_plan_services` (hoy protegidas solo por
+trigger, no por ausencia de policy).
+
+**Regla nueva para el repo**: toda vista de `public` se cierra con
+`REVOKE` explícito de escritura para `anon`/`authenticated` en el mismo
+momento en que se crea — el default de Postgres/Supabase es entregar
+los cuatro comandos, no solo `SELECT`, y "hicimos `grant select`" no
+implica que el resto esté cerrado.
+
+**Implementación**: completa (2026-09-23) — Fase 36, en **dos
+migraciones** que se commitean por separado:
+
+- `20260923230000_phase36_public_views_read_only.sql` — el fix de la
+  vulnerabilidad crítica: las dos vistas, `organization_members` y
+  `audit_public_view_write_grants()`. No depende de nada posterior a la
+  Fase 13, así que **se puede commitear sola**.
+- `20260923240000_phase36b_role_and_plan_scope_delete_closed.sql` — las
+  dos defensas en profundidad (`organization_roles`,
+  `service_plan_services`). **Se commitea junto con la Fase 32**, de la
+  que dependen las dos.
+
+El split no es cosmético: la versión original, en un solo archivo,
+volteó el PR en CI. CI aplica las migraciones **desde cero sobre lo que
+hay en git**, y `organization_roles` es una tabla de la Fase 32, que
+todavía no está commiteada → `relation "public.organization_roles" does
+not exist` y la migración entera aborta. El caso de
+`service_plan_services` era más peligroso por silencioso: la tabla
+existe desde la Fase 22, pero la policy que se reemplaza
+(`service_plan_services_write_owner`) la crea la Fase 32 — la Fase 22 la
+había llamado `service_plan_services_write_staff` —, así que el
+`drop policy if exists` no borraba nada y la policy `FOR ALL` con
+`DELETE` seguía viva, con los tests en verde por el motivo equivocado.
+
+**Regla que deja el incidente**: una migración sólo puede referenciar
+objetos creados por migraciones **ya commiteadas**, y la verificación de
+"aplica desde cero" se corre contra el estado real de git, no contra el
+working tree. Correr la suite completa con todo el WIP presente no dice
+nada sobre lo que CI va a aplicar.
+
+Verificado en los dos estados: sólo-commiteado + Fase 36 → 231/231
+integración en 23 archivos + 43 unitarios, `db reset` limpio; working
+tree completo (Fases 30-35 + 36 + 36b) → 321/321 en 30 archivos + 60
+unitarios. Validado al revés: restaurando temporalmente
+los grants/policies viejos, 16 de 19 fallan, incluidos los seis
+vectores anónimos y el secuestro de slug encadenado. `anon` sigue
+pudiendo `SELECT` ambas vistas (el calendario público no se rompió).
+`REFERENCES`/`TRIGGER`/`MAINTAIN` quedan sin revocar a propósito
+(inalcanzables por la Data API — PostgREST no emite DDL — y ADR-0037
+especificaba los cuatro verbos de escritura, no estos tres): deuda
+aceptada de riesgo nulo, no bloqueante.
+
+**Nota operativa**: como esta vulnerabilidad ya estaba en producción,
+corresponde revisar `audit_log` y los conteos de `organizations`/
+`services` contra lo esperado una vez aplicado el fix, para descartar
+que haya sido explotada antes de encontrarla hoy. La `anon key` es
+pública por diseño (no hay secreto que rotar).

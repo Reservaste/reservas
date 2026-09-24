@@ -1034,3 +1034,1310 @@ No hay migración de datos ni cambio de tabla — `slot_occurrence_id` y
 
 Verificado: `npx supabase db push --local` limpio + suite de integración
 completa (214 tests, 22 archivos) contra la función recreada.
+
+## Fase 30 — `audit_log` (ADR-0032, migración `20260923170000_phase30_audit_log.sql`)
+
+Registro de hechos sensibles. Aditiva: **una tabla, un enum, cuatro
+triggers de auditoría, un trigger de inmutabilidad, una policy de
+`SELECT` y una función de lectura**. No toca el motor de reservas, ni el
+de cobertura, ni ninguna firma existente.
+
+### Por qué trigger y no un `insert` en cada RPC
+
+Porque **la mitad de las escrituras del alcance no pasa por ninguna
+RPC** (verificado en el código, no supuesto): el alta de pago es un
+`INSERT` de PostgREST (`frontend/app/actions/billing.ts`), la anulación
+es un `UPDATE payments set status='VOID'` directo, y los dos cambios de
+plan (precio/nombre y activar/desactivar) son `UPDATE` directos
+(`service-plans.ts`). Un insert explícito por RPC habría dejado afuera
+justo eso. Es el mismo criterio del invariante 6 de `invariants.md` —
+toda tabla es escribible por PostgREST, así que la defensa vive en la
+base — y la lección de ADR-0028: lo que se confía a que cada llamador
+recuerde hacer, en algún lado no se hace.
+
+### El mapa: qué acción registra qué trigger
+
+Esta tabla existe para que "¿esto se audita?" se conteste acá y no
+leyendo ocho funciones.
+
+| Acción | Cómo se escribe hoy | Trigger | `action` |
+|---|---|---|---|
+| Alta de pago | `INSERT payments` (PostgREST) | `payments_audit_insert` | `PAYMENT_CREATED` |
+| Cambio de estado de pago, incluida la anulación | `UPDATE payments` (PostgREST) / `set_payment_status()` | `payments_audit_status` (`when old.status is distinct from new.status`) | `PAYMENT_STATUS_CHANGED` |
+| Reserva creada por el mostrador | `admin_book_for_customer()` | `bookings_audit_insert` | `BOOKING_CREATED_BY_STAFF` |
+| Cancelación hecha por staff | `cancel_booking()` con actor staff, `cancel_slot_occurrence()`, `discontinue_schedule_rule()`, cascada de serie | `bookings_audit_cancel` | `BOOKING_CANCELLED_BY_STAFF` |
+| Alta de plan | `create_service_plan()` | `service_plans_audit_insert` | `SERVICE_PLAN_CREATED` |
+| Cambio de precio / nombre / orden | `UPDATE service_plans` (PostgREST) | `service_plans_audit_update` | `SERVICE_PLAN_UPDATED` |
+| Activar / desactivar plan | `UPDATE service_plans` (PostgREST) | `service_plans_audit_update` | `SERVICE_PLAN_DEACTIVATED` (metadata dice `from`/`to`) |
+| Suspensión / cambio de plan SaaS | `set_organization_subscription()` | `organizations_audit_subscription` | `ORGANIZATION_SUBSCRIPTION_CHANGED` |
+
+**Fuera de alcance, explícito**: asistencia (alto volumen: una clase de 3
+personas son 3 filas por día), créditos de recupero (`makeup_credits`
+**ya es su propio log**: `origin`, `issued_by`, `source_booking_id`,
+`consumed_booking_id`, RLS `SELECT`-only — duplicarlo crearía dos
+versiones de la misma verdad), acciones del propio cliente, altas de
+cliente/servicio/horario/branding, logins y lecturas.
+
+### Shape
+
+`id`, `organization_id` (FK, nullable), `actor_id` (FK a `profiles`,
+nullable), `action` (enum de 8 valores), `target_table` + `target_id`,
+`metadata` jsonb, `created_at`. Dos índices:
+`(organization_id, created_at desc)` — el de la pantalla, y el que un
+borrado por retención necesitaría (ADR-0032 resolución 3: **sin política
+de retención por ahora**, pero el índice queda para no agregarlo sobre
+una tabla ya grande) — y `(target_table, target_id, created_at desc)`
+para "¿qué pasó con este pago?".
+
+- **`target_table` + `target_id` y no una FK por tabla.** Cuatro FK
+  nullables para expresar "una de estas cuatro" no se consultan
+  uniformemente y tres siempre están vacías. Se renuncia a la integridad
+  referencial sobre el target **a propósito**: el log tiene que
+  sobrevivir al borrado de lo que audita, y una FK con cascade borraría
+  justo la evidencia.
+- **`metadata` es el diff mínimo** (`{"status":{"from":"PENDING","to":"VOID"}}`,
+  `{"price":{"from":2500,"to":3400}}`), armado por una función por tabla
+  y **nunca** un `to_jsonb(new)` genérico — ese es el modo típico de
+  fallar de estas tablas: termina duplicando datos personales fuera de su
+  RLS. Ids, montos, estados y fechas sí; nombres, mails y teléfonos no.
+- **Sin `updated_at` ni `cancelled_at`**: una fila de auditoría es
+  inmutable por definición y darle columnas de ciclo de vida invita a
+  editarla.
+
+### Inmutabilidad
+
+RLS habilitada, **cero policies de escritura** para ningún rol,
+`revoke insert, update, delete ... from anon, authenticated` (+
+`revoke select from anon`), y `reject_audit_log_mutation()` como trigger
+`before update or delete` (y `before truncate`) que siempre lanza
+`AUDIT_LOG_IMMUTABLE`. **`service_role` no se exceptúa**: verificado en
+la suite, un cliente service-role puede leer pero no puede actualizar ni
+borrar. Corregir una fila exige un superusuario desactivando el trigger —
+una operación deliberada y fuera de banda, que es exactamente lo que
+corresponde.
+
+Dos consecuencias conocidas y aceptadas, documentadas en la migración:
+
+- `organization_id` es `on delete cascade`, así que **borrar una
+  organización a mano falla** con `AUDIT_LOG_IMMUTABLE`. Hoy no existe
+  ninguna policy de `DELETE` sobre `organizations`, así que no rompe
+  ningún camino del producto.
+- `actor_id` no tiene acción de borrado (igual que `payments.created_by`
+  desde la Fase 7): borrar un `auth.users` que dejó filas de auditoría
+  falla. **Ya pasaba antes** por esas otras FK; no es nuevo.
+
+### El actor, y la lógica de tres valores
+
+`audit_write()` es el único punto de inserción: resuelve
+`actor_id = auth.uid()` y **lo baja a `NULL` si ese uid no tiene
+`profile`** — la auditoría nunca puede ser el motivo por el que un pago
+no entra.
+
+La condición "por staff, no por el propio cliente" se escribe
+`profile_id is distinct from auth.uid()`, **nunca `<>`**: con un cliente
+gestionado (ADR-0026) `profile_id` es `NULL`, `<>` daría `NULL`, el `if`
+no entraría y la reserva que por definición hizo el mostrador quedaría
+sin auditar. Es el mismo error que la Fase 19 encontró en
+`cancel_booking()`, donde saltaba la autorización entera. Tiene su test.
+
+**Dos exclusiones del trigger de `bookings`, con su motivo:**
+
+1. `bookings_audit_insert` tiene `when (new.recurring_booking_id is
+   null)`: las fechas de una serie las materializa
+   `generate_recurring_booking()` (una por semana, por serie, por
+   cliente) y son consecuencia de la serie, no un alta de mostrador —
+   auditarlas multiplicaría el volumen del log por dos órdenes de
+   magnitud y no hay valor de enum que las describa. El alta de la serie
+   vive en `recurring_bookings` (`created_by`, `status`).
+2. Un `INSERT` sin sesión (`auth.uid() is null`) es el job de horizonte
+   (ADR-0009) y tampoco se registra. Una **cancelación** sin sesión sí:
+   es una decisión que nadie reclama, justo lo que hay que poder
+   rastrear.
+
+### Contexto opcional desde la RPC
+
+`set_config('app.audit_note', ..., true)` — local a la transacción. El
+trigger la levanta si está (`metadata.note`, recortada a 500) y **la fila
+se escribe igual si no está**: el contexto es opcional, el hecho no.
+`set_organization_subscription()` es el primer consumidor real
+(`'PLATFORM_CONSOLE'`), reescrita con `create or replace` (misma firma →
+conserva los grants de la Fase 10 y los revoke de la Fase 19).
+
+### Lectura
+
+`audit_log_select`: `is_platform_admin()` ve todo; el `OWNER` ve el log
+de su organización, **incluidas** las filas de
+`ORGANIZATION_SUBSCRIPTION_CHANGED`; `STAFF` no ve nada (es el sujeto
+mayoritario del log). El matiz de la resolución 2 —que la identidad del
+actor de plataforma no se resuelva a un nombre del lado del cliente— lo
+implementa `organization_audit_log()` (ver `docs/api.md` y
+`docs/security.md`), que es la lectura que consume el frontend.
+
+Test: `test/phase30.audit-log.test.ts` (12 casos). Verificado:
+`npx supabase db push --local` limpio, `db reset` completo desde cero, y
+la suite de integración completa (**226 tests, 23 archivos**) en verde
+con `--no-file-parallelism`.
+
+## Fase 31 — ciclos de facturación largos y prorrateo del primer período (ADR-0031, migración `20260923180000_phase31_long_billing_periods.sql`)
+
+Aditiva y sin migración de datos: **dos valores de enum, dos columnas, dos
+ramas nuevas en `billing_period_for()`, una función de cotización nueva y
+dos funciones extendidas**. `billing_period_months` nulo se lee como 1, así
+que ningún plan ni pago existente cambia de comportamiento el día del
+deploy (mismo patrón que el `UNLIMITED` de ADR-0024 y el
+`makeup_credits_enabled` de ADR-0025).
+
+**No toca el motor de reservas.** `evaluate_payment_coverage()` sigue
+preguntando "¿la fecha local del turno cae dentro del período pago?"
+(ADR-0013) y un período de tres meses o de un año responde eso sin una
+línea nueva. Todo lo de esta fase vive del lado de *escribir* un pago.
+
+### `service_plans`: `billing_period_months` y `billing_anchor_month`
+
+- `billing_cycle` gana `CALENDAR_PERIOD` y `ROLLING_PERIOD`.
+  `CALENDAR_MONTH`/`ROLLING_MONTH` **no se tocan ni se deprecan**: son el
+  caso `billing_period_months = 1` y el 100% de los datos existentes.
+- `billing_period_months int` — cada cuántos meses cobra el plan. `NULL` = 1.
+- `billing_anchor_month int` — mes (1..12) en que arranca el bloque
+  calendario. `NULL` = arranca el mes de la compra (y entonces no hay nada
+  que prorratear). Sólo para `CALENDAR_PERIOD`.
+
+Tres `CHECK` nuevos, todos de una sola fila:
+
+| Constraint | Qué impide |
+|---|---|
+| `service_plans_billing_period_months_matches_cycle` | Una segunda representación de lo mismo: los dos ciclos `_PERIOD` exigen la cantidad de meses, los `_MONTH` y el `ONE_TIME` la prohíben (bicondicional, con `coalesce(billing_cycle::text,'')` para que un `NULL` no lo vuelva trivialmente cierto). |
+| `service_plans_billing_period_months_range` | 1..12, y para `CALENDAR_PERIOD` además **divisor de 12** (1, 2, 3, 4, 6, 12): si los bloques no tapizan el año exacto, el "trimestre" se corre de año en año y el anclaje deja de significar lo que la pantalla promete. Un ciclo rodante no tiene esa restricción porque no se ancla a nada. |
+| `service_plans_billing_anchor_month_matches_cycle` | Anclar un ciclo que no se ancla (rodante) o cuyo bloque es de un mes (`CALENDAR_MONTH`). |
+
+`service_plans_billing_matches_kind` (Fase 17) **no se tocó**: ya decía
+"`MONTHLY` exige `billing_cycle` no nulo" sin enumerar cuáles.
+
+`check_service_plan_terms_immutable()` suma las dos columnas a la lista de
+términos congelados con pagos no-`VOID` (ADR-0024 resolución 5): la
+cotización las lee **en vivo** desde el plan, nunca de una copia por pago,
+así que cambiarlas reinterpretaría hacia atrás lo que alguien compró. Mover
+el anclaje además desalinea de golpe a todos los clientes del plan. El
+precio sigue libre.
+
+> **Detalle de implementación que hay que conocer para leer el archivo**: un
+> valor de enum agregado en la misma transacción no se puede usar como
+> literal de ese tipo hasta que commitee, así que todas las comparaciones de
+> ciclo van sobre `::text` (mismo recurso que el `OVER_PLAN_QUOTA` de la
+> Fase 17).
+
+### `billing_period_for()`: dos ramas nuevas, las tres viejas intactas
+
+```
+MONTHLY + CALENDAR_MONTH  -> [1 del mes de `from`, ultimo dia de ese mes]   (igual que antes)
+MONTHLY + ROLLING_MONTH   -> [from, from + 1 mes - 1 dia]                    (igual que antes)
+MONTHLY + CALENDAR_PERIOD -> el bloque de N meses anclado en billing_anchor_month que contiene a `from`
+MONTHLY + ROLLING_PERIOD  -> [from, from + N meses - 1 dia]
+ONE_TIME                  -> [from, from]                                    (igual que antes)
+```
+
+Se extendió, no se duplicó: una función "sólo para el primer pago de un
+ciclo largo" obligaría a cada llamador a saber si el pago que está creando
+es el primero — un dato que la base no tiene sin interpretar el historial —
+y serían dos fuentes de verdad sobre qué período compra un pago.
+
+**El período no se recorta** (resolución 2). Quien entra el 15 de septiembre
+en un trimestral jul-sep compra el trimestre jul-sep y su cobertura empieza
+el 1 de julio. Recortar `period_start` desalinearía el `EXCLUDE` de
+solapamiento y rompería "todos los clientes del plan renuevan el mismo
+día", que es el único motivo para elegir un ciclo calendario.
+
+El módulo del anclaje se calcula sólo con el mes del año, y es correcto
+porque el `CHECK` garantiza que N divide a 12. Un anual anclado en marzo
+resuelve el 31-ene-2026 al bloque `2025-03-01 .. 2026-02-28`.
+
+### `quote_service_plan_period(p_service_plan_id, p_from)` — la cotización
+
+`stable security definer`, **sólo lectura**, `revoke` de `public`/`anon` +
+`grant` a `authenticated`, con `is_organization_member()` adentro: el precio
+de un plan es público, pero cotizar es una operación de mostrador. Devuelve
+`period_start, period_end, full_price, prorated_price, prorated,
+units_charged, units_total`.
+
+- **Prorrateo por meses enteros, contando el mes de alta como completo**
+  (resolución 1): trimestre jul-sep con alta el 15-sep → 1 de 3; el 2-ago →
+  2 de 3; en julio → 3 de 3 (no prorratea). Es lo que el mostrador explica
+  en una frase y no depende del largo del mes.
+- **Sólo prorratea al entrar a mitad de un `CALENDAR_PERIOD` de más de un
+  mes.** Un `ROLLING_PERIOD` arranca el día de la compra, así que no hay
+  fracción que descontar — nunca prorratea. `CALENDAR_MONTH`,
+  `ROLLING_MONTH` y `ONE_TIME` tampoco.
+- Redondeo a la unidad entera de moneda, half-up (`round(numeric, 0)`).
+  `organizations.currency_minor_units` queda diferido a ADR-0027
+  (resolución 5). Cuando **no** prorratea devuelve el precio de lista *tal
+  cual*, sin pasar por `round()`: si no, un plan de 1500.50 se cobraría 1501
+  y aparecería marcado como prorrateado.
+- `least(greatest(...))` y no un `CHECK`: el monto sugerido nunca puede
+  pasar el precio de lista ni bajar de 0, pero **`payments.amount` sigue
+  libre** a propósito (ADR-0024 resolución 5). Se acota la sugerencia, no el
+  cobro.
+- **Es función pura de (plan, fecha): no lee ni un pago.** Por eso no puede
+  descontar un cambio de plan (resolución 3) ni reconocer lo no consumido de
+  un plan anterior (resolución 4, sin nota de crédito). El cambio de plan a
+  mitad de período sigue siendo VOID + recargar el **período completo**
+  (ADR-0024 resolución 1): cotizado desde el inicio del período que se
+  recarga, la respuesta es el precio completo. Si el negocio quiere
+  reconocer algo, lo ajusta a mano en `amount`.
+
+Separada de `billing_period_for()` a propósito: esa función es la que llaman
+cuatro caminos de lectura del motor, y meterle precio la convertiría en la
+función que todos llaman para todo. La envuelve, no la reimplementa.
+
+### `create_service_plan()` y el crédito de recupero
+
+- `create_service_plan()` gana `p_billing_period_months` y
+  `p_billing_anchor_month`, **con default `NULL`**. `DROP` + `CREATE` (no un
+  segundo `CREATE OR REPLACE`): dos firmas coexistiendo serían una sobrecarga
+  que PostgREST tendría que desambiguar por nombre de argumento. Se repiten
+  `revoke`/`grant` sobre la firma nueva — un `DROP FUNCTION` se lleva los
+  privilegios y Postgres otorga `EXECUTE` a `PUBLIC` por default (misma nota
+  de la Fase 29).
+- `issue_makeup_credit()`: en un plan con `billing_period_months > 1`,
+  `END_OF_BILLING_PERIOD` se **acota a `END_OF_MONTH`** (resolución 6). Un
+  crédito vivo tres meses en un plan trimestral triplica el riesgo que
+  ADR-0025 ya dejó anotado como abierto. Va acá y no en
+  `resolve_makeup_credits_policy()` porque esa política se resuelve por
+  `Service` (organización + override del servicio) y no sabe qué plan cubrió
+  la reserva liberada; `issue_makeup_credit()` ya tiene el plan en la mano
+  para decidir el alcance del crédito (ADR-0029). La fila del crédito guarda
+  la base **efectiva** (`END_OF_MONTH`), no la de la política: `expires_on`
+  es inmutable, así que la auditoría tiene que poder explicar la fecha. Para
+  ciclos mensuales no cambia nada.
+
+Test: `test/phase31.long-billing-periods.test.ts` (8 casos: cotización 1/3 y
+2/3 de trimestre, ciclo rodante que nunca prorratea, borde de mes en los dos
+sentidos, anual anclado que cruza el año, los tres `CHECK` nuevos,
+inmutabilidad con pagos no-`VOID`, cambio de plan que se recarga completo,
+crédito trimestral que vence a fin de mes con control mensual, y
+autorización cross-tenant de la cotización). Verificado: `supabase migration
+up --local` limpio y la suite de integración completa (**255 tests, 25
+archivos**) en verde.
+
+## Fase 32 — roles configurables por organización (ADR-0033, migración `20260923190000_phase32_configurable_roles.sql`)
+
+Implementa ADR-0033 completa. Antes de esta fase el rol era binario
+(`organization_member_role` = `OWNER | STAFF`) y **todo lo que no estaba
+explícitamente cerrado a `OWNER` lo podía hacer cualquier `STAFF`** —
+incluida la cobranza entera. Lo nuevo es una capa de roles configurables
+**dentro** de `STAFF`. `OWNER` no cambia una línea: sigue siendo enum fijo,
+nunca se evalúa contra un permiso y corta antes de mirar el rol.
+
+### Orden de la migración (importa)
+
+1. Enum `org_permission`, tabla `organization_roles`,
+   `organization_members.role_id`.
+2. Trigger de siembra + backfill del rol por defecto.
+3. `has_org_permission()`.
+4. Endurecimiento de policies y RPCs.
+
+Al revés hay una ventana dentro de la transacción en la que
+`has_org_permission()` devuelve `false` para todos, porque todavía no existe
+el rol por defecto al que caen los `STAFF` sin `role_id`.
+
+### `org_permission` (enum, no `text`)
+
+`VIEW_PAYMENTS`, `MANAGE_PAYMENTS`, `MANAGE_BOOKINGS`, `MANAGE_CUSTOMERS`,
+`MANAGE_ATTENDANCE`. Enum a propósito: un typo en una policy
+(`'VIEW_PAYMENT'`) falla en la migración con `invalid input value for enum`,
+no en producción con un permiso que silenciosamente deniega. El `else false`
+del `CASE` dentro del helper es el segundo cinturón.
+
+### `organization_roles`
+
+| Columna | Notas |
+|---|---|
+| `organization_id` | FK a `organizations`, `on delete cascade` |
+| `name` | **texto libre** elegido por la organización; `CHECK` 1..60 caracteres |
+| `is_default` | el rol que recibe un `STAFF` sin `role_id` |
+| `is_active` | `CHECK (not is_default or is_active)` |
+| `can_view_payments` … `can_manage_attendance` | 5 columnas `boolean not null default true` |
+
+Permisos como columnas booleanas y **no** `jsonb` (ADR-0033 §4.2):
+`(permissions->>'view_payments')::boolean` con una clave ausente o mal
+tipeada da `NULL`, y un `if NULL` no entra — que es exactamente la raíz del
+bypass de autorización de ADR-0026/ADR-0028. Con `coalesce(..., false)` se
+falla cerrado pero en silencio. Una columna booleana `not null` no tiene ese
+estado. Bonus: agregar un permiso más adelante es
+`add column can_x boolean not null default true` y ningún rol existente
+cambia de comportamiento — el `DEFAULT` *es* el mecanismo de migración.
+
+Constraints e índices:
+
+- `organization_roles_manage_implies_view`:
+  `check (not can_manage_payments or can_view_payments)`. Cobrar sin poder
+  ver lo cobrado no es un rol, es un bug.
+- `organization_roles_org_name_idx`: único por
+  `(organization_id, lower(trim(name)))`.
+- `organization_roles_one_default_idx`: único parcial por
+  `(organization_id) where is_default` → **como máximo** un default. Es
+  inmediato, así que mover el default siempre es "desmarcar y después
+  marcar".
+- `organization_roles_default_present`: **constraint trigger diferido**
+  (`deferrable initially deferred`) → **como mínimo** un default. Diferido
+  porque el swap son dos statements y un chequeo inmediato rechazaría el
+  primero. Una organización ya borrada no se chequea (el cascade se lleva
+  sus roles y no hay nada que exigir).
+- `organization_roles_not_in_use` (BEFORE UPDATE OR DELETE): un rol con
+  miembros activos no se desactiva ni se borra → `ROLE_IN_USE`. Si se
+  pudiera, esos miembros caerían al rol por defecto de golpe, en silencio y
+  posiblemente **ganando** permisos.
+
+### `organization_members.role_id`
+
+Nullable a propósito: `organization_members` es escribible por PostgREST
+directo (`organization_members_write_owner` era `for all`; desde la Fase 36 son
+`organization_members_insert_owner` + `organization_members_update_owner`, misma
+expresión y sin `DELETE` — ADR-0037), así que un
+`not null` rompería cualquier escritura que hoy no manda la columna — y
+ADR-0028 ya dejó la lección de que lo que se confía a que cada llamador
+recuerde hacer, en algún lado no se hace. El fallback al rol por defecto no
+es fail-open: ese rol lo configura el `OWNER`.
+
+Dos guardas nuevas, en la base y no en el action:
+
+- `organization_members_owner_has_no_role`:
+  `check (role <> 'OWNER' or role_id is null)`. La propuesta preveía "la
+  pantalla no ofrece rol para un `OWNER`"; el `CHECK` mata la contradicción
+  ("le puse el rol Profesor al dueño y sigue viendo todo") también para un
+  `PATCH` directo.
+- `organization_members_role_same_org` (trigger): un rol de **otra**
+  organización no es un rol de este miembro → `ROLE_OTHER_ORGANIZATION`. La
+  FK sola no lo impide (apunta a `organization_roles`, no a "los roles de
+  esta organización") y el resultado sería un cross-tenant de autorización.
+  Mismo precedente que `check_payment_same_org()`.
+
+### Siembra + backfill: nadie pierde acceso el día del deploy
+
+`organizations_seed_default_role` (AFTER INSERT on `organizations`) crea el
+rol `'Equipo'` con los cinco booleanos en `true` y `is_default`. Va como
+**trigger y no como línea dentro de `create_organization_with_owner()`**:
+una organización sin rol por defecto es una organización donde todo `STAFF`
+futuro queda sin permisos, y ADR-0028 ya demostró que lo que depende de que
+cada llamador se acuerde, en algún camino no pasa (esto cubre además el alta
+de ADR-0034 y cualquier inserción por `service_role` en tests).
+
+El backfill hace lo mismo para las organizaciones existentes y asigna
+`role_id` a los miembros **`STAFF`** (los `OWNER` quedan en null por el
+`CHECK`). Comportamiento **idéntico, bit a bit**, al del día anterior.
+
+### `has_org_permission(organization_id, org_permission)`
+
+Única puerta de permisos. `security definer` (rompe la recursión de RLS que
+documenta `phase1:204-213`), `stable`, y **con `EXECUTE` para `PUBLIC` a
+propósito** — es una de las funciones "correctas por construcción que RLS
+necesita evaluar" que ADR-0028 dejó exceptuadas del `revoke from public`;
+sólo contesta sobre `auth.uid()`.
+
+```
+OWNER                  -> true, sin consultar organization_roles
+STAFF con role_id      -> la columna del permiso en ese rol
+STAFF con role_id null -> la columna del permiso en el rol is_default
+rol inactivo / ausente -> NULL -> el EXISTS no devuelve fila -> false
+```
+
+`my_organization_permissions(organization_id)` es el read model para el
+panel: devuelve `role`, `role_id`, `role_name` y los cinco booleanos ya
+resueltos. Sin filas para un no-miembro.
+
+### Dónde se aplica: policies **y** RPCs
+
+Policies endurecidas (la **rama del cliente no se toca** — ADR-0006 de dos
+capas sigue igual; sólo la rama de staff pasa de "es miembro" a "es miembro
+con el permiso"):
+
+| Policy | Permiso |
+|---|---|
+| `payments_select_self_or_staff` | `VIEW_PAYMENTS` |
+| `payments_insert_staff`, `payments_update_staff` | `MANAGE_PAYMENTS` |
+| `payment_service_coverage_select_self_or_staff` | `VIEW_PAYMENTS` |
+| `plan_change_requests_select_self_or_staff` | `VIEW_PAYMENTS` |
+| `customers_write_staff` | `MANAGE_CUSTOMERS` |
+
+⚠️ **Renombrada en la Fase 35 (ADR-0036):** `customers_write_staff` ya no existe.
+La misma expresión `has_org_permission(organization_id, 'MANAGE_CUSTOMERS')` vive
+ahora en `customers_insert_staff` + `customers_update_staff` — la policy se partió
+para quitarle el `DELETE`. El permiso no cambió.
+
+**17 RPCs `security definer` cambiaron su chequeo interno.** Esto es lo que
+decide si la feature sirve o es decorado: una función `security definer`
+corre como dueña de la tabla y **bypassea RLS por completo**, así que
+endurecer la policy de `payments` no la toca — el dato seguiría saliendo por
+`POST /rest/v1/rpc/organization_payment_summary` con la pestaña escondida.
+Ninguna cambió de firma.
+
+| Permiso | RPCs |
+|---|---|
+| `VIEW_PAYMENTS` | `organization_payment_summary()`, `customer_payment_detail()`, `organization_plan_change_requests()` |
+| `MANAGE_PAYMENTS` | `set_payment_status()`, `resolve_plan_change_request()` |
+| `MANAGE_BOOKINGS` | `admin_book_for_customer()`, `admin_create_recurring_booking()`, `admin_preview_recurring_booking()`, `cancel_booking()` (rama de staff), `cancel_recurring_booking()` (rama de staff), `cancel_slot_occurrence()`, `retry_not_generated_booking()` (rama de staff) |
+| `MANAGE_CUSTOMERS` | `create_managed_customer()`, `enroll_customer_by_email()`, `issue_customer_activation()`, `revoke_customer_activation()` |
+| `MANAGE_ATTENDANCE` | `mark_attendance()` |
+
+`customer_billing_horizon()` estaba en la lista de la propuesta y **no
+lleva chequeo, deliberadamente**: no está otorgada a nadie (sólo al dueño de
+la función). Es un helper interno que `evaluate_payment_coverage()` y
+compañía llaman dentro del camino de reserva de un cliente, donde
+`auth.uid()` es el cliente y no un miembro — un `has_org_permission()` ahí
+rompería el booking de cualquier cliente. La puerta es el `REVOKE`, que esta
+migración deja explícito (`from public, anon, authenticated, service_role`)
+para que un `grant` futuro tenga que ser una decisión y no un descuido.
+
+### RPCs de administración de roles (OWNER)
+
+`create_organization_role()`, `update_organization_role()`,
+`set_organization_role_default()`, `set_member_role()`. Todas
+`is_organization_owner()`. Las policies
+(`organization_roles_select_members` para lectura,
+`organization_roles_write_owner` para escritura — partida en la Fase 36 en
+`organization_roles_insert_owner` + `organization_roles_update_owner`, ADR-0037)
+ya alcanzarían para un
+`PATCH` directo, pero mover el rol por defecto son **dos statements** y dos
+llamadas de PostgREST son dos transacciones (mismo razonamiento de ADR-0004
+que obligó a `book_slot()`); además los errores traducidos
+(`ROLE_NAME_TAKEN`, `ROLE_IN_USE`, `DEFAULT_ROLE_REQUIRED`,
+`MANAGE_PAYMENTS_REQUIRES_VIEW`, `OWNER_HAS_NO_ROLE`) son mejores que una
+violación de índice cruda.
+
+**Administrar roles no es un permiso configurable**: si lo fuera, existiría
+un rol capaz de ampliarse a sí mismo y los otros cinco no significarían
+nada.
+
+### Cambios de contrato
+
+- `organization_team()` (drop + create, dos columnas nuevas): gana `role_id`
+  y `role_name`, que son el rol **EFECTIVO** — el asignado, o el por defecto
+  cuando `role_id` es null. Null en las dos para un `OWNER`.
+- `invite_member_by_email()` (drop + create): gana
+  `p_role_id uuid default null` **al final**. Por el `DEFAULT`, la llamada de
+  3 argumentos que ya existía sigue resolviendo y deja al miembro en el rol
+  por defecto — es aditivo, no un contrato roto (la propuesta suponía lo
+  contrario).
+
+### El hueco preexistente que se cerró (ADR-0033 resolución 3)
+
+El precio y el nombre de un `ServicePlan` estaban protegidos a nivel `OWNER`
+**sólo en TypeScript** (`frontend/app/actions/service-plans.ts`), mientras
+`create_service_plan()` y las policies `service_plans_*_staff` pedían nada
+más `is_organization_member()`: cualquier `STAFF` cambiaba un precio con un
+`PATCH /rest/v1/service_plans` sin pasar por el panel. Ahora:
+
+- `service_plans_insert_owner` / `service_plans_update_owner` (renombradas
+  desde `*_staff`) y `service_plan_services_write_owner` (partida en la Fase 36
+  en `service_plan_services_insert_owner` + `service_plan_services_update_owner`,
+  ADR-0037).
+- `service_plans_write_owner`, trigger `before insert or update` con
+  `check_service_plan_write_owner()`. Va como **trigger y no reescribiendo
+  `create_service_plan()`**: esa función es `security definer`, o sea que
+  bypassea RLS y las policies no la alcanzan, mientras que un trigger se
+  dispara siempre — y así no se duplica el cuerpo de una función que otras
+  migraciones siguen evolucionando (la Fase 31 la rehizo). Mismo patrón que
+  `check_service_billing_override_owner()` de la Fase 25.
+- `auth.uid() is null` no se bloquea: ése es el camino sin JWT (backfills de
+  migración, el job diario, un cliente `service_role` — que ya bypassea RLS
+  por definición). Toda request real de un panel lleva su `sub`.
+
+`service_plans_select_public` **no** cambia: sigue siendo
+`is_active or is_organization_member(...)`. La lista de precios de los planes
+activos es pública — "no ver pagos" no es "no ver precios".
+
+### Lo que a propósito quedó como está
+
+- `makeup_credits` y `organization_customer_makeup_credits()` siguen siendo
+  de todo miembro: un crédito de recupero es un derecho a reprogramar, no
+  dinero cobrado, y tiene su propio registro (ADR-0025).
+- `organization_customers()`, `occurrence_bookings()`,
+  `occurrence_attendance_summary()`, `service_attendance_history()`,
+  `agenda_occurrences()`, `customer_activation_status()` y la **edición** de
+  horarios (`create_schedule_rule_group()`, modificar una regla…) siguen
+  siendo de todo miembro activo. Sin eso no hay trabajo que hacer.
+  ⚠️ **Corregido en la Fase 34:** `discontinue_schedule_rule()` estaba en
+  esta lista por error — cancela en masa reservas de clientes, así que pasó
+  a exigir `MANAGE_BOOKINGS`.
+- `services.price` (columna legada de pre-ADR-0024) sigue escribible por
+  cualquier miembro vía `services_write_staff`. Los cuatro overrides de
+  política de recupero ya eran OWNER-only por trigger desde la Fase 25.
+  ⚠️ **Cerrado en la Fase 34:** `price` pasó a OWNER-only por el mismo
+  trigger.
+
+Test: `test/phase32.configurable-roles.test.ts` (21 casos: el rol por
+defecto sembrado, un `STAFF` sin `role_id` que se comporta como antes, un
+`OWNER` que no se filtra aunque el rol por defecto no pueda nada,
+`VIEW_PAYMENTS` atacado por PostgREST **y** por las cuatro RPCs,
+`MANAGE_PAYMENTS` ver-sí/escribir-no por las tres puertas, el `CHECK` de
+manage-implica-view por RPC y por insert directo, `MANAGE_BOOKINGS` sobre
+las cinco RPCs más la rama "mi propia reserva" que no se toca,
+`MANAGE_CUSTOMERS` sobre alta/enrolamiento/activación/tabla directa,
+`MANAGE_ATTENDANCE`, precios de plan cerrados a `OWNER` por RPC y por
+`PATCH`, administrar roles cerrado a `OWNER`, `ROLE_IN_USE`,
+`DEFAULT_ROLE_REQUIRED` y el swap atómico del default, cross-tenant de roles
+por RPC y por trigger, `OWNER_HAS_NO_ROLE`, `LAST_OWNER` todavía protegido,
+`organization_team()` con el rol efectivo, `invite_member_by_email()` con 3
+y con 4 argumentos, y un no-miembro que no obtiene nada). Verificado:
+`npx supabase db reset` limpio y la suite de integración completa
+(**255 tests, 25 archivos**) en verde, más 54 unitarios del paquete de
+dominio.
+
+## Fase 33 — invitaciones de equipo (ADR-0034, migración `20260923200000_phase33_team_invitations.sql`)
+
+Implementa ADR-0034 completa. Antes de esta fase sumar a alguien al equipo
+exigía que **ya tuviera cuenta**: `invite_member_by_email()` hace
+`select id from auth.users where lower(email) = ...` y levanta
+`PROFILE_NOT_FOUND` si no la encuentra, así que el dueño no podía dar de alta
+a un profesor — tenía que pedirle que se registrara primero, esperar, y
+recién ahí invitarlo con el email exacto con el que se registró. Es el mismo
+problema que ADR-0026 resolvió para clientes, del otro lado del mostrador.
+
+`invite_member_by_email()` **no se toca**: sigue siendo el camino rápido
+cuando la persona ya tiene cuenta (ADR-0034 resolución 1), elegido
+explícitamente por quien invita y nunca automático — automático reintroduciría
+el oráculo de `PROFILE_NOT_FOUND`.
+
+### `new_activation_token()` — el acuñado, una sola definición
+
+`returns table (token text, token_hash bytea)`. Las cuatro decisiones de
+ADR-0026 sobre el token en un solo lugar: 256 bits de
+`extensions.gen_random_bytes` (CSPRNG real, no `random()`), base64url sin
+padding (43 caracteres de `[A-Za-z0-9_-]`, entra en un path segment sin
+re-encodear), `sha256` en reposo, todo schema-calificado para no depender del
+`search_path`.
+
+**Sin `EXECUTE` para nadie** — ni `authenticated`, ni `service_role`. Es un
+helper interno al que sólo llegan las funciones `security definer`, que corren
+como su dueño. Mismo patrón (y mismo motivo) que el `REVOKE` de
+`customer_billing_horizon()` en la Fase 32.
+
+`issue_customer_activation()` se rehace para usarlo. Es lo único que esta
+migración le cambia: el cuerpo es el de la Fase 32 (con su gate
+`has_org_permission(..., 'MANAGE_CUSTOMERS')`, no el de la Fase 21) salvo las
+dos líneas del acuñado. El punto de extraer el helper era justamente que esas
+dos líneas no puedan divergir entre los dos flujos (ADR-0034 §2.4).
+
+> Trampa comprobada: escribir un `create or replace` de una función viva
+> partiendo de la versión de la migración que la **creó** en vez de la que la
+> modificó **revierte** el endurecimiento posterior en silencio. Pasó acá con
+> el gate de `MANAGE_CUSTOMERS` de la Fase 32 y lo cazó
+> `test/phase32.configurable-roles.test.ts`. Al rehacer una función, la
+> referencia es la última migración que la tocó, no la primera.
+
+### `team_invitations`
+
+Mecanismo **separado** de `customer_activations` (ADR-0034 decisión 1), no una
+columna nueva en ella: el destino del token todavía no existe como fila (la de
+`organization_members` **nace en el canje**), lo que otorga es acceso a datos
+de **terceros** en todo el tenant y no "sos vos mismo", y la unicidad de "un
+link vivo" es por `(organización, email)` y no por fila.
+
+| Columna | Notas |
+|---|---|
+| `organization_id` | FK a `organizations`, `on delete cascade` |
+| `email` | el **vínculo**; normalizado por `CHECK`, no por confianza en el llamador |
+| `phone` | sólo **canal** de envío (E.164). Se guarda para poder reenviar y para saber a dónde se mandó |
+| `display_name` | el nombre con el que el dueño dio el alta. No es identidad |
+| `role` | `organization_member_role not null default 'STAFF'` + `CHECK (role = 'STAFF')` |
+| `role_id` | FK a `organization_roles`, **nullable = el rol `is_default`** de la organización |
+| `token_hash` | `bytea not null unique`, `sha256` del token. El claro nunca se guarda |
+| `expires_at` | `now() + 24 h` |
+| `created_by` / `redeemed_at` / `redeemed_profile_id` / `revoked_at` / `revoked_by` | ciclo de vida |
+
+Constraints:
+
+- `team_invitations_never_owner`: `check (role = 'STAFF')`. ADR-0034
+  resolución 5 — una invitación **nunca** puede crear un `OWNER`, y es un
+  `CHECK` y no una convención que la RPC deba recordar. Cierra incluso el
+  camino de `service_role` (que bypassea RLS por definición). La columna existe
+  en vez de asumir `'STAFF'` para que el día que el enum crezca, el `CHECK`
+  siga siendo la frontera explícita.
+- `team_invitations_email_lower`: `check (email = lower(btrim(email)))`. Sin
+  esto, `Profe@X.com` y `profe@x.com` son dos invitaciones vivas para la misma
+  persona y el índice parcial no los ve como el mismo destino.
+- `team_invitations_email_shape` y `team_invitations_phone_e164`
+  (`^\+[1-9][0-9]{6,14}$`, igual que `customers`).
+- `team_invitations_redeemed_shape`:
+  `check ((redeemed_at is null) = (redeemed_profile_id is null))`. "Canjeada" y
+  "canjeada por alguien" son el mismo hecho; el estado mixto es justo el que
+  haría ambigua la idempotencia del doble click.
+
+Índices:
+
+- `team_invitations_one_live_idx`: único parcial por
+  `(organization_id, email) where redeemed_at is null and revoked_at is null`.
+  **Un solo link vivo por (organización, email)**; reenviar revoca el anterior
+  adentro de la RPC — un link viejo es justo el que pudo haber ido al lugar
+  equivocado, no algo que deba seguir sirviendo al lado del nuevo.
+- `team_invitations_org_created_idx` `(organization_id, created_at)`: respalda
+  los dos `count(*)` del rate limit y el orden del read model.
+- `team_invitations_role_idx`.
+
+Trigger `team_invitations_role_same_org` → `ROLE_OTHER_ORGANIZATION`: un rol de
+**otra** organización no es un rol de esta invitación. La FK sola no lo impide
+(apunta a `organization_roles`, no a "los roles de esta organización") y el
+resultado sería un cross-tenant de autorización **acuñado en un token**. Mismo
+precedente que `check_member_role_same_org()`.
+
+RLS habilitada **sin una sola policy**, y además
+`revoke all on public.team_invitations from anon, authenticated` (más estricto
+que `customer_activations`, que se apoya sólo en RLS-sin-policies). Esta tabla
+tiene emails y teléfonos de gente que todavía no aceptó nada: un
+`grant select` sería un padrón de contactos expuesto. La única puerta son las
+RPCs `security definer`.
+
+### `assert_team_seat_available(organization_id, include_live_invitations)`
+
+ADR-0034 resolución 9. `enforce_plan_limit()` es un
+`before insert on organization_members`, y con este flujo el `INSERT` ocurre en
+el **canje**: sin un chequeo en la emisión, un `OWNER` con un lugar libre emite
+cinco invitaciones y cuatro personas se comen `PLAN_LIMIT_REACHED` al hacer
+click en un link que ya tenían — un error incomprensible, y del lado equivocado
+del mostrador.
+
+El trigger sigue siendo **la regla**; esto es el mensaje temprano. Por eso la
+excepción tiene exactamente la forma que levanta `enforce_plan_limit()`
+(`PLAN_LIMIT_REACHED: personas en el equipo (n/m)`): si el borde aprendió a
+leer una, lee las dos. Mismo reparto que el proyecto ya usa (la base manda, el
+borde explica).
+
+- `include_live_invitations = true` → emisión: miembros activos **+**
+  invitaciones vivas (no canjeadas, no revocadas, no vencidas).
+- `include_live_invitations = false` → la rama de **reactivación** del canje,
+  que es un `UPDATE` y por lo tanto **no** pasa por el trigger (es INSERT-only).
+  Sin esto, un link viejo reabriría una plaza que el plan ya no tiene — un
+  agujero que hoy comparte `invite_member_by_email()` y que acá queda cerrado
+  porque el que lo atraviesa es un token portador.
+
+Sin `EXECUTE` para nadie, igual que el helper de acuñado.
+
+### Las cuatro RPCs
+
+| RPC | Gate | Qué hace |
+|---|---|---|
+| `issue_team_invitation(org, email, display_name, phone, role_id)` → `(invitation_id, token, expires_at)` | **OWNER** | acuña, revoca el link vivo anterior para ese email, devuelve el token claro **una sola vez** |
+| `revoke_team_invitation(invitation_id)` | **OWNER** | idempotente; no falla si ya estaba revocada o canjeada |
+| `organization_team_invitations(org, include_history)` | **OWNER** | read model; nunca devuelve `token_hash` |
+| `claim_team_invitation(token)` → `jsonb` | `authenticated` | el canje |
+
+Las cuatro con `revoke execute from public, anon` antes del
+`grant to authenticated` (ADR-0028).
+
+**Quién emite: `OWNER`**, igual que `invite_member_by_email()`. Asimetría
+deliberada con ADR-0026 (donde un `STAFF` emite activaciones de cliente): allá
+el link otorga "ser vos mismo", acá otorga acceso a los datos de todos. El
+argumento de ADR-0026 resolución 2 para gatear a `STAFF` ("gatearlo a `OWNER`
+forzaría a compartir su cuenta") no aplica al alta de personal, que es
+ocasional y del dueño.
+
+**`issue_team_invitation()` no consulta `auth.users` en ningún momento**, a
+propósito (ADR-0034 §5.6). `invite_member_by_email()` levanta
+`PROFILE_NOT_FOUND` y con eso convierte al panel en un oráculo de "¿tal email
+tiene cuenta en la plataforma?". Este camino no responde esa pregunta — ni
+siquiera para decir "ya es miembro": si la persona ya lo es, el canje devuelve
+`OK` sin tocarle nada.
+
+Orden de chequeos al emitir: `OWNER` → `organization_can_operate()` →
+email (requerido + forma) → nombre → teléfono normalizado → rol vigente de esta
+organización → rate limit (**10/h, 30/día** por organización) → **revocar el
+link vivo de ese email** → cupo de plan → acuñar → insertar.
+
+El revoke va **antes** del chequeo de cupo a propósito: un reenvío a la misma
+persona no puede contar dos plazas, o "no le llegó, mandale de nuevo" sería un
+callejón sin salida en el plan más chico.
+
+Números del rate limit: 10/h y 30/día, no los 30/h y 200/día de
+`issue_customer_activation()` — un equipo son 2-20 personas, no 200 clientes.
+Como en ADR-0026, son propuestas razonadas, no medidas. La fuerza bruta del
+**canje** sigue siendo riesgo residual aceptado (256 bits lo vuelven
+computacionalmente irrelevante; el rate limiting general es deuda de ADR-0008).
+
+Diferencia deliberada con `create_managed_customer()`: ante un teléfono
+impresentable (`"no-es-un-telefono"`), aquélla lo deja en `null` sin decir nada
+y ésta levanta `INVALID_PHONE`. Acá el teléfono **es** el canal por el que va a
+viajar el link; dejarlo en null en silencio haría que el dueño crea que ya
+mandó el WhatsApp.
+
+### `claim_team_invitation(token)` — el canje
+
+ADR-0005 aplicado literalmente, igual que `claim_customer_activation()`: **un
+solo parámetro, el token**. No nombra ninguna organización ni ninguna fila de
+miembro. El destino sale entero del token; la identidad, entera de
+`auth.uid()`. No hay superficie de IDOR porque **no hay input que apunte a una
+fila**.
+
+1. `auth.uid() is null` → `AUTH_REQUIRED`.
+2. `token_hash = digest(token,'sha256')` **`for update`** → `INVALID_TOKEN`.
+3. `revoked_at` → `INVITATION_REVOKED`.
+4. `redeemed_at`: si `redeemed_profile_id = auth.uid()` → `OK` (idempotencia
+   del doble click); si es otro → `ALREADY_REDEEMED`.
+5. `expires_at <= now()` → `INVITATION_EXPIRED`.
+6. **El email de la sesión tiene que coincidir** → `INVITE_WRONG_EMAIL`.
+   Precedente exacto: `create_organization_with_owner()` ya hace esta
+   comparación. ADR-0034 resolución 3, **sin excepción**.
+7. Organización activa y `organization_can_operate()` →
+   `ORGANIZATION_UNAVAILABLE`.
+8. Rol vigente → `INVITATION_ROLE_UNAVAILABLE`. **Falla cerrado**: no se cae al
+   rol por defecto ni se adivina. Un rol desactivado suele ser una decisión de
+   seguridad reciente; entrar "con otra cosa" sería justo lo que esa decisión
+   quería evitar.
+9. Si ya es miembro: **activo** → `OK` sin tocar nada; **inactivo** →
+   `assert_team_seat_available(..., false)` y reactivar. En los dos casos
+   **nunca se le pisa el rol** (ADR-0034 resolución 8 / riesgo 3).
+   `invite_member_by_email()` sí lo pisa (`set role = p_role, role_id = ...`) y
+   ahí es correcto porque es sincrónico y `OWNER`-gated; en un canje sería un
+   camino de escalada — un `STAFF` que consigue una invitación a un rol mayor,
+   o peor, un link que **degrada** a alguien que ya trabaja. Un `OWNER` que se
+   invita a sí mismo por torpeza sigue siendo `OWNER`.
+10. Si no es miembro: `insert` con `role = 'STAFF'`, `role_id` de la invitación
+    y **`created_by` = el `created_by` de la invitación** — el alta la decidió
+    quien invitó, no quien hizo click. Acá corre `enforce_plan_limit()`, que es
+    la regla real.
+11. `update ... set redeemed_at = now(), redeemed_profile_id = auth.uid() where
+    id = ... and redeemed_at is null`. El `and redeemed_at is null` sobre el
+    `for update` del paso 2 da **exactamente un ganador** entre dos canjes
+    concurrentes del mismo token, incluso si el lock de fila no los hubiera
+    serializado.
+
+### `organization_team_invitations(org, include_history)` — el read model que faltaba
+
+ADR-0034 resolución 10 / riesgo 8. `organization_team()` hace
+`join public.profiles p on p.id = om.profile_id`, y una invitación pendiente
+**ni siquiera tiene fila de miembro**: sin este read model el dueño no tiene
+forma de ver a quién invitó, ni de reenviar, ni de revocar. Es el eco exacto
+del hallazgo B de ADR-0026, y por eso entra en el alcance y no en "después".
+
+`status` es **derivado**, no una columna: `REDEEMED` → `REVOKED` → `EXPIRED` →
+`PENDING`, en ese orden de precedencia. `role_name` es el rol **EFECTIVO** (el
+elegido, o el por defecto de la organización si se invitó sin elegir), igual
+que en `organization_team()`.
+
+Con `include_history = false` (default) muestra sólo lo no canjeado y no
+revocado — **incluidas las vencidas**, que son justo las que hay que reenviar.
+
+**Gate: `OWNER`, más estricto que el "miembro" que sugería la propuesta
+(§4.2).** Motivo: cada fila es el email y el teléfono de alguien que todavía no
+aceptó nada, y la emisión, la revocación y la pantalla que lo muestra ya son
+`OWNER`-only. Para un no-`OWNER` devuelve **vacío**, no una excepción (igual
+que `customer_activation_status()`): una lista sin filas es algo que la UI ya
+sabe dibujar. Nunca devuelve `token_hash`, y el token claro no se puede
+recuperar — para volver a mandarlo hay que reemitir.
+
+### Errores
+
+`NOT_AUTHORIZED`, `SUBSCRIPTION_INACTIVE`, `EMAIL_REQUIRED`, `INVALID_EMAIL`,
+`INVALID_PHONE`, `ROLE_NOT_FOUND`, `ROLE_OTHER_ORGANIZATION`,
+`RATE_LIMITED_HOURLY`, `RATE_LIMITED_DAILY`,
+`PLAN_LIMIT_REACHED: personas en el equipo (n/m)` (emisión y canje),
+`AUTH_REQUIRED`, `INVALID_TOKEN`, `INVITATION_REVOKED`, `ALREADY_REDEEMED`,
+`INVITATION_EXPIRED`, `INVITE_WRONG_EMAIL`, `ORGANIZATION_UNAVAILABLE`,
+`INVITATION_ROLE_UNAVAILABLE`.
+
+Test: `test/phase33.team-invitations.test.ts` (21 casos: el camino feliz
+completo con el `role_id` elegido y los permisos resueltos, TTL de 24 h,
+normalización de teléfono, email distinto rechazado **sin consumir el token**,
+vencido, un solo uso con idempotencia del doble click, revocado, reenvío que
+revoca el anterior, el canje que no le pisa el rol a un miembro existente ni
+degrada a un `OWNER`, `OWNER` no fabricable por RPC ni por `service_role`,
+cupo de plan en la **emisión** y también en el canje, reenvío que no cuenta dos
+plazas, rate limit por organización y no global, `OWNER`-only para emitir /
+revocar / listar, los cuatro estados del read model, la tabla invisible por
+PostgREST, rol de otra organización, rol desactivado entre emisión y click,
+token inexistente / vacío / anónimo, invitación de otro tenant, organización
+suspendida). Verificado: `npx supabase db reset` limpio y la suite completa en
+verde (**276 tests de integración en 26 archivos** + **60 unitarios** del
+paquete de dominio).
+
+## Fase 34 — límites de permiso: dónde va la autorización (migración `20260923210000_phase34_permission_boundary_fixes.sql`)
+
+Cuatro hallazgos de la auditoría de `security-engineer` sobre ADR-0031/0032/0033
+(~110 sondas de explotación reales contra la base). Tres eran **bloqueantes de
+ADR-0033**; el cuarto era el residuo de `services.price` que la Fase 32 había
+dejado anotado como "lo que a propósito quedó como está" y el Orchestrator
+decidió cerrar acá. No hay tablas, columnas ni enums nuevos: la migración sólo
+mueve chequeos de autorización y agrega un trigger.
+
+### La regla que la migración deja escrita
+
+> **La autorización de una operación va en el punto de entrada público, nunca
+> en un helper compartido que también corre como efecto colateral interno de
+> otra escritura.**
+
+Ponerlo adentro del helper produce los dos errores opuestos, y la auditoría
+encontró uno de cada uno:
+
+| | Síntoma | Caso |
+|---|---|---|
+| Falso negativo | el helper corre como consecuencia de una escritura legítima y exige un permiso que no le corresponde al actor de *esa* escritura | Fix 1 — el cajero no podía cobrar |
+| Falso positivo | otra entrada pública comparte el helper y hereda un chequeo más laxo que el suyo | Fix 2 — `discontinue_schedule_rule()` se quedó en `is_organization_member()` |
+
+### Fix 1 — `MANAGE_PAYMENTS` sin `MANAGE_BOOKINGS` no podía cobrar
+
+La Fase 32 le agregó a `retry_not_generated_booking()` un chequeo de
+`MANAGE_BOOKINGS` (correcto para la RPC: reintentar una fecha ajena a mano *es*
+operar sobre la reserva de otro). Pero esa función también corre como efecto
+colateral interno:
+
+```
+insert payments (status = 'PAID')
+  -> trigger payments_reconcile_pending            (Fase 12)
+    -> reconcile_after_payment()
+      -> reconcile_pending_recurring_bookings()
+        -> retry_not_generated_booking()           <-- chequeaba MANAGE_BOOKINGS
+          -> raise NOT_AUTHORIZED
+=> el INSERT del pago entero se abortaba
+```
+
+Un rol "Recepción" (`can_manage_payments = true`, `can_manage_bookings = false`
+a propósito) registrando el pago de un cliente con fechas
+`NOT_GENERATED`/`PAYMENT_REQUIRED` pendientes recibía `NOT_AUTHORIZED` y el pago
+no entraba. La misma cascada existía por
+`services_reconcile_on_payment_not_required` (Fase 15): apagar
+`payment_required` es edición de servicio de cualquier miembro y también moría
+en `NOT_AUTHORIZED`.
+
+Se partió en dos:
+
+| Función | Autoriza | Grants |
+|---|---|---|
+| `internal_retry_not_generated_booking(uuid)` | **nada** — el cuerpo real | `revoke execute ... from public, anon, authenticated, service_role` (mismo patrón que `audit_write()`, Fase 30) |
+| `retry_not_generated_booking(uuid)` | cliente dueño de la reserva · miembro con `MANAGE_BOOKINGS` · `auth.uid()` null (job) · y **después** delega | sin cambios: mismo nombre y firma, conserva el `revoke`/`grant` de la Fase 19 |
+
+`reconcile_pending_recurring_bookings()` pasa a llamar al **helper interno**.
+Reconciliar es la consecuencia automática del pago, no una acción del cajero
+sobre la reserva. El lock `for update` de ADR-0004 sigue viviendo en el helper,
+así que la protección de concurrencia no se movió.
+
+Barrido del resto del código de la Fase 32 buscando la misma forma: **no hay
+otro caso**. `cancel_booking()` la llama `release_my_booking()`, que es un punto
+de entrada público (la cancelación del propio cliente), no un trigger;
+`can_customer_book()` la llama `book_slot()`, idem. Las demás funciones
+invocadas internamente (`evaluate_payment_coverage`, `generate_recurring_booking`,
+`issue_makeup_credit`, `assert_*`…) no tienen chequeos propios por diseño.
+
+### Fix 2 — `discontinue_schedule_rule()` evadía `MANAGE_BOOKINGS`
+
+Seguía gateada en `is_organization_member()` desde la Fase 3, pero cancela en
+masa **todas** las `slot_occurrences` futuras de la regla, **todas** las
+`bookings` `CONFIRMED` de esas ocurrencias (con `MakeupCredit` cada una) y la
+serie recurrente entera. Su prima `cancel_slot_occurrence()`, que hace lo mismo
+para **una** fecha, ya exigía `MANAGE_BOOKINGS` desde la Fase 32. Resultado: un
+`STAFF` con los cinco permisos en `false` no podía cancelar una clase y sí podía
+cancelarle las reservas a toda la organización.
+
+Ahora exige `has_org_permission(organization_id, 'MANAGE_BOOKINGS')`, exactamente
+el mismo patrón que `cancel_slot_occurrence()`.
+
+Decisión de producto del Orchestrator, y es la frontera exacta:
+
+- **cancelación en masa** → `MANAGE_BOOKINGS`;
+- **edición** de un horario (crear la regla, cambiarle capacidad/hora, sin
+  cancelar nada) → cualquier miembro activo, sin gate nuevo.
+
+`discontinue_schedule_rule_group()` **hereda** el gate: llama a la función una
+vez por regla y el `raise` aborta la transacción completa, así que no existe
+cancelación parcial.
+
+Residuo conocido y aceptado: un `PATCH schedule_rules.is_active = false` directo
+por PostgREST sigue siendo de cualquier miembro. Apaga el horario a futuro pero
+**no cancela ninguna reserva ni ocurrencia** y no estampa `cancelled_at` — es
+edición, no cancelación, del lado correcto de la frontera de arriba.
+
+### Fix 3 — el `OWNER` se auto-reactivaba y se subía de plan
+
+`organizations_update_owner` es `for update using is_organization_owner(id)`, sin
+`WITH CHECK` y sin restricción de columnas. Un `PATCH /rest/v1/organizations` del
+propio `OWNER` podía escribir `subscription_status`, `plan_code`,
+`trial_ends_at` y `current_period_end`: se saltaba la suspensión que un platform
+admin le hubiera puesto y se subía de plan sin pasar por
+`set_organization_subscription()` (que sí está cerrada a `is_platform_admin()`).
+Preexistente a ADR-0033, pero real.
+
+Igual que en `services` (Fase 25), la policy de UPDATE de la tabla **no** puede
+pasar a platform-admin-only: el `OWNER` sigue editando nombre, timezone,
+branding y política de recupero. El chequeo tiene que ser **por columna**, así
+que va en un trigger:
+
+```sql
+create trigger organizations_subscription_platform_only
+  before update on public.organizations
+  for each row
+  execute function public.check_organization_subscription_platform_only();
+```
+
+`check_organization_subscription_platform_only()` levanta `NOT_AUTHORIZED` cuando
+cambia alguna de las cuatro columnas y `auth.uid() is not null and not
+is_platform_admin()`. Dos ramas pasan:
+
+- **platform admin real** — `set_organization_subscription()` es `SECURITY
+  DEFINER`, pero eso cambia privilegios, **no la sesión**: el trigger la ve con
+  el `auth.uid()` del admin, `is_platform_admin()` da `true` y pasa (verificado
+  con un platform admin real en el test, no razonado).
+- **`auth.uid()` null** — migraciones de datos (el backfill de la Fase 10 hace
+  `update organizations set plan_code = 'full'`), jobs internos. No hay actor al
+  que autorizar y ese camino no es alcanzable por PostgREST.
+
+Un `PATCH` que escribe el **mismo** valor no es un cambio (`is distinct from` da
+`false`) y pasa: no es una escalada.
+
+### Fix 4 — `services.price` sólo lo cambia el `OWNER`
+
+Columna legada pre-ADR-0024: ninguna decisión de cobertura la lee desde la Fase
+17 (el precio real vive en `service_plans.price`), pero seguía escribible por
+cualquier miembro vía `services_write_staff` mientras el precio del `ServicePlan`
+ya estaba cerrado al `OWNER` (`check_service_plan_write_owner`). Es un número que
+la organización publica: mismo criterio.
+
+Se **extendió** el trigger que ya existe sobre esa tabla,
+`check_service_billing_override_owner()` (Fase 25), en vez de agregar un segundo
+`before update` que haría el mismo `raise`. Ahora exige `is_organization_owner()`
+para los cuatro overrides de recupero **y** para `price`. El resto de columnas de
+`services` (nombre, descripción, `is_active`, `payment_required`…) sigue siendo
+de cualquier miembro.
+
+La columna **no se borra**: sacarla es un ADR aparte (hay lecturas históricas y
+el backfill de la Fase 17 la usó como origen). Su `comment on column` ahora dice
+quién puede escribirla. El gate es sólo en `UPDATE`: crear un servicio con
+`price` en el `INSERT` sigue siendo de cualquier miembro, igual que los cuatro
+overrides desde la Fase 25.
+
+### Cambios de contrato
+
+Ninguno. Ninguna firma de RPC cambió (la partición del Fix 1 conserva nombre y
+firma de la RPC pública a propósito) y ningún shape de respuesta se movió. Lo que
+cambia es **quién** puede llamar a `discontinue_schedule_rule()` /
+`discontinue_schedule_rule_group()` y quién puede escribir cuatro columnas de
+`organizations` y una de `services`. El panel ya sabe esconder/deshabilitar con
+`my_organization_permissions()` (Fase 32); `MANAGE_BOOKINGS` es el permiso que
+ahora también gobierna el botón "discontinuar horario".
+
+Test: `test/phase34.permission-boundary-fixes.test.ts` (14 casos: el rol
+cobra-pero-no-gestiona registrando un pago `PAID` de un cliente con fechas
+pendientes y la reconciliación confirmándolas, el mismo rol pasando un `PENDING`
+a `PAID`, la cascada de `payment_required` apagado por un rol sin ningún permiso,
+la RPC pública que **sigue** exigiendo `MANAGE_BOOKINGS` y el `OWNER` que sí
+puede, el helper interno inalcanzable como RPC, `discontinue_schedule_rule()` sin
+permiso → `NOT_AUTHORIZED` con regla/ocurrencia/reserva intactas, el grupo que
+hereda el gate sin cancelar ninguna de sus dos reglas, el `STAFF` **con**
+`MANAGE_BOOKINGS` que sí discontinúa con `RULE_DISCONTINUED`, la edición pura de
+un horario que sigue abierta, las cuatro columnas de suscripción rechazadas al
+`OWNER` una por una con la suspensión intacta, el `OWNER` que sigue editando
+nombre y timezone, un platform admin real cambiando plan y estado por
+`set_organization_subscription()`, `services.price` rechazado al `STAFF` con y
+sin permisos, y el `OWNER` que sí puede mientras `description` sigue siendo de
+cualquier miembro). Verificado: `npx supabase db reset` limpio y la suite de
+integración completa en verde (**290 tests en 27 archivos**) + **60 unitarios**
+del paquete de dominio. Además se re-corrieron los dos scripts de explotación de
+`security-engineer` (`r5.mjs` 6/6, `r6.mjs` 10/10).
+
+## Fase 35 — se cierra el `DELETE` de la Data API (ADR-0036, migración `20260923220000_phase35_close_data_api_delete.sql`)
+
+Hallazgo de `security-engineer`, reproducido contra la base real, en una línea:
+
+> **La cascada de FK no evalúa RLS.** Postgres aplica las policies a la fila que
+> el comando nombra; las filas que la integridad referencial arrastra detrás se
+> van sin que ninguna policy las mire.
+
+Las dos reproducciones concretas:
+
+| Ataque | Cascada | Daño |
+|---|---|---|
+| `DELETE /rest/v1/schedule_rules?id=eq.<X>` | `schedule_rules` → `slot_occurrences` → `bookings` | Borra `Booking`s `CONFIRMED`. **No las cancela: las borra** — sin `cancelled_at`/`cancelled_by`, sin `MakeupCredit`, sin fila en `audit_log` |
+| `DELETE /rest/v1/services?id=eq.<X>` | `services` → `payments` (`payments.service_id`, Fase 14) | Borra pagos `PAID`. Historial financiero destruido |
+
+Lo hacía un `STAFF` con los cinco permisos de ADR-0033 en `false`: exactamente el
+efecto que `MANAGE_BOOKINGS` y `MANAGE_PAYMENTS` existen para negarle. No es un
+bug introducido por ADR-0033 — es preexistente desde que estas tablas tienen
+policy `ALL using is_organization_member()` (Fases 1/2/3) — pero ADR-0033 lo
+vuelve urgente: **un rol restringido no vale nada si hay una puerta lateral que
+lo ignora.** Ningún gate de la Fase 32 ni de la Fase 34 lo cubría porque todos
+viven en policies de `INSERT`/`UPDATE` o en chequeos dentro de RPCs, y este
+camino no pasa por ninguno de los dos.
+
+### El fix: quitar el comando de la policy, no agregar un trigger
+
+Bajo RLS, la **ausencia** de policy de `DELETE` deniega por default. Las siete
+policies `ALL` pasan a `INSERT` + `UPDATE` explícitos con la **misma** expresión
+que ya tenían:
+
+| Tabla | Policy que se reemplaza | Policies nuevas | Expresión (sin cambios) |
+|---|---|---|---|
+| `schedule_rules` | `schedule_rules_write_staff` | `schedule_rules_insert_staff`, `schedule_rules_update_staff` | `is_organization_member(organization_id)` |
+| `services` | `services_write_staff` | `services_insert_staff`, `services_update_staff` | `is_organization_member(organization_id)` |
+| `resources` | `resources_write_staff` | `resources_insert_staff`, `resources_update_staff` | `is_organization_member(organization_id)` |
+| `customers` | `customers_write_staff` | `customers_insert_staff`, `customers_update_staff` | `has_org_permission(organization_id, 'MANAGE_CUSTOMERS')` (Fase 32) |
+| `schedule_exceptions` | `schedule_exceptions_write_staff` | `schedule_exceptions_insert_staff`, `schedule_exceptions_update_staff` | `is_organization_member(organization_id)` |
+| `service_entitlements` | `service_entitlements_write_staff` | `service_entitlements_insert_staff`, `service_entitlements_update_staff` | `is_organization_member(organization_id)` |
+| `service_resources` | `service_resources_write_staff` | `service_resources_insert_staff`, `service_resources_update_staff` | `exists (select 1 from services s where s.id = service_id and is_organization_member(s.organization_id))` |
+
+**El `OWNER` tampoco tiene `DELETE` directo.** Si algún día hace falta borrar de
+verdad (no cancelar ni desactivar), es una RPC nueva con su propia decisión
+explícita, nunca un `DELETE` genérico.
+
+### Por qué `ALL → INSERT + UPDATE` y no `ALL → SELECT + INSERT + UPDATE`
+
+Una policy `FOR ALL` también cubre `SELECT`, así que quitarla podría cerrar
+lectura sin querer. No pasa: **las siete tablas ya tienen su policy de lectura
+dedicada** (`*_select_*`, Fases 1/2/3), con una expresión idéntica o más amplia
+que la de la policy `ALL` que se reemplaza. El caso menos obvio es `customers`:
+`has_org_permission(..., 'MANAGE_CUSTOMERS')` exige membresía activa, así que es
+un subconjunto estricto de `is_organization_member()`, y la policy de lectura
+(`customers_select_self_or_staff`) es `profile_id = auth.uid() or
+is_organization_member(...)`. Agregar una policy de `SELECT` duplicada no
+cambiaría ni una fila visible; sólo sumaría una expresión más a evaluar por fila
+leída.
+
+### Qué NO se toca
+
+- **Ninguna FK `on delete cascade`.** Siguen siendo correctas para cuando la fila
+  padre sí se borre por una vía legítima futura. El problema nunca fue la
+  cascada: era la puerta que la disparaba.
+- **Ninguna RPC.** Verificado antes de escribir la migración, no asumido: en todo
+  `backend/supabase/migrations/` el único `delete from` es el de
+  `slot_occurrences` dentro de `regenerate_occurrences_for_rule()` (Fase 3) —
+  tabla que **no** está en esta lista y cuyo borrado de ocurrencias futuras sin
+  `Booking` es el mecanismo mismo de ADR-0003. En `frontend/app/actions/` no hay
+  un solo `.delete()` contra PostgREST (el único `.delete()` del repo es
+  `jar.delete()` sobre una cookie en `activation.ts`). Las funciones `security
+  definer`, además, no evalúan RLS, así que ningún camino interno se ve afectado
+  ni siquiera en principio.
+- **Los caminos legítimos de baja**, que ya existían y ninguno usa `DELETE`:
+  `discontinue_schedule_rule()` (`UPDATE`: corta la regla y cancela las
+  ocurrencias futuras liberando cupo), `is_active = false` para
+  `Service`/`Resource`, `revoke_member()` para equipo.
+
+### Cómo se ve un `DELETE` denegado por RLS
+
+**No da error.** Postgres no encuentra filas que el actor pueda borrar, PostgREST
+responde `204` con `[]` y la fila sigue ahí. El test afirma las dos mitades (la
+respuesta no borró nada **y** la fila sobrevive, mirada con el cliente de service
+role): afirmar sólo un código de error daría un falso verde si mañana alguien
+reabre el `DELETE`.
+
+### Cambios de contrato
+
+Ninguno. Ninguna firma de RPC cambió, ningún shape de respuesta se movió y
+ninguna pantalla del panel ofrece hoy un botón "eliminar" sobre estas tablas
+(confirmado contra `docs/api.md` antes de aceptar el ADR). El único cambio
+observable es que un `DELETE` directo por PostgREST sobre esas siete tablas deja
+de borrar.
+
+Test: `test/phase35.data-api-delete-closed.test.ts` (11 casos: los dos escenarios
+exactos de `security-engineer` — `DELETE schedule_rules` con una `Booking`
+`CONFIRMED` abajo y `DELETE services` con un pago `PAID` abajo, ambos rechazados
+con la reserva todavía `CONFIRMED` y `cancelled_at` en `null` y el pago todavía
+`PAID`; las siete tablas una por una con el **`OWNER`** como actor, que es el rol
+más privilegiado fuera del platform admin; el contrapeso de que `SELECT`,
+`INSERT` y `UPDATE` siguen funcionando en las siete; y `discontinue_schedule_rule()`
+todavía cancelando y liberando en vez de borrar). El test se validó **al revés**
+antes de darlo por bueno: con una migración temporal que restauraba las dos
+policies `ALL` originales, 8 de los 11 casos fallan — o sea que el test prueba lo
+que dice probar y no es un verde estructural. Verificado: `npx supabase db reset`
+limpio, `npm run typecheck` sin errores, **301 tests de integración en 28
+archivos** en verde (eran 290 en 27) + **60 unitarios** del paquete de dominio.
+
+## Fase 36 — las vistas públicas dejan de ser escribibles (ADR-0037, migraciones `20260923230000_phase36_public_views_read_only.sql` + `20260923240000_phase36b_role_and_plan_scope_delete_closed.sql`)
+
+> **Por qué ADR-0037 son dos migraciones y no una.** Nació como una sola y se
+> partió después de que CI la volteara. CI construye la base **desde cero con lo
+> que hay en git**, y las secciones de `organization_roles` y
+> `service_plan_services` dependen de la Fase 32, que todavía no está commiteada:
+> el `drop policy ... on public.organization_roles` abortaba la migración entera
+> con `relation "public.organization_roles" does not exist`. El caso de
+> `service_plan_services` era peor porque no fallaba: la tabla sí existe desde la
+> Fase 22, pero la policy que hay que reemplazar,
+> `service_plan_services_write_owner`, la crea la **Fase 32** (la Fase 22 la había
+> llamado `service_plan_services_write_staff`, con `is_organization_member`), así
+> que el `drop policy if exists` era un no-op silencioso que dejaba viva la policy
+> `FOR ALL` real — con el `DELETE` todavía abierto y el test en verde por el motivo
+> equivocado.
+>
+> Reparto: `..._phase36_public_views_read_only.sql` (el fix de la
+> vulnerabilidad crítica: las dos vistas + `organization_members` +
+> `audit_public_view_write_grants()`) no depende de nada posterior a la Fase 13 y
+> **va sola**. `..._phase36b_role_and_plan_scope_delete_closed.sql` se aplica
+> después de la Fase 32 y **se commitea junto con ella**.
+>
+> Regla general que deja este incidente: una migración sólo puede referenciar
+> objetos creados por migraciones **ya commiteadas**. "Anda en mi working tree" no
+> es una verificación — la verificación es aplicar desde cero sobre el estado real
+> de git.
+
+Hallazgo de `security-engineer` en el barrido que pidió ADR-0036, reproducido
+contra la base real con el actor `anon` **sin sesión**. **Vulnerabilidad crítica
+preexistente en producción desde la Fase 4 (ADR-0008)**, sin relación con ninguna
+ADR del mismo día.
+
+La causa son dos mitades que por separado parecían inofensivas:
+
+> 1. Una vista **sin `security_invoker`** corre con los privilegios de su dueño.
+>    Eso es justo lo que el calendario público necesita para leer
+>    `organizations`/`services` salteando la RLS de miembro — pero el bypass **no
+>    es sólo de lectura**: alcanza los cuatro comandos. Las dos vistas son
+>    auto-updatable (un solo `FROM`, sin agregación, sin `DISTINCT`), así que un
+>    `INSERT`/`UPDATE`/`DELETE` sobre la vista se reescribe como el mismo comando
+>    sobre la tabla base, con los privilegios del dueño y sin evaluar su RLS.
+> 2. Los **default privileges de Supabase** en `public` entregan *todos* los
+>    privilegios a `anon`/`authenticated` sobre cada tabla y vista nueva. El
+>    `grant select` explícito de la Fase 4 era decorativo: `anon` ya tenía
+>    `INSERT`, `UPDATE`, `DELETE` y `TRUNCATE` antes de que esa línea corriera.
+>    Verificado en `information_schema.role_table_grants`, no deducido.
+
+Lo que lograba un visitante anónimo con la anon key (pública por diseño) y nada
+más:
+
+| Ataque | Cascada / gate salteado | Daño |
+|---|---|---|
+| `DELETE /rest/v1/services_public?id=eq.<X>` (servicio **sin plan**) | `services → schedule_rules → slot_occurrences → bookings` | Borra `Booking`s `CONFIRMED`. **No las cancela: las borra** — sin `cancelled_at`, sin `MakeupCredit`, sin `audit_log` |
+| `DELETE /rest/v1/services_public?id=eq.<X>` (servicio cubierto **sólo** por un plan `applies_to_all_services`) | `services → payments` (`payments.service_id`, Fase 14) | Borra pagos `PAID` |
+| `PATCH /rest/v1/organizations_public?id=eq.<otro tenant>` | — | Reescribe `slug`/`name`/`timezone` de una organización ajena |
+| `POST /rest/v1/organizations_public` | `create_organization_with_owner()`, gate de invitación (ADR-0017), `enforce_plan_limit()` | Crea una `Organization` sin `OWNER` y sin invitación. La ausencia deliberada de policy de `INSERT` en `organizations` (Fase 1) no servía: la vista no la evalúa |
+| `PATCH` (libera el slug) + `POST` (lo reclama) | — | **Secuestro del slug**: la URL pública de un negocio real resuelve a la organización falsa del atacante |
+
+### El fix: cerrar la escritura, no tocar la lectura
+
+```sql
+revoke insert, update, delete, truncate on public.organizations_public from anon, authenticated;
+revoke insert, update, delete, truncate on public.services_public from anon, authenticated;
+```
+
+**`security_invoker = on` es el fix equivocado y no se aplicó.** Haría que el
+`SELECT` evaluara RLS con los privilegios del llamador, y un visitante anónimo no
+es miembro de ninguna organización: el calendario público — todo el punto de
+ADR-0008 — devolvería cero filas para todo el mundo. La lectura anónima de estas
+dos vistas es legítima e intencional; lo que nunca debió existir es la escritura.
+
+`relacl` antes: `anon=arwdDxtm/postgres`. Después: `anon=rxtm/postgres`.
+`REFERENCES`/`TRIGGER`/`MAINTAIN` quedan concedidos y **fuera del alcance de
+ADR-0037**: no son alcanzables por la Data API (PostgREST no emite DDL ni comandos
+de mantenimiento, y `anon` no tiene `CREATE` en `public`). Anotado para
+`security-engineer` en vez de ampliar el ADR sin decisión.
+
+`TRUNCATE` va en el `revoke` aunque no se pueda truncar una vista: el bit de
+privilegio existe igual, y el objetivo es que el test genérico de abajo no tenga
+excepciones que explicar.
+
+### Las tres policies `FOR ALL` que quedaban
+
+Mismo patrón que ADR-0036 (`ALL → INSERT` + `UPDATE`, **misma** expresión, sin
+`DELETE`). Bajo RLS la ausencia de policy de `DELETE` deniega por default.
+
+| Tabla | Migración | Policy que se reemplaza | Policies nuevas | Expresión (sin cambios) | Por qué |
+|---|---|---|---|---|---|
+| `organization_members` | Fase 36 | `organization_members_write_owner` (Fase 1) | `organization_members_insert_owner`, `organization_members_update_owner` | `is_organization_owner(organization_id)` | **El caso real**: un `OWNER` podía `DELETE` su propia fila y saltear el guard `LAST_OWNER` de `revoke_member()`, dejando la organización sin ningún `OWNER` activo — inadministrable para siempre, porque agregar un `OWNER` es a su vez `OWNER`-only |
+| `organization_roles` | Fase 36b | `organization_roles_write_owner` (Fase 32) | `organization_roles_insert_owner`, `organization_roles_update_owner` | `is_organization_owner(organization_id)` | Defensa en profundidad: hoy lo protegían triggers (`ROLE_IN_USE`, `DEFAULT_ROLE_REQUIRED`), no la ausencia de la policy |
+| `service_plan_services` | Fase 36b | `service_plan_services_write_owner` (Fase 32) | `service_plan_services_insert_owner`, `service_plan_services_update_owner` | `exists (select 1 from service_plans sp where sp.id = service_plan_id and is_organization_owner(sp.organization_id))` | Defensa en profundidad: `check_service_plan_services_immutable()` sólo cubría los planes con pagos no `VOID` |
+
+La columna "Migración" es la que hace que esto funcione desde cero: las dos de la
+Fase 36b tocan policies que **crea la Fase 32**, así que no pueden vivir en la
+migración que se commitea sin ella.
+
+La policy original de `organization_members` **no tenía `with check`**, así que
+Postgres usaba su `using` también como check de `INSERT`: la policy nueva de
+`INSERT` lleva exactamente esa expresión y el reparto de permisos no cambia.
+
+Verificado antes de escribir la migración, no asumido: ningún `delete from` en
+`backend/supabase/migrations/` toca estas tres tablas, y el producto nunca borró
+ninguna de las tres — el equipo se da de baja con `revoke_member()` (`UPDATE`), un
+rol se desactiva con `update_organization_role(p_is_active => false)`, y el
+alcance de un plan se fija al crearlo (`create_service_plan(p_service_ids)`) y el
+plan se desactiva en vez de rescopearse.
+
+### `audit_public_view_write_grants()` — el guardarraíl
+
+Función nueva, `stable`, `EXECUTE` **sólo** para `service_role` (`revoke all ...
+from public` primero: toda función nueva nace con `EXECUTE` para `PUBLIC`).
+Devuelve una fila por cada `(vista de public, rol de request, privilegio de
+escritura)` que siga concedido. **El resultado correcto es el conjunto vacío.**
+
+Usa `has_table_privilege` y no `information_schema.role_table_grants` a propósito:
+resuelve también los privilegios concedidos a `PUBLIC` y los heredados por
+pertenencia a otro rol, que no aparecen como fila de `anon` en el catálogo pero
+`anon` los tiene igual.
+
+**Regla nueva del repo (ADR-0037)**: toda vista de `public` se cierra con un
+`REVOKE` explícito de escritura para `anon`/`authenticated` **en la misma
+migración que la crea**. El default de Postgres/Supabase es entregar los cuatro
+comandos, y "hicimos `grant select`" no implica que el resto esté cerrado. Esta
+función existe para que olvidarse no sea silencioso.
+
+### Dos formas distintas de "denegado"
+
+| Mecanismo | Qué responde PostgREST | Qué afirma el test |
+|---|---|---|
+| Falta el privilegio de tabla (las dos vistas) | Error `42501` (`insufficient_privilege`) | el código de error **y** que la fila sobrevive |
+| Falta la policy de RLS (las tres tablas) | `204` / `[]`, **sin error** | `error === null`, cero filas afectadas **y** que la fila sobrevive |
+
+Conviven en ADR-0037, así que un test que afirmara sólo una de las dos formas
+daría un falso verde el día que alguien reabra la puerta por la otra.
+
+### Cambios de contrato
+
+Ninguno. Ninguna firma de RPC cambió y ningún shape de respuesta se movió. El
+único uso de las dos vistas en todo `frontend/` es `.select()` en
+`frontend/app/actions/public.ts`, y no hay un solo `.delete()` contra PostgREST en
+`frontend/`. Se agrega una RPC nueva (`audit_public_view_write_grants()`) que
+**no** es parte de ningún contrato de producto: sólo `service_role` la ejecuta.
+
+Tests: `test/phase36.public-views-read-only.test.ts` (**17 casos**, se commitea con
+la Fase 36) y `test/phase36b.role-and-plan-scope-delete-closed.test.ts` (**3
+casos**, se commitea con la Fase 32 + 36b: cubren `organization_roles`,
+`service_plan_services` y el `UPDATE` de `organization_members.role_id`, que es
+una columna de la Fase 32). Lo primero que
+corre no es un ataque: son los tres casos que afirman que `anon` **sigue** leyendo
+`organizations_public`, `services_public` y `get_public_availability()` — si eso se
+pone rojo, el fix está mal (es el síntoma exacto de haber puesto
+`security_invoker = on`) y hay que volver atrás, no ajustar el test. Después los
+seis vectores anónimos, el mismo intento con un usuario autenticado **sin
+membresía**, el test genérico sobre `pg_views`, el `OWNER` intentando borrar su
+propia fila de `organization_members` (con `revoke_member()` todavía devolviendo
+`LAST_OWNER` y todavía funcionando sobre un `STAFF`, con su rastro
+`cancelled_at`/`cancellation_reason`), y el contrapeso de que
+`SELECT`/`INSERT`/`UPDATE` siguen funcionando en las tres tablas.
+
+El fixture usa **dos servicios distintos** para los dos `DELETE` críticos, y eso
+no es decorativo: un servicio cubierto por un plan `PER_SERVICE` sobrevivía al
+`DELETE` anónimo **por accidente** (`validate_service_plan_scope` /
+`check_service_plan_services_immutable` abortaban la transacción al quedar el plan
+sin servicios). Un test que sólo mirara ese caso estaría midiendo la casualidad y
+no el agujero, así que hay un servicio **sin ningún plan** (con una `Booking`
+`CONFIRMED` abajo) y uno cubierto **sólo** por un plan `applies_to_all_services`
+(con un `Payment` `PAID` abajo).
+
+Validado **al revés** antes de darlo por bueno: con una migración temporal que
+devolvía los `GRANT` de escritura y las tres policies `FOR ALL`, **16 de los 19
+casos fallan** (contados sobre el archivo único, antes del split), y los tres que
+pasan son justamente los de lectura anónima, que tienen que pasar en los dos
+estados. En ese estado vulnerable los dos `DELETE` anónimos críticos devuelven
+`error === null`: borran de verdad.
+
+Un test preexistente cambió: `phase32.configurable-roles.test.ts` >
+*"un rol con miembros activos no se desactiva ni se borra"* afirmaba
+`ROLE_IN_USE` sobre un `DELETE` directo. Ese `DELETE` ya no llega al trigger — no
+hay policy — así que ahora afirma cero filas afectadas, sin error, y que el rol
+sigue en la tabla. La intención del caso no cambia; la razón por la que pasa es
+más fuerte.
+
+Verificado, en los **dos** estados que importan:
+
+| Estado | `db reset` | `typecheck` | Unit | Integración |
+|---|---|---|---|---|
+| Sólo lo commiteado + la Fase 36 (lo que arma CI: Fases 30-35 y 36b **fuera** de `supabase/migrations/`) | limpio, 30 migraciones | sin errores | 43 | **231 en 23 archivos** |
+| Working tree completo (Fases 30-35 + 36 + 36b) | limpio, 37 migraciones | sin errores | 60 | **321 en 30 archivos** |
+
+La primera fila es la que faltó la primera vez: correr la suite contra el working
+tree completo no prueba nada sobre lo que CI va a aplicar.
+
+Además de la dependencia faltante, esa corrida destapó un segundo bloqueante de CI
+**preexistente** e independiente (viene de antes del fix de seguridad):
+`phase25.production-feedback.test.ts` > *"reporte 1: el motor no es el problema"*
+filtraba ocurrencias con techo `lastOfMonth(0)T23:59:59Z`, y la clase de las 21:00
+del último día del mes tiene `start_at` a las 00:00 UTC del **1 del mes siguiente**
+(ADR-0014) — justo el caso que el test existe para probar. El filtro la excluía y
+el test pasaba sólo mientras quedara otra fecha del mes por delante: fallaba según
+la hora del día en que corriera la suite. Techo corregido a `firstOfMonth(1)`.
+
+**Nota operativa (de ADR-0037)**: como la vulnerabilidad ya estaba en producción,
+corresponde revisar `audit_log` y los conteos de `organizations`/`services` contra
+lo esperado una vez aplicado el fix, para descartar que haya sido explotada antes
+de encontrarla. La `anon key` es pública por diseño: no hay secreto que rotar.

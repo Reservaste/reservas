@@ -504,3 +504,616 @@ necesariamente la que acaba de tocar).
 
 Ninguna firma de función cambió (siguen `(slotOccurrenceId, prevState)` y
 `(bookingId)`); solo cambió el string al que redirigen.
+
+## Fase 30 — `audit_log`: lectura para el OWNER (ADR-0032)
+
+**Ninguna firma existente cambió.** `set_organization_subscription()`
+conserva sus cuatro parámetros (sólo setea `app.audit_note` adentro), y
+ningún action de pagos, reservas o planes cambió de shape: la auditoría
+la escribe un trigger, así que el llamador no se entera. Detalle de la
+base en `docs/database.md`, Fase 30.
+
+### RPC nueva — `organization_audit_log(p_organization_id, p_limit, p_before)`
+
+**Nivel ADMIN, restringido a OWNER.** `grant execute to authenticated` +
+`revoke from public, anon`. Devuelve `NOT_AUTHORIZED` para `STAFF` y para
+un `OWNER` de otra organización (no una lista vacía: acá "no sos dueño" y
+"no hay nada registrado" tienen que distinguirse, porque la pantalla dice
+"registro desde tal fecha", no "no pasó nada").
+
+```ts
+interface AuditLogEntry {          // ya vive en @reservaste/domain
+  id: string;
+  action: AuditAction;             // 8 valores, ver domain.md
+  targetTable: string;             // "payments" | "bookings" | "service_plans" | "organizations"
+  targetId: string;
+  actorId: string | null;          // null = sistema, o actor de plataforma visto por el OWNER
+  actorName: string | null;
+  actorIsPlatform: boolean;        // true = la acción la hizo alguien que no es de esta organización
+  metadata: Record<string, unknown>;  // diff mínimo: {"price":{"from":2500,"to":3400}}
+  createdAt: string;
+}
+```
+
+`p_limit` se acota en SQL a 1..200 (default 100) y `p_before` pagina hacia
+atrás por `created_at` — el orden es `created_at desc, id desc`.
+
+**El matiz de ADR-0032 resolución 2 está resuelto del lado de la lectura,
+no de la UI**: cuando el actor no es miembro de la organización (es decir,
+un platform admin suspendiendo o reactivando la cuenta), la función no
+joinea `profiles` y devuelve `actorId = null`, `actorName = null` y
+`actorIsPlatform = true`. El dueño ve **qué** pasó y **cuándo**, no quién
+de nuestro lado lo hizo. Para un llamador `is_platform_admin()` devuelve
+el actor completo.
+
+### Pendiente de backend (no lo hice en esta ronda, por consigna)
+
+`getOrganizationAuditLog()` en `frontend/app/actions/` (archivo nuevo
+`audit.ts`, o dentro de `organization.ts` si se prefiere). Contrato
+propuesto, sin sorpresas respecto de la RPC:
+
+```ts
+export async function getOrganizationAuditLog(
+  organizationSlug: string,
+  options?: { limit?: number; before?: string },
+): Promise<AuditLogEntry[]>
+```
+
+Resuelve el `organizationId` desde el slug + membership como ya hacen las
+demás acciones ADMIN (nunca un `organizationId` de parámetro libre) y
+traduce `NOT_AUTHORIZED` a "sólo el dueño puede ver el registro".
+
+### Pendiente de `frontend-engineer` — la pantalla
+
+Solo lectura, para el `OWNER`, en `/org/[slug]/configuracion` (es
+configuración del negocio, no una operación de mostrador; y ahí ya está
+el resto de lo que sólo el dueño toca). Nada de filtros elaborados en el
+primer corte: una lista cronológica descendente con
+
+- **qué pasó**, en castellano y por acción (no el enum crudo): "Se
+  registró un pago", "Se anuló un pago", "Se anotó a un cliente", "Se
+  canceló una reserva", "Se cambió el precio de un plan", "Se suspendió
+  la cuenta"...
+- **quién**: `actorName`, o "Reservaste" / "Soporte de la plataforma"
+  cuando `actorIsPlatform` es `true` (**nunca** intentar resolver ese
+  actor a un nombre, y no mostrar el uuid: viene `null` a propósito), o
+  "Sistema" cuando `actorId` es `null` y `actorIsPlatform` es `false`.
+- **cuándo**, en la zona de la organización (ADR-0014).
+- el diff de `metadata` cuando aporta ("de $2500 a $3400", "de PENDIENTE
+  a ANULADO"). `metadata.note` es texto de contexto que puso la RPC.
+
+Dos cosas que la pantalla debe decir explícitamente, porque el dato no
+las tiene:
+
+1. **"Registro desde DD/MM/AAAA"** (la fecha del deploy). No hay backfill:
+   no se puede inventar quién hizo qué antes de que el log existiera, y un
+   vacío sin esa leyenda se lee como "no pasó nada".
+2. El registro **no** incluye asistencia, créditos de recupero (que tienen
+   su propia vista) ni lo que hace cada cliente por su cuenta.
+
+`STAFF` no debe ver ni la entrada de menú: la RPC le responde
+`NOT_AUTHORIZED`, así que una pantalla visible sería un botón que siempre
+falla.
+
+## Fase 31 — ciclos de cobro largos y prorrateo (ADR-0031)
+
+Todo aditivo y compatible hacia atrás. Lo que necesita trabajo de
+`frontend-engineer` está al final, marcado.
+
+### `service-plans.ts` — `PaymentPlanOption` gana la cotización
+
+`listPaymentPlanOptions(organizationSlug, month?)` **no cambia de firma**.
+Internamente pasa de llamar `billing_period_for()` a
+`quote_service_plan_period()` (que la envuelve), y la fila que devuelve gana
+seis campos:
+
+| Campo | Qué es |
+|---|---|
+| `billingPeriodMonths: number \| null` | Cada cuántos meses cobra el plan. `null` = 1, igual que en la base. |
+| `billingAnchorMonth: number \| null` | Mes en que arranca el bloque de un ciclo calendario largo. `null` = el mes de la compra. |
+| `proratedPrice: number` | Monto **sugerido** para el período. Igual a `price` salvo que el alta caiga a mitad de un ciclo calendario largo. |
+| `prorated: boolean` | Si `proratedPrice` difiere de `price`. |
+| `unitsCharged` / `unitsTotal: number` | La cuenta a la vista: "1 de 3 meses". |
+
+`periodStart`/`periodEnd` siguen existiendo con el mismo significado, y
+**siguen sin recortarse**: un plan trimestral jul-sep cotizado el 15 de
+septiembre devuelve `2026-07-01`/`2026-09-30`, no un período recortado al
+día del alta (ADR-0031 resolución 2).
+
+El prorrateo se calcula **en SQL**, no en el browser: "un mes de un
+trimestre, contando el mes de alta como completo, redondeado a la unidad
+entera de moneda" es una regla de negocio, y una segunda implementación en
+el cliente derivaría (CLAUDE.md). Es una **sugerencia**: el campo de monto
+sigue editable y `Payment.amount` sigue libre (ADR-0024 resolución 5).
+`registerPayment()` **no cambia**.
+
+### `service-plans.ts` — `createServicePlan` acepta el ciclo largo
+
+El `FormData` admite dos campos nuevos, los dos opcionales:
+
+- `billingPeriodMonths` (1..12) — obligatorio en la práctica cuando
+  `billingCycle` es `CALENDAR_PERIOD` o `ROLLING_PERIOD`; si no viene, la
+  acción manda 1.
+- `billingAnchorMonth` (1..12) — sólo para `CALENDAR_PERIOD`. Sin él, el
+  ciclo arranca el mes de la compra (y entonces nunca hay nada que
+  prorratear).
+
+`billingCycle` acepta ahora cuatro valores (`CALENDAR_MONTH`,
+`ROLLING_MONTH`, `CALENDAR_PERIOD`, `ROLLING_PERIOD`). Un formulario que no
+mande ninguno de los campos nuevos crea exactamente el plan que creaba
+antes. La acción limpia los dos campos cuando el ciclo no los admite, y
+traduce los tres `CHECK` nuevos a mensajes en castellano
+(`service_plans_billing_period_months_matches_cycle`,
+`..._range`, `service_plans_billing_anchor_month_matches_cycle`).
+
+`updateServicePlan` **no** los acepta: son términos congelados en la
+edición, como `plan_kind`/`weekly_quota`/alcance (y además inmutables por
+trigger una vez que el plan tiene pagos no-`VOID`).
+
+### `public.ts` — `PublicServicePlan.billingCycle` se ensancha
+
+Pasa de `"CALENDAR_MONTH" | "ROLLING_MONTH" | null` a `BillingCycle | null`:
+el tipo mentía en cuanto existiera un plan de ciclo largo. El catálogo
+público **todavía no trae** `billing_period_months` (`public_service_plans()`
+no cambió), así que un plan trimestral se ve con su precio de lista y sin el
+"cada N meses" — pendiente de un corte futuro, no de esta fase.
+
+### `lib/plan-labels.ts` — etiquetas
+
+`BILLING_CYCLE_LABEL` gana las dos entradas nuevas.
+`planBillingLabel(billingType, billingCycle, billingPeriodMonths?)` y
+`planPriceSuffix(billingType, billingPeriodMonths?)` ganan un parámetro
+**opcional**: sin él dicen exactamente lo que decían antes; con él, un plan
+trimestral se rotula "Cada 3 meses" y su precio " / 3 meses" en vez de " /
+mes". La copy definitiva es de `frontend-engineer`.
+
+### Pendiente de `frontend-engineer` (no toqué UI)
+
+1. **Pantalla de planes** (`/org/[slug]/plans`): el formulario de alta gana
+   "cada cuántos meses se cobra" y, cuando el ciclo es de bloque fijo del
+   año, el **mes de anclaje**. Riesgo conocido (ADR-0031 riesgo 2): un
+   anclaje mal elegido desalinea de golpe a todos los clientes del plan y
+   después es inmutable — **mostrar los bloques resultantes antes de
+   guardar** ("ene-mar, abr-jun, jul-sep, oct-dic"). Los dos campos
+   desaparecen en la edición: están congelados.
+2. **Formulario de registrar pago**: al elegir un plan de ciclo largo,
+   mostrar el **período completo**, el **precio completo** y —si
+   `prorated`— el **monto sugerido con la cuenta a la vista** ("1 de 3
+   meses del trimestre jul-sep"). El campo de monto **sigue editable**: el
+   prorrateo es una sugerencia, no un cobro, y un descuento de mostrador
+   tiene que poder escribirse encima.
+3. **Cambio de plan a mitad de período**: sigue siendo anular + recargar el
+   período completo (ADR-0024 resolución 1), y **no se prorratea**.
+   `quote_service_plan_period()` es función pura de (plan, fecha) y no mira
+   ningún pago, así que no puede distinguir un alta de un cambio de plan:
+   cuando la pantalla está recargando un período que el cliente ya tenía
+   cubierto, tiene que cotizar **desde el inicio de ese período** (con lo
+   cual la respuesta es el precio completo) o usar `price` en vez de
+   `proratedPrice`. No hay nota de crédito por lo no consumido del plan
+   anterior: si el negocio quiere reconocer algo, lo escribe a mano en el
+   monto.
+
+## Fase 32 — roles configurables por organización (ADR-0033)
+
+Backend completo (migración `20260923190000_phase32_configurable_roles.sql`
++ paquete `@reservaste/domain` + server actions). **UI pendiente de
+`frontend-engineer`** — esta sección es la especificación completa, no hace
+falta volver a leer la migración.
+
+**Regla de oro de esta feature**: la UI **esconde y deshabilita**, nunca
+autoriza. La autorización está en RLS, en 17 RPCs y en un trigger. Pero
+tampoco vale mostrar todo y fallar al guardar: cada pantalla recibe los
+permisos resueltos antes de renderizar, así que puede no ofrecer lo que la
+base va a rechazar.
+
+### Cambio de contrato 1 — `requireOrganizationMembership(slug)`
+
+`frontend/app/actions/organizations.ts`. El shape de retorno pasa de
+`{ organization, membership }` a:
+
+```ts
+{
+  organization: Organization,
+  membership: OrganizationMember,   // ahora con `roleId: string | null`
+  roleName: string | null,          // nombre del rol efectivo; null para un OWNER
+  permissions: {
+    canViewPayments: boolean,
+    canManagePayments: boolean,
+    canManageBookings: boolean,
+    canManageCustomers: boolean,
+    canManageAttendance: boolean,
+  },
+}
+```
+
+Aditivo: ninguna pantalla existente se rompe. `permissions` viene de la RPC
+`my_organization_permissions()`, con los cinco booleanos **ya resueltos**
+(rol propio, o rol por defecto, o todo en `true` si es `OWNER`). Si la RPC
+fallara se devuelve `NO_ORG_PERMISSIONS` (todo en `false`): se falla cerrado.
+
+Para leer un permiso usar el helper del paquete de dominio, no el booleano
+suelto:
+
+```ts
+import { hasOrgPermission } from "@reservaste/domain";
+if (hasOrgPermission(permissions, "VIEW_PAYMENTS")) { /* ... */ }
+```
+
+### Cambio de contrato 2 — `getTeam(slug)` → `TeamMember`
+
+`frontend/app/actions/admin.ts`. Dos campos nuevos:
+
+```ts
+interface TeamMember {
+  memberId: string; profileId: string; fullName: string;
+  role: "OWNER" | "STAFF"; isActive: boolean;
+  roleId: string | null;    // rol EFECTIVO (el asignado, o el por defecto)
+  roleName: string | null;  // null para un OWNER
+}
+```
+
+`roleId` es el **efectivo**, no el asignado: si el miembro no tiene rol
+propio, viene el id del rol por defecto. Eso es justo lo que el `<select>`
+de la pantalla de equipo tiene que mostrar preseleccionado.
+
+### Cambio de contrato 3 — `inviteMember` acepta `roleId`
+
+`frontend/app/actions/admin.ts`. El `FormData` admite un campo opcional
+`roleId`. Vacío = rol por defecto (el comportamiento de antes). Si
+`role === "OWNER"` el `roleId` se ignora: un `OWNER` no lleva rol.
+
+### Acciones nuevas — `frontend/app/actions/roles.ts`
+
+Todas **OWNER-only** (chequeado también en la base):
+
+| Acción | Firma | Notas |
+|---|---|---|
+| `getOrganizationRoles(slug)` | `→ OrganizationRole[]` | lectura para cualquier miembro; ordenado con el default primero |
+| `createOrganizationRole(slug, prev, formData)` | `→ ActionState` | campos: `name`, y checkboxes `canViewPayments`, `canManagePayments`, `canManageBookings`, `canManageCustomers`, `canManageAttendance` |
+| `updateOrganizationRole(slug, prev, formData)` | `→ ActionState` | campos: `roleId`, `name` y los cinco checkboxes. **Un checkbox ausente significa "apagado"**, no "no lo toques" |
+| `setOrganizationRoleDefault(slug, roleId)` | `→ ActionState` | mueve el default; atómico (una RPC, no dos updates) |
+| `deactivateOrganizationRole(slug, roleId)` | `→ ActionState` | falla con `ROLE_IN_USE` si todavía lo tiene alguien |
+| `setMemberRole(slug, prev, formData)` | `→ ActionState` | campos: `memberId`, `roleId` (vacío = volver al rol por defecto) |
+
+`ActionState` es el `{ error, success }` de siempre, y los errores ya vienen
+traducidos a español por `describeRoleError()`.
+
+### Pantalla de roles — `/org/[slug]/team`
+
+Va **en la misma pantalla de Equipo**, no en una ruta nueva: la pregunta
+"¿qué puede esta persona?" y "¿qué puede este rol?" se responden juntas, y
+`/team` ya es OWNER-gated para escribir.
+
+**Sección 1 — Roles** (visible para cualquier miembro, editable sólo por el
+`OWNER`):
+
+- Lista de `getOrganizationRoles(slug)`. Por rol: nombre, badge "Por
+  defecto" en el que lo sea, y un resumen legible de los permisos (algo como
+  "Pagos: ver y registrar · Reservas · Clientes · Asistencia"). No mostrar
+  cinco íconos crudos sin texto: el dueño tiene que poder leer de un vistazo
+  qué firmó.
+- Formulario de alta con el nombre libre y los cinco checkboxes, **los cinco
+  tildados por defecto** (así crear un rol sin pensarlo reproduce el
+  comportamiento actual y nunca deja a alguien sin poder trabajar).
+- `MANAGE_PAYMENTS` implica `VIEW_PAYMENTS`: al tildar "registrar pagos",
+  tildar y **deshabilitar** "ver pagos". Si se destilda "ver pagos",
+  destildar "registrar pagos". Hay `CHECK` en la base y `refine` en Zod, pero
+  el formulario no debería poder llegar a ese estado.
+- Acciones por rol: editar, "usar como rol por defecto"
+  (`setOrganizationRoleDefault`) y desactivar
+  (`deactivateOrganizationRole`). **Nunca ofrecer desactivar el rol por
+  defecto ni un rol con miembros** — se puede saber sin pedir nada al
+  backend: el default trae `isDefault: true`, y los miembros de cada rol
+  salen de contar `team.filter(m => m.roleId === role.id)`.
+- No hay tope de roles (ADR-0033 resolución 5).
+
+**Sección 2 — Equipo** (la lista que ya existe):
+
+- Cada fila muestra hoy un `StatusBadge` con `roleLabel(member.role)`. Para
+  un `STAFF`, mostrar además (o en su lugar) el **nombre del rol**
+  (`member.roleName`), que es el dato que le importa al dueño — "Profesor"
+  dice más que "Equipo".
+- Para un `OWNER`: **no** ofrecer selector de rol, y decir por qué en una
+  línea ("El dueño siempre puede todo"). La RPC responde
+  `OWNER_HAS_NO_ROLE` y hay un `CHECK` en la base, así que ofrecerlo sería
+  ofrecer un error.
+- Para un `STAFF` activo y si quien mira es `OWNER`: un `<select>` con los
+  roles activos + `setMemberRole`, preseleccionado en `member.roleId`.
+- El formulario de invitar (`InviteForm`) gana el mismo `<select>` de rol,
+  con `name="roleId"`, deshabilitado cuando se elige `OWNER`.
+
+### Esconder según permiso — el mapa completo
+
+| Permiso ausente | Qué hay que esconder / deshabilitar |
+|---|---|
+| `canViewPayments` | El ítem "Pagos" de la navegación y toda `/org/[slug]/payments/*`; el bloque de deuda/estado de pago en la ficha de cliente; la cola de solicitudes de cambio de plan. La pantalla de planes (`/org/[slug]/plans`) **no** se esconde: es la lista de precios, que es pública |
+| `canManagePayments` | Botón "Registrar pago", anular pago (`VOID`), y resolver una solicitud de cambio de plan. La lectura queda |
+| `canManageBookings` | "Anotar cliente" en la agenda, cancelar la reserva **de otra persona**, cancelar una ocurrencia, crear/cancelar un horario fijo. Ver la agenda y la lista de anotados **no** se esconde |
+| `canManageCustomers` | "Nuevo cliente", "Cliente sin cuenta", enrolar por email, dar de baja, y emitir/revocar el link de activación de WhatsApp. El padrón se sigue viendo |
+| `canManageAttendance` | Los controles de presente/ausente. El resumen de asistencia se sigue viendo |
+
+No hay permiso para "ver el calendario", "ver la agenda" ni "ver el padrón":
+son de todo miembro activo a propósito (un rol que no ve a los clientes no
+puede pasar lista).
+
+**Fuga aceptada, no la esconda**: un rol sin `canViewPayments` sigue viendo
+la señal `upcoming_unpaid` en el horario fijo y el motivo
+`PAYMENT_REQUIRED` cuando no puede anotar a alguien (ADR-0033 resolución 2).
+Es deliberado y está documentado en `security.md`: sin ese dato el rol no
+entiende por qué el sistema lo rechaza. Redactarlo en términos de acción
+("no se puede anotar: falta el pago del período") y no de monto.
+
+### Lo que sigue siendo OWNER-only (y ahora también en la base)
+
+Planes y precios (`/org/[slug]/plans`): los gates
+`membership.role !== "OWNER"` de `service-plans.ts` **se quedan** — ahora
+están respaldados por policies y un trigger, así que ya no son la única
+defensa, pero siguen siendo el que da el mensaje decente. Igual
+configuración/branding, invitar y revocar equipo, administrar roles,
+créditos manuales de cortesía, merge/unlink de clientes.
+
+### Errores nuevos ya traducidos
+
+`ROLE_NAME_TAKEN`, `ROLE_NAME_TOO_LONG`, `ROLE_NAME_REQUIRED`,
+`MANAGE_PAYMENTS_REQUIRES_VIEW`, `ROLE_IN_USE`, `DEFAULT_ROLE_REQUIRED`,
+`ROLE_INACTIVE`, `ROLE_OTHER_ORGANIZATION`, `OWNER_HAS_NO_ROLE`,
+`ROLE_NOT_FOUND`, `MEMBER_NOT_FOUND`. `NOT_AUTHORIZED` ya estaba y sigue
+mapeando a "No tenés permiso para hacer esto" — es lo que devuelve cada RPC
+cuando el permiso falta, así que **no hace falta un código nuevo por
+permiso**.
+
+### Tipos del paquete de dominio
+
+`OrganizationRole`, `OrgPermission`, `OrganizationPermissions`,
+`MyOrganizationPermissions`, `OrganizationTeamMember`, los mappers
+(`mapOrganizationRole`, `mapMyOrganizationPermissions`,
+`mapOrganizationTeamMember`), los schemas Zod
+(`createOrganizationRoleSchema`, `updateOrganizationRoleSchema`,
+`setMemberRoleSchema`) y los helpers `hasOrgPermission`,
+`ALL_ORG_PERMISSIONS`, `NO_ORG_PERMISSIONS`, `ORG_PERMISSION_KEYS`.
+**No duplicar nada de esto del lado del frontend.**
+
+Requiere que `frontend/package.json` apunte a una versión de
+`@reservaste/domain` que incluya estos tipos (commit de `backend#main`
+posterior a la Fase 32) — orden de publicación en `CHARTER.md`.
+
+## Fase 33 — invitaciones de equipo sin registro previo (ADR-0034)
+
+Backend completo: migración `20260923200000_phase33_team_invitations.sql` +
+tipos/schemas/mappers en `@reservaste/domain`. **Server actions y UI pendientes
+— esta sección es la especificación completa, no hace falta volver a leer la
+migración.** Por consigna de esta ronda no se tocó nada de `frontend/`, ni
+siquiera `app/actions/`.
+
+El problema que resuelve: hoy `inviteMember` traduce `PROFILE_NOT_FOUND` a "No
+existe una cuenta con ese email. Si todavía no se registró..." — o sea, el
+dueño no puede dar de alta a un profesor hasta que el profesor se registre
+solo. Es exactamente el problema que ADR-0026 resolvió para clientes.
+
+**`inviteMember` no cambia.** Sigue siendo el camino rápido para quien ya tiene
+cuenta (ADR-0034 resolución 1), elegido **explícitamente** por el dueño. No
+hacerlo automático es deliberado: elegir el camino según si el email ya tiene
+cuenta reintroduciría el oráculo de "¿tal email está registrado en la
+plataforma?".
+
+### RPCs nuevas (contrato con la base)
+
+| RPC | Gate | Parámetros | Devuelve |
+|---|---|---|---|
+| `issue_team_invitation` | **OWNER** | `p_organization_id`, `p_email`, `p_display_name`, `p_phone`, `p_role_id` | `setof (invitation_id uuid, token text, expires_at timestamptz)` — **una fila** |
+| `revoke_team_invitation` | **OWNER** | `p_invitation_id` | `void`, idempotente |
+| `organization_team_invitations` | **OWNER** | `p_organization_id`, `p_include_history boolean default false` | `setof` (ver abajo) |
+| `claim_team_invitation` | `authenticated` | `p_token` | `jsonb`: `{ status, organization_slug, organization_name, member_id }` |
+
+`organization_team_invitations()` devuelve, por fila: `invitation_id`, `email`,
+`display_name`, `phone`, `role_id`, `role_name` (el rol **efectivo**),
+`status` (`PENDING | REDEEMED | REVOKED | EXPIRED`, derivado), `created_at`,
+`expires_at`, `redeemed_at`, `redeemed_profile_id`, `revoked_at`, `created_by`.
+**Nunca `token_hash`.** Para un no-`OWNER` devuelve **cero filas**, no un error.
+
+`issue_team_invitation()` devuelve el token claro **exactamente una vez**. No se
+puede recuperar (en la base sólo vive su `sha256`): si se pierde antes de mandar
+el WhatsApp, hay que **reemitir** — lo que revoca el anterior.
+
+### Server actions a escribir — `frontend/app/actions/team-invitations.ts`
+
+Archivo nuevo, no dentro de `admin.ts`: `admin.ts` ya pasa las 700 líneas y este
+es un flujo con su propio vocabulario de errores. Todas `OWNER`-only (y
+chequeado en la base, así que el gate en TS es el que da el mensaje decente, no
+la defensa).
+
+```ts
+export interface IssuedTeamInvitation {
+  invitationId: string;
+  expiresAt: string;
+  /**
+   * Deep link de api.whatsapp.com ya armado en el servidor (nombre de la
+   * organización y siteUrl() nunca desde el cliente). El token existe en esta
+   * URL exactamente una vez: no se devuelve por separado, no se persiste, no
+   * se loguea.
+   */
+  whatsappUrl: string;
+  /** El link pelado, para "copiar link" cuando no hay teléfono. */
+  invitationUrl: string;
+}
+
+// Campos del FormData: email, displayName, phone (opcional), roleId (vacío = rol por defecto)
+export async function issueTeamInvitation(
+  organizationSlug: string,
+  prev: ActionState,
+  formData: FormData,
+): Promise<ActionState & { invitation: IssuedTeamInvitation | null }>;
+
+export async function revokeTeamInvitation(
+  organizationSlug: string,
+  invitationId: string,
+): Promise<ActionState>;
+
+export async function getTeamInvitations(
+  organizationSlug: string,
+  includeHistory?: boolean,
+): Promise<OrganizationTeamInvitation[]>;
+```
+
+Notas de implementación que no son opcionales:
+
+- Validar con `inviteTeamMemberSchema` de `@reservaste/domain` **antes** de la
+  RPC. El schema ya normaliza el email a minúsculas, igual que la RPC: si el
+  borde y la base normalizaran distinto, "reenviar" crearía una segunda
+  invitación viva en vez de reemplazar la primera.
+- `invitationUrl = `${siteUrl()}/equipo/${token}`` y el mensaje de WhatsApp
+  armado con un helper propio, **`buildWhatsAppTeamInvitationLink()`** en
+  `frontend/lib/whatsapp-team-invitation-link.ts`. No reusar
+  `buildWhatsAppActivationLink()`: el texto del mensaje es otro ("te invita a
+  sumarse al equipo", no "a activar tu cuenta para gestionar tus reservas") y
+  el path es otro. Igual que el de clientes, **el mensaje nombra a la
+  organización y nunca a la persona**: mandarlo a un número mal tipeado no
+  puede filtrar el nombre de un tercero.
+- El token **no** se devuelve como campo suelto ni se guarda en estado de
+  cliente. Sólo viaja dentro de `whatsappUrl`/`invitationUrl`.
+- `revalidatePath(`/org/${slug}/team`)` después de emitir y de revocar.
+- Si no hay `phone`, `whatsappUrl` va `null`/vacío y la UI ofrece sólo "copiar
+  link". Una invitación sin teléfono es válida.
+
+### El canje — `frontend/app/actions/team-invitations.ts` + ruta propia
+
+**Cookie y ruta propias, no las de `/activar`.** Alguien puede ser cliente del
+negocio **y** haber sido invitado al equipo (la recepcionista que además
+entrena ahí es el caso normal, no el raro): si el flujo de equipo reusara
+`/activar/[token]` o la cookie `activation_token`, un token pisaría al otro y la
+persona perdería uno de los dos sin forma de recuperarlo (el claro no existe en
+la base).
+
+| Pieza | Clientes (ADR-0026) | Equipo (ADR-0034) |
+|---|---|---|
+| Ruta que recibe el link | `/activar/[token]/route.ts` | `/equipo/[token]/route.ts` |
+| Pantalla de confirmación | `/activar/continuar` | `/equipo/continuar` |
+| Cookie | `activation_token`, `path: "/activar"` | `team_invitation_token`, `path: "/equipo"` |
+| TTL de la cookie | 72 h | **24 h** |
+| Helper | `lib/activation-cookie.ts` | `lib/team-invitation-cookie.ts` (nuevo) |
+
+La ruta `/equipo/[token]/route.ts` es un calco del handler de clientes, y por
+las mismas razones (que están escritas en el archivo existente y siguen
+valiendo):
+
+- `Cache-Control: no-store`, `Referrer-Policy: no-referrer`,
+  `X-Robots-Tag: noindex`, cookie `httpOnly` + `Secure` + `sameSite: "lax"`.
+- **El GET no toca la base**: WhatsApp (y todo cliente de chat) hace fetch del
+  link para armar la tarjeta de preview antes de que la persona lo toque, así
+  que cualquier cosa que se consumiera acá la consumiría un crawler y el primer
+  click humano encontraría el link usado.
+- **`maxAge` de la cookie = TTL del token (24 h), no unos minutos.** Ésta es la
+  lección que ya rompió el flujo de clientes en producción (ver el hotfix de
+  2026-09-23 más arriba): la cookie es la **única copia** del token que tiene la
+  persona, y el camino normal es link → `/login` → `/signup` → confirmar email →
+  volver, que tarda más que unos minutos. La invariante es *la cookie nunca
+  puede vencer antes que el token*, y `TEAM_INVITATION_TOKEN_TTL_SECONDS` tiene
+  que espejar el `interval '24 hours'` de `issue_team_invitation()`
+  (`backend/test/phase33.team-invitations.test.ts` fija el lado SQL, así que los
+  dos no pueden divergir en silencio).
+- Al limpiar la cookie, **repetir el `path`**: `jar.delete(name)` apunta a la
+  cookie de path `/`, que es otra cookie distinta.
+
+```ts
+/** Server component helper: ¿hay un token de equipo en vuelo? */
+export async function readTeamInvitationToken(): Promise<string | null>;
+
+/** El canje. La RPC recibe SÓLO el token, leído de la cookie httpOnly. */
+export async function claimTeamInvitation(): Promise<{ error: string | null }>;
+```
+
+En éxito: limpiar la cookie y redirigir a `/org/${organization_slug}` (el panel
+del negocio al que se acaba de sumar), no a `/dashboard`. La persona hizo click
+para entrar a **ese** negocio.
+
+Sin cookie, **no decir "venció"** — mismo error que el hotfix de clientes tuvo
+que arreglar. El texto correcto es: *"No encontramos la invitación en este
+navegador. Volvé a abrir el link desde este mismo teléfono y seguí desde ahí."*
+
+### Errores a traducir
+
+| Código | Mensaje sugerido |
+|---|---|
+| `NOT_AUTHORIZED` | "No tenés permiso para hacer esto" (ya existe) |
+| `SUBSCRIPTION_INACTIVE` | "La suscripción de la organización está suspendida" (ya existe) |
+| `EMAIL_REQUIRED` / `INVALID_EMAIL` | "Revisá el email: es el que la persona va a tener que usar para entrar" |
+| `INVALID_PHONE` | "Revisá el teléfono: tiene que incluir el código de país (ej: +598 99 123 456)" |
+| `ROLE_NOT_FOUND` / `ROLE_OTHER_ORGANIZATION` | "Ese rol ya no está disponible. Elegí otro" (ya existen) |
+| `RATE_LIMITED_HOURLY` / `RATE_LIMITED_DAILY` | "Mandaste muchas invitaciones seguidas. Probá de nuevo en un rato" |
+| `PLAN_LIMIT_REACHED` | "Tu plan no tiene más lugares de equipo. Contá también las invitaciones pendientes: revocá una o cambiá de plan" — **el mensaje tiene que mencionar las pendientes**, porque es la diferencia con el error que ya existía |
+| `INVALID_TOKEN` | "Este link no es válido. Pedile al negocio que te lo reenvíe" |
+| `INVITATION_REVOKED` | "Este link fue desactivado. Pedile al negocio uno nuevo" |
+| `INVITATION_EXPIRED` | "Este link venció (duran 24 horas). Pedile al negocio que te lo reenvíe" |
+| `ALREADY_REDEEMED` | "Este link ya fue usado por otra cuenta. Pedile al negocio uno nuevo" |
+| `INVITE_WRONG_EMAIL` | **El mensaje más importante del flujo.** "Esta invitación es para otro email. Entrá con la casilla a la que te la mandaron, o pedile al negocio que te la reenvíe a `<el email con el que estás>`." Hay que decir **con qué email está la sesión**, o la persona no tiene forma de entender qué salió mal (el caso típico: se registró con Google y su cuenta de Google es otra). |
+| `INVITATION_ROLE_UNAVAILABLE` | "El rol de esta invitación ya no existe. Pedile al negocio que te la reenvíe" |
+| `ORGANIZATION_UNAVAILABLE` | "Este negocio no está disponible en este momento" |
+| `AUTH_REQUIRED` | "Iniciá sesión para continuar" (ya existe) |
+
+### UI pendiente de `frontend-engineer`
+
+**En `/org/[slug]/team`**, junto a la sección de Roles de la Fase 32. Todo
+`OWNER`-only.
+
+**Sección "Invitar al equipo" — dos caminos, elegidos por el dueño:**
+
+1. *"Ya tiene cuenta"* → el `InviteForm` que ya existe (`inviteMember`).
+2. *"Todavía no tiene cuenta"* → formulario nuevo: **nombre + teléfono +
+   email** + el mismo `<select>` de rol de la Fase 32. Lo que el usuario pidió
+   textualmente es el alta por nombre y teléfono; el email va igual y **no es
+   opcional**, porque es lo único que el canje puede verificar — decirlo en el
+   campo ("con este email va a tener que entrar") en vez de dejarlo como un dato
+   burocrático más.
+
+No unificar los dos en un solo formulario que decida solo: eso reintroduce el
+oráculo de emails (ADR-0034 §5.6) y además borra la diferencia real entre "ya
+está adentro" y "le mandé un link que puede no llegar".
+
+**Al emitir**, mostrar el resultado en el acto y **una sola vez**:
+
+- Botón primario "Enviar por WhatsApp" → `invitation.whatsappUrl`
+  (`target="_blank"`).
+- Botón secundario "Copiar link" → `invitation.invitationUrl`.
+- Aviso explícito: *"Este link se muestra una sola vez y vence en 24 horas. Si
+  lo perdés, reenvialo."* No es decoración: el token no se puede recuperar.
+- **Nunca** renderizar el token como texto suelto ni ponerlo en un `input`
+  visible, ni loguearlo.
+
+**Lista de invitaciones** (`getTeamInvitations`), separada de la lista de
+miembros — una invitación pendiente **no es** un miembro y ponerlas juntas
+miente sobre el padrón. Por fila: nombre (o el email si no hay nombre), email,
+teléfono, rol, y un badge por `status`:
+
+| `status` | Badge | Acciones |
+|---|---|---|
+| `PENDING` | "Enviada" + "vence en N h" | Reenviar, Revocar |
+| `EXPIRED` | "Vencida" (warning, no error: nadie hizo nada mal) | Reenviar, Revocar |
+| `REVOKED` | "Cancelada" (sólo con historial) | — |
+| `REDEEMED` | "Activada" + fecha (sólo con historial) | — |
+
+- **"Reenviar" es emitir de nuevo con los mismos datos**, no un "resend" que
+  recicle el link: el token anterior se revoca y sale uno nuevo. Decirlo en el
+  botón o en un tooltip ("el link anterior deja de funcionar").
+- Un toggle "ver historial" que pasa `includeHistory: true`.
+- Estado vacío con el porqué: "Todavía no invitaste a nadie que no tenga
+  cuenta."
+
+**Cuando el plan está lleno**: deshabilitar el formulario de invitar y decir
+cuántos lugares hay y cuántos están tomados **contando las pendientes**. El
+dato ya está: miembros activos de `getTeam()` + invitaciones con `status` en
+`PENDING` (las vencidas no cuentan, igual que en la base). Es el error más
+confuso de la feature si se lo deja aparecer recién al apretar el botón.
+
+### Tipos del paquete de dominio
+
+`TeamInvitation`, `TeamInvitationStatus`, `OrganizationTeamInvitation`, los
+mappers `mapTeamInvitation` / `mapOrganizationTeamInvitation` (con sus filas
+`TeamInvitationRow` / `OrganizationTeamInvitationRow`) y los schemas Zod
+`inviteTeamMemberSchema`, `revokeTeamInvitationSchema`,
+`claimTeamInvitationSchema`, `teamInvitationEmailSchema`,
+`teamInvitationPhoneSchema`. **No duplicar nada de esto del lado del
+frontend.**
+
+Requiere que `frontend/package.json` apunte a una versión de
+`@reservaste/domain` que incluya estos tipos (commit de `backend#main`
+posterior a la Fase 33) — orden de publicación en `CHARTER.md`.
