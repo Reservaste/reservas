@@ -2080,6 +2080,40 @@ los conteos de `organizations`/`services` contra lo esperado **una vez aplicado 
 fix**, para descartar que haya sido explotada antes de encontrarla. La `anon key`
 es pública por diseño: no hay secreto que rotar.
 
+## Suite E2E contra producción (ADR-0039) — reglas de credenciales
+
+La suite Playwright de `frontend/e2e/` opera producción real con una sesión real.
+Reglas (auditoría security-engineer, 2026-09-25):
+
+1. **La contraseña QA nunca se tipea dentro de un test reportado.** Verificado
+   empíricamente con Playwright 1.63: `locator.fill(value)` deja `value` en claro en
+   (a) el título del step del reporte HTML (`Fill "<valor>"`), **para tests que
+   pasan también**; (b) los params de la acción y los snapshots DOM
+   (`__playwright_value_`, incluso en `type="password"`) del `trace.zip`; y (c) el
+   snapshot ARIA de `error-context.md` (`textbox "Contraseña": <valor>`). El
+   reporte se sube como artifact de CI. El login con la credencial real se hace
+   una sola vez en `globalSetup` (fuera del reporter y sin trace) y los tests
+   reusan `storageState`; el archivo de `storageState` es un token de sesión: va
+   a una ruta gitignoreada y **nunca** dentro del artifact subido.
+2. **Secrets a nivel de step, no de job**: `QA_EMAIL`/`QA_PASSWORD` solo en el
+   `env:` del step que corre Playwright; el job con `permissions: contents: read`.
+3. **Cuenta QA dedicada, de mínimo privilegio — propuesta, evaluada y
+   rechazada por el usuario (Orchestrator, 2026-09-25)**: se le presentó la
+   opción de crear una cuenta que sea OWNER únicamente de `redentor`, sin ser
+   platform admin ni pertenecer a otras organizaciones, para acotar el radio
+   de impacto de una fuga de credenciales a solo datos de prueba. El usuario
+   eligió explícitamente seguir usando su cuenta personal real
+   (`credendor@gmail.com`, dueño real de `redentor`) como cuenta QA. **Riesgo
+   aceptado**: si `QA_PASSWORD` se filtra por cualquier vector (este ya
+   cerrado por la regla 1, u otro futuro), el radio de impacto es el de esa
+   cuenta completa — no solo `redentor` — y depende de a qué otras
+   organizaciones pertenezca o si tiene privilegios de plataforma. Esto hace
+   que la regla 1 (nunca tipear la contraseña real en un test reportado) sea
+   todavía más importante de mantener, no menos: es la única barrera real
+   que queda contra ese escenario.
+4. Si se sospecha que un artifact con la credencial llegó a subirse: borrar el
+   artifact y **rotar la contraseña**.
+
 ## Pendiente de definir (Phase 1)
 
 - Proveedor de auth concreto: **Supabase Auth** (ADR-0002, cerrado).

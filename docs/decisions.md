@@ -2556,6 +2556,86 @@ montoSugerido = round2(tarifaDiaria × díasEnElPeríodoEditado)
   puramente de presentación, igual que `suggestedAmount()`
   (ADR-0031) — vive en el mismo componente cliente.
 
-**Implementación**: pendiente, delegada a `frontend-engineer`
-(`app/org/[slug]/customers/[customerId]/customer-forms.tsx`,
-`RegisterPaymentForm`).
+**Implementación**: completa (2026-09-24) — `frontend-engineer` la hizo en
+`lib/billing-period.ts` (`inclusiveDays()`, `round2()`) y
+`RegisterPaymentForm`; `qa-engineer` agregó `lib/billing-period.test.ts`
+(13 casos) tras un primer NO LISTO del reviewer por falta de cobertura;
+segunda pasada, LISTO. Commit `6ff1902` (frontend), mergeado a `main` vía
+PR #6. Verificado además a mano contra producción el mismo día (ver nota
+de Fase de verificación visual, más abajo): plan de $1.700/mes, período
+editado a 10 días → sugiere $566,67 exacto.
+
+## ADR-0039 — Suite E2E de humo contra producción, después de cada deploy de frontend
+
+Fecha: 2026-09-24
+Estado: **Aceptada**
+Propuesta por: usuario, después de una sesión de verificación visual
+manual (Playwright ad-hoc, agente Orchestrator operando el navegador con
+las credenciales de un owner real) que encontró todo el trabajo del día
+funcionando correctamente en producción — pidió que esa verificación deje
+de ser manual y corra sola en cada deploy futuro.
+
+**Decisión, con las dos preguntas que el Orchestrator le hizo al usuario
+ya resueltas:**
+
+1. **Cuándo corre**: después del deploy, como *smoke test* contra el
+   sitio real (`https://161-35-63-60.sslip.io`) — no como gate de CI
+   antes de mergear. Un job nuevo en `frontend/.github/workflows/ci.yml`,
+   `needs: deploy`, que corre Playwright contra producción una vez que el
+   healthcheck del contenedor ya dio verde. Si falla, no bloquea nada
+   (el deploy ya pasó) pero el workflow queda en rojo — visible, no
+   silencioso.
+2. **Rigor de "consistencia visual"**: **sin capturas de referencia**
+   (no hay pixel-diff ni baseline que aprobar a mano en cada cambio
+   visual intencional). En su lugar, reglas concretas y automatizables:
+   escaneo de accesibilidad (`axe-core`, que entre otras cosas mide
+   contraste de color) en cada pantalla clave, sin scroll horizontal a
+   390px de ancho, y presencia de los componentes esperados
+   (`EmptyState`, `FormError`/`FormSuccess`) donde el patrón del resto
+   del producto los exige.
+
+### Organización de prueba: `redentor`, permanente
+
+La organización `redentor` (dueño real del usuario, antes vacía) se usó
+hoy para crear datos de prueba a mano vía la UI real (no SQL directo) y
+verificar visualmente: horario, agenda con tres estados de ocupación,
+plan mensual, prorrateo por días (ADR-0038), roles, invitación de equipo,
+auditoría. El usuario pidió explícitamente **dejar esos datos, no
+limpiarlos** — pasa a ser la organización de pruebas permanente de la
+suite, con datos con prefijo/nombre reconocible (`Cliente Uno`..,
+`Pilates`, plan `Mensual`) para no confundirse con una organización real.
+
+**Regla no negociable para la suite (la razón de este párrafo es un
+hallazgo de hoy, no hipotético)**: cada test que cree estado en
+`redentor` tiene que **limpiarlo al final** o **reusar lo que ya existe**
+en vez de crear de nuevo, porque:
+
+- **Los cupos de equipo son finitos** (2 en el plan actual) — armar una
+  invitación de prueba sin revocarla al terminar deja el cupo ocupado
+  para siempre; a la segunda corrida la suite ya no puede probar el
+  flujo de invitación (se topa con "Tu plan no tiene más lugares de
+  equipo"). **Toda invitación de prueba se revoca en el mismo test.**
+- **Una reserva duplicada del mismo cliente en el mismo turno rechaza**
+  (invariante del dominio, no negociable) — si un test reserva y no
+  cancela, la corrida de la semana que viene sobre el mismo horario
+  fijo falla por una razón que no tiene nada que ver con lo que se
+  quiere probar. **Toda reserva de prueba se cancela (`Quitar`, staff)
+  al final del test que la creó.**
+- **No hay `DELETE`** para casi nada de esto (ADR-0036/0037): "limpiar"
+  significa anular el pago, cancelar la reserva, revocar la invitación —
+  nunca borrar filas.
+- Recursos/servicios/planes/clientes de prueba se crean **una sola vez**
+  (buscar por nombre antes de crear) — no hace falta recrearlos en cada
+  corrida, y `ScheduleRule` sigue generando `SlotOccurrence` futuras solas
+  (ventana rodante de 90 días, ADR-0009), así que un horario fijo creado
+  una vez alcanza para siempre.
+
+### Credenciales
+
+Cuenta QA: la del dueño real de `redentor` que el usuario ya usa. Viven
+como secrets de GitHub Actions del repo `frontend` (`QA_EMAIL`,
+`QA_PASSWORD`) — el Orchestrator no tiene forma de crear secrets de
+GitHub por su cuenta, así que **queda a cargo del usuario** cargarlos
+antes de que el job corra por primera vez.
+
+**Implementación**: delegada a `qa-engineer`.

@@ -375,6 +375,50 @@ Sigue pendiente, sin cambios por este pase: verificación visual con
 `next dev`/sesión real (Fase M), y el resto de la densidad `touch` del panel
 admin (Clientes, Pagos, Servicios, Recursos, Equipo como listas).
 
+## Suite E2E de humo post-deploy (ADR-0039)
+
+`frontend/e2e/` (Playwright + `@axe-core/playwright`): corre después de cada
+deploy de `frontend`, contra el sitio real (`smoke-e2e` en
+`frontend/.github/workflows/ci.yml`, `needs: deploy`, sin gate hacia atrás —
+si falla, el deploy ya pasó y nada se bloquea, pero el workflow queda en
+rojo, visible). `frontend/e2e/playwright.config.ts` fija `baseURL` desde
+`PLAYWRIGHT_BASE_URL` (default la URL del droplet), un solo proyecto
+chromium, `workers: 1` sin paralelismo.
+
+Corre contra la organización `redentor`, permanente y compartida (no una
+organización descartable por corrida). `frontend/e2e/helpers.ts` documenta
+por qué y trae los helpers ya resueltos (login contra el server action real,
+lectura de "Anotados (N)" a prueba de `text-transform: uppercase`,
+find-or-create de fixtures, prorrateo de pagos). Dos reglas no negociables
+para cualquier spec nuevo acá:
+
+- **Buscar antes de crear.** Los recursos/servicios/planes/clientes de
+  `redentor` ya existen (creados a mano una vez); un spec nuevo los busca
+  por nombre y sólo crea si falta. Crearlos de nuevo en cada corrida es el
+  bug, no una corrida más segura.
+- **Limpiar lo que se ensucia, en el mismo test.** No hay `DELETE` para casi
+  nada de este dominio (ADR-0036/0037): "limpiar" es cancelar la reserva,
+  anular el pago, revocar la invitación — nunca borrar filas. Un cupo de
+  equipo sin revocar o una reserva sin cancelar rompe la corrida siguiente
+  por una razón que no tiene nada que ver con lo que ese spec prueba. Los
+  specs con estado propio limpian en `finally`/`try`-`catch` para que un
+  fallo de aserción no tape el cleanup.
+
+También documentado ahí, porque costó una trampa real operando la app a
+mano antes de escribir la suite: un turno cuyo horario ya pasó
+(`CalendarEvent.past`, `schedule-calendar.tsx`) se renderiza siempre en un
+tono neutro plano sin importar su ocupación — a propósito, no un bug — así
+que cualquier spec sobre color de ocupación tiene que ubicar la *próxima
+ocurrencia futura* del horario que le interesa (nunca una fecha
+hardcodeada).
+
+Sin capturas de referencia (ADR-0039, resolución 2): la "consistencia
+visual" se automatiza como axe-core (umbral `serious`/`critical`, no
+`moderate`/`minor` — documentado en `consistency.spec.ts`), ausencia de
+scroll horizontal a 390px, y presencia del patrón `EmptyState` real
+(`data-slot="empty-state"`, agregado a `components/ui/empty-state.tsx` para
+que un test pueda ubicarlo sin depender de un texto que puede cambiar).
+
 ## Próximos pasos
 
 Arrancar Phase 1 (`roadmap.md`): Auth + Organizations + Roles, con el
