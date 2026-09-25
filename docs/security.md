@@ -2080,6 +2080,26 @@ los conteos de `organizations`/`services` contra lo esperado **una vez aplicado 
 fix**, para descartar que haya sido explotada antes de encontrarla. La `anon key`
 es pública por diseño: no hay secreto que rotar.
 
+## Fases 37/37b/38 — niveles de acceso verificados (2026-09-25)
+
+Ninguna policy nueva ni tocada (las tres migraciones no contienen `create/alter/drop
+policy` ni cambios de `row level security`). Niveles verificados contra base local
+(`pg_proc.proacl` = `{postgres, authenticated, service_role}`, sin `PUBLIC` ni `anon`;
+`anon` recibe `42501`), y con una prueba cross-org con ids reales:
+
+| Función | Nivel | Cómo se resuelve la identidad |
+|---|---|---|
+| `my_payments()` (reescrita 2 veces por `drop`+`create`) | **CUSTOMER** — cada migración re-aplica `revoke from public, anon` + `grant to authenticated` (ADR-0028) | **solo `auth.uid()`**: `join customers c on c.id = p.customer_id and c.profile_id = auth.uid()`, idéntico a la Fase 15. Un OWNER que no es `Customer` recibe `[]`. Columnas nuevas (`plan_name`, `plan_kind`, `weekly_quota`, `plan_applies_to_all_services`, `currency`) son del plan que el propio cliente compró; mismo nivel de disclosure que `public_service_plans()` (anon). `payments_same_org`/`payments_plan_consistency` garantizan que el plan joineado es de la misma organización que el pago. |
+| `recurring_booking_occurrences(uuid)` | **ADMIN** — `is_organization_member(rb.organization_id)` dentro del `where`; `revoke from public, anon` + `grant to authenticated` | membership sobre `recurring_bookings.organization_id` (el trigger `recurring_bookings_same_org` ata ese valor al del `Customer` y la `ScheduleRule`). OWNER y STAFF de otra organización con el id real de una serie ajena reciben `[]`; el propio `Customer` de la serie también recibe `[]` (no es vista de cliente). |
+
+**Regla que queda escrita:** una RPC ADMIN que recibe un id de fila hija (serie,
+booking, pago) gatea con `is_organization_member()` sobre el `organization_id` de
+**esa fila** (no sobre el slug que manda el server action). El
+`requireOrganizationMembership(slug)` del server action es UX, no el gate: un
+miembro de A y B que manda slug A con una serie de B ve la serie de B porque es
+miembro legítimo de B — no es fuga, pero el frontend no debe asumir que el
+resultado pertenece al slug.
+
 ## Suite E2E contra producción (ADR-0039) — reglas de credenciales
 
 La suite Playwright de `frontend/e2e/` opera producción real con una sesión real.

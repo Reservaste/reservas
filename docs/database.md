@@ -2396,3 +2396,157 @@ alter table public.organizations
 Test: `backend/test/phase27b.reserved-organization-slugs.test.ts` (3 casos: cada slug
 reservado rechazado por la RPC, `INSERT` directo con `service_role` rechazado por el
 `CHECK`, slug que sólo *contiene* una palabra reservada aceptado).
+
+## Fase 37 — `my_payments()`: `LEFT JOIN` + descripción del plan (ADR-0029, migración `20260925100000_phase37_my_payments_plan_scope.sql`)
+
+Pedido: en `/me/pagos` (portal del cliente) el pago sólo mostraba el monto, sin decir
+qué compró. Al investigar apareció el mismo bug que ya se había corregido del lado
+admin en la Fase 25 (§4, `customer_payment_detail()`), pero nunca replicado acá:
+`my_payments()` (Fase 15, `phase15:574`) joineaba `services` por `payments.service_id`
+con `INNER JOIN`. Desde ADR-0029 (Fase 22) `payments.service_id` es `NULL` cuando el
+pago está anclado a un plan que cubre varios servicios (o todos,
+`applies_to_all_services`) — ese `INNER JOIN` descartaba la fila entera. Un pago real,
+`PAID`, de un plan multi-servicio simplemente no aparecía en la pantalla de pagos del
+propio cliente — sin error visible, sólo una fila que nunca llegaba.
+
+`services` pasa a `LEFT JOIN` y `service_name` cae a `coalesce(s.name, sp.name)`
+(mismo criterio que `customer_payment_detail()`). Se agregan cuatro columnas para que
+el frontend pueda armar "de qué plan vino y qué da" incluso cuando no hay un único
+servicio: `plan_name`, `plan_kind`, `weekly_quota` (entrada de `planSummary()`,
+`frontend/lib/plan-labels.ts`) y `plan_applies_to_all_services` (alcance, relevante
+cuando `service_name` cae al plan porque no hay un único servicio). `service_plans` se
+joinea también por `LEFT JOIN`, defensivo: `payments.service_plan_id` es `NOT NULL`
+desde la Fase 7, así que en la práctica nunca pierde filas.
+
+**Cambio de contrato — `returns table` cambia de forma.** `CREATE OR REPLACE` no
+alcanza (Postgres no permite cambiar el tipo de retorno de una función existente): la
+migración hace `DROP FUNCTION` + `CREATE FUNCTION`, igual que la Fase 15 ya había hecho
+con esta misma función. Eso resetea los grants a los default de Postgres (`PUBLIC`
+tiene `EXECUTE` por default en funciones) — `revoke ... from public, anon` + `grant
+... to authenticated` están en la misma migración, sin depender de que el revoke de la
+Fase 19 (que apuntaba a un objeto con OID distinto) siga aplicando.
+
+`service_name` pasa a ser nullable — el único consumidor hoy (`getMyPayments()`,
+`frontend/app/actions/customer.ts`) ya lo tipa `string | null`. El JSX de
+`/me/pagos` queda **pendiente de `frontend-engineer`**: hoy sólo muestra el monto, no
+se tocó esa pantalla en este cambio.
+
+Test: `backend/test/phase37.my-payments-plan-scope.test.ts` — un pago `PAID` anclado a
+un plan `UNLIMITED` `applies_to_all_services` (dos servicios cubiertos, sin service
+único) confirma que la fila aparece con `plan_name`/`plan_kind`/
+`plan_applies_to_all_services` correctos (este es exactamente el caso que el `INNER
+JOIN` viejo descartaba en silencio); un pago normal de un plan `WEEKLY_QUOTA` de un
+único servicio confirma `service_name`/`plan_name`/`plan_kind`/`weekly_quota`; un
+no-cliente sigue recibiendo `[]` (ADR-0006, sin cambios).
+
+**Fase 37b — `currency` (migración `20260925120000_phase37b_my_payments_currency.sql`).**
+Mismo día, cambio chico y aditivo: `/me/pagos` necesita formatear cada monto en la
+moneda real de la organización que emitió el pago — un mismo cliente puede tener pagos
+de varias organizaciones distintas, cada una con su propia `organizations.currency`
+(ISO 4217, default `UYU`, ADR-0024), así que no hay forma segura de asumir una moneda
+desde el frontend sin este dato viajando junto al monto. `my_payments()` ya hacía
+`join public.organizations o`; se agrega `o.currency` al `select` y `currency text` al
+final del `returns table` (mismo patrón que `my_services()`, Fase 23,
+`20260922210000:26,45`). Contrato aditivo — agrega una columna, no quita ni renombra
+ninguna existente.
+
+Otro `DROP FUNCTION` + `CREATE FUNCTION` (el `returns table` cambia de forma otra vez;
+`CREATE OR REPLACE` no alcanza) con `revoke`/`grant` repetidos en la misma migración —
+mismo motivo que la Fase 37: el objeto queda con OID nuevo, los grants anteriores no le
+aplican. No se editó la migración de la Fase 37 (`20260925100000`), ya revisada y
+probada — esta es una migración nueva, separada.
+
+Test: se extendieron los dos casos con pago (`plan applies_to_all_services` y `plan`
+de servicio único) de `backend/test/phase37.my-payments-plan-scope.test.ts` para
+afirmar `currency === "UYU"` (default de la organización de test, sin override).
+
+## Fase 38 — `recurring_booking_occurrences()`: detalle fecha por fecha de un horario fijo activo (migración `20260925110000_phase38_recurring_booking_occurrence_detail.sql`)
+
+Pedido del dueño (captura de pantalla): en la fila de un horario fijo, el badge rojo
+"Falta el pago" (de `upcoming_unpaid`) quedaba pegado visualmente a la oración de
+`upcoming_beyond_period` ("N caen más adelante que el período que ya pagó..."), la
+única que tenía texto propio. Leído en conjunto se lee como contradictorio. Dos
+partes: el fix de mensajería simétrica es de frontend puro (ver `docs/api.md` §
+`standing-reservations.tsx`); esta migración resuelve la otra mitad — "ver claramente
+qué está agendado y qué no", fecha por fecha, no sólo el conteo agregado que ya da
+`schedule_rule_standing_reservations()` (Fase 25).
+
+**RPC nueva** (no se toca `schedule_rule_standing_reservations()`, que sigue siendo la
+fuente del agregado):
+
+```sql
+recurring_booking_occurrences(p_recurring_booking_id uuid)
+  returns table (
+    slot_occurrence_id uuid,
+    start_at timestamptz,
+    display_status text,                          -- 'CONFIRMED' | 'UNPAID' | 'OVER_QUOTA'
+                                                    -- | 'BEYOND_PERIOD' | 'UNAVAILABLE'
+    booking_status public.booking_status,          -- 'CONFIRMED' | 'NOT_GENERATED', real
+    not_generated_reason public.not_generated_reason  -- real, null si CONFIRMED
+  )
+```
+
+`security definer`, `stable`; `revoke ... from public, anon` + `grant ... to
+authenticated` (mismo patrón que `schedule_rule_standing_reservations()`).
+Autorización: filtra por `public.is_organization_member(rb.organization_id)` en el
+`WHERE` — un no-miembro recibe `[]`, no una excepción (mismo criterio que el agregado).
+
+**Por qué no reusar `admin_preview_recurring_booking()`.** Esa RPC (Fase 11/32) evalúa
+una serie **prospectiva**: `evaluate_customer_booking(occurrence, customer,
+v_existing_series, v_existing_series is null)` — cuando la serie ya existe
+(`v_existing_series` no nulo) sigue pasando `p_prospective_series = false`, pero el
+punto es que fue diseñada para el caso "todavía no la creé, ¿qué pasaría?" (dry-run
+antes de confirmar, ADR-0012). Reusarla contra una serie que **ya está activa**
+arriesga evaluarla como si fuera una serie adicional hipotética en vez de la que ya
+ocupa su lugar en la cuota del plan (`customer_series_in_force_count()` vs.
+`customer_series_quota_position()`, Fase 22) — el mismo tipo de error que ya se vio
+antes en esta tabla (Fase 12/17: reescribir sin cuidado la generación pierde el
+descuento de cuota). `recurring_booking_occurrences()` en cambio no evalúa nada: lee
+el `not_generated_reason` real que `generate_recurring_booking()` /
+`reconcile_pending_recurring_bookings()` ya dejaron guardado en `bookings` la última
+vez que corrieron.
+
+**`display_status` desdobla `PAYMENT_REQUIRED` en dos**, con la misma comparación de
+fechas que el agregado ya usa para separar `upcoming_unpaid` de
+`upcoming_beyond_period`:
+
+```sql
+case
+  when b.status = 'CONFIRMED' then 'CONFIRMED'
+  when b.not_generated_reason = 'PAYMENT_REQUIRED' then
+    case
+      when public.slot_local_date(so.id) <= public.customer_billing_horizon(
+             rb.customer_id, sr.service_id, (now() at time zone org.timezone)::date)
+      then 'UNPAID'        -- cobrable hoy
+      else 'BEYOND_PERIOD' -- no es deuda, todavía no se factura
+    end
+  when b.not_generated_reason::text = 'OVER_PLAN_QUOTA' then 'OVER_QUOTA'
+  else 'UNAVAILABLE'        -- SLOT_FULL / DUPLICATE
+end
+```
+
+Esto **no** es una evaluación prospectiva: es la misma comparación de fecha contra
+`customer_billing_horizon()` (Fase 25) que ya corre dentro de
+`schedule_rule_standing_reservations()`, aplicada fila por fila en vez de contada.
+Sin este desdoble el `not_generated_reason` crudo no alcanza — `UNPAID` y
+`BEYOND_PERIOD` comparten el mismo valor guardado (`PAYMENT_REQUIRED`) y sólo se
+distinguen por la fecha de la ocurrencia contra el horizonte de facturación.
+
+`booking_status` y `not_generated_reason` viajan también en crudo (sin traducir) para
+quien prefiera leer el dato real en vez de confiar en `display_status`.
+
+**Acción de frontend nueva**: `listStandingReservationOccurrences(organizationSlug,
+recurringBookingId)` en `frontend/app/actions/standing.ts` (mapea
+`display_status` → `StandingOccurrenceStatus`, mismo vocabulario que
+`StandingCreateSummary`). El consumo en UI (detalle expandible) queda para
+`frontend-engineer`.
+
+Test: `backend/test/phase38.recurring-booking-occurrence-detail.test.ts` — una serie
+real con `CONFIRMED`, `UNPAID` y `BEYOND_PERIOD` simultáneos (un único pago que cubre
+un tramo intermedio, sin cubrir hoy, para que `customer_billing_horizon()` caiga en la
+rama de fallback) verificando que el detalle suma exactamente igual que
+`schedule_rule_standing_reservations()` para esa misma serie; una segunda serie sobre
+otro `ScheduleRule` del mismo cliente que excede la cuota del plan (`OVER_QUOTA`,
+mismas fechas pagas que la primera, para confirmar que lo que la bloquea es la cuota y
+no el pago); un no-miembro de la organización recibe `[]`; `anon` no puede ejecutar la
+RPC.

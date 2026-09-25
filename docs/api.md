@@ -1234,3 +1234,122 @@ server action invocable por `POST` — una que devuelve el valor de una cookie `
 deshace el `httpOnly`. **Regla:** un helper que devuelve un secreto nunca vive en un
 módulo `"use server"`. Consumidores actualizados: `app/activar/continuar/page.tsx` y
 `app/equipo/continuar/page.tsx` (sólo el import).
+
+## Fase 37 — `getMyPayments()`: qué compró cada pago (ADR-0029)
+
+Pedido del dueño (vía "Juanito Pérez"): en `/me/pagos` (portal del cliente) el pago
+sólo mostraba el monto — sin decir qué plan/servicio compró. Investigando apareció un
+bug más grave en la misma función: un pago anclado a un plan multi-servicio
+(`applies_to_all_services`, `payments.service_id = NULL` desde ADR-0029) no aparecía
+en absoluto en la pantalla de pagos del propio cliente — lo descartaba un `INNER JOIN`
+en `my_payments()` (mismo bug ya corregido del lado admin en la Fase 25,
+`customer_payment_detail()`, nunca replicado acá). Detalle de la RPC en
+`docs/database.md` §Fase 37.
+
+**Contrato ampliado, no roto** (agrega campos y relaja uno a nullable, no quita ni
+renombra ninguno):
+
+```ts
+export interface MyPayment {
+  paymentId: string;
+  organizationName: string;
+  serviceName: string | null;   // antes string -- null cuando el pago no tiene un único servicio (plan multi-servicio)
+  periodStart: string;
+  periodEnd: string;
+  status: "PAID" | "PENDING" | "OVERDUE" | "VOID";
+  amount: number | null;
+  planName: string;                      // nuevo
+  planKind: ServicePlanKind;              // nuevo
+  weeklyQuota: number | null;             // nuevo
+  planAppliesToAllServices: boolean;      // nuevo
+}
+```
+
+`getMyPayments()` (`frontend/app/actions/customer.ts`) mapea las cuatro columnas
+nuevas de `my_payments()`; nada más cambió en la acción. `planSummary(planKind,
+weeklyQuota)` (`frontend/lib/plan-labels.ts`, ya usado en otras pantallas) es lo que
+la UI puede llamar para mostrar qué da cada plan.
+
+**Implementado** (2026-09-25): `app/me/pagos/page.tsx` cae al `planName` cuando
+`serviceName` es `null`, muestra `planSummary(planKind, weeklyQuota)` y antepone
+"Todos los servicios · " cuando `planAppliesToAllServices` es `true`. Pendiente real
+(no bloqueante, cosmético): un plan que cubre *varios* servicios puntuales (no
+"todos") también deja `serviceName` en `null` y hoy no recibe ninguna nota de
+alcance — mismo límite que ya tiene `customer_payment_detail()` del lado admin, no
+es una regresión de este cambio.
+
+**Fase 37b — `currency` (migración `20260925120000_phase37b_my_payments_currency.sql`).**
+Mismo día, cambio chico y aditivo: como un cliente puede tener pagos de varias
+organizaciones distintas, cada una con su propia moneda (`organizations.currency`,
+ADR-0024), `/me/pagos` no puede formatear `amount` sin saber en qué moneda viene ese
+pago puntual. `my_payments()` ahora expone `currency` (detalle de la RPC en
+`docs/database.md` §Fase 37, subsección "Fase 37b"). Contrato ampliado, no roto — se
+agrega un campo:
+
+```ts
+export interface MyPayment {
+  // ...igual que antes...
+  currency: string; // nuevo -- ISO 4217 de la organización que emitió el pago
+}
+```
+
+`getMyPayments()` (`frontend/app/actions/customer.ts`) mapea `currency` sin cambios en
+el resto de la acción. `formatMoney(amount, currency)` (`frontend/lib/money.ts`) es lo
+que `app/me/pagos/page.tsx` puede llamar para reemplazar el `${p.amount}` sin formato
+— pantalla que queda, de nuevo, pendiente de `frontend-engineer`.
+
+## Fase 38 — horario fijo: detalle fecha por fecha de una serie activa (`standing.ts`)
+
+Reporte del dueño (con captura): en la fila de un horario fijo, el badge rojo "Falta
+el pago" (de `upcomingUnpaid`) quedaba pegado a la única oración explicativa que
+había, la de `upcomingBeyondPeriod` — se lee como contradictorio aunque hablan de
+fechas distintas. Dos partes, backend hace ambas:
+
+**1. `standing-reservations.tsx` — mensaje simétrico, sin contrato nuevo.**
+`upcomingUnpaid` gana la misma oración que ya tenían `upcomingOverQuota` y
+`upcomingBeyondPeriod` ("N fecha(s) están esperando que se ponga al día el pago del
+período actual para confirmarse."), y el bloque de texto se reordena para quedar en
+el mismo orden que el de badges (ya estaba así): `upcomingUnpaid` (accionable hoy) →
+`upcomingOverQuota` (requiere una decisión del dueño) → `upcomingBeyondPeriod`
+(informativo). Sin cambio de contrato — `StandingReservation` no gana campos, es sólo
+JSX.
+
+**2. `listStandingReservationOccurrences(organizationSlug, recurringBookingId)`
+(acción nueva) — el detalle fecha por fecha.**
+
+```ts
+export type StandingOccurrenceStatus =
+  "CONFIRMED" | "UNPAID" | "OVER_QUOTA" | "BEYOND_PERIOD" | "UNAVAILABLE";
+
+export interface StandingOccurrence {
+  slotOccurrenceId: string;
+  startAt: string;
+  status: StandingOccurrenceStatus;
+}
+
+listStandingReservationOccurrences(
+  organizationSlug: string,
+  recurringBookingId: string,
+): Promise<StandingOccurrence[]>
+```
+
+Llama a la RPC nueva `recurring_booking_occurrences(p_recurring_booking_id)` (ver
+`docs/database.md` §Fase 38 para el detalle de la función y por qué no reusa
+`admin_preview_recurring_booking()`, que es prospectiva). Mismo criterio de errores
+que `listStandingReservations`: si la RPC falla o el caller no es miembro de la
+organización, devuelve `[]` en vez de propagar la excepción — el llamador no necesita
+distinguir "no hay fechas" de "no se pudo leer" para pintar la lista.
+
+`status` ya viene calculado por la RPC (mismo vocabulario que
+`StandingCreateSummary`: `confirmed`/`unpaid`/`overQuota`/`beyondPeriod`/
+`unavailable`, en mayúsculas y sin el desglose de conteo) — el frontend no tiene que
+re-derivar nada, sólo mapear el texto/color por estado.
+
+### Implementado — consumo en `standing-reservations.tsx` (2026-09-25)
+
+Cada reserva fija activa tiene un botón "Ver fechas" que llama a
+`listStandingReservationOccurrences` bajo demanda (no precargado para toda la
+lista) y cachea el resultado por `recurringBookingId`. Estados: carga ("Buscando
+fechas…"), error con "Reintentar", vacío (`EmptyState`), y la lista con fecha +
+razón (`DESK_BOOKING_REASONS`, `frontend/lib/booking-reasons.ts`, ganó las 5
+entradas de `StandingOccurrenceStatus`).
