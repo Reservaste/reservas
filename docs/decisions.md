@@ -2565,6 +2565,54 @@ PR #6. Verificado además a mano contra producción el mismo día (ver nota
 de Fase de verificación visual, más abajo): plan de $1.700/mes, período
 editado a 10 días → sugiere $566,67 exacto.
 
+**Bug real encontrado en producción (2026-09-28), con dinero real de por
+medio** — reportado por el dueño: un plan `WEEKLY_QUOTA` de $2.500
+("Pilates Reformer 2 x S", organización `mathias-gym`), pago de un
+cliente real registrado para 2026-10-01→2026-10-31 (octubre completo,
+31 días, sin que el dueño sintiera que estaba "editando" nada raro) quedó
+guardado en **$2.583,33** en vez de $2.500 — exactamente
+`2500 / 30 × 31`.
+
+Causa confirmada por `frontend-engineer` (sin necesitar acceso a
+producción — el mismatch está forzado por la lógica del código, no por la
+configuración particular del plan): `RegisterPaymentForm` se usa en dos
+pantallas. Desde `/org/[slug]/payments/[customerId]?mes=` el período
+completo del plan (el denominador del prorrateo) se resuelve anclado al
+mes que dice la URL — correcto. Desde `/org/[slug]/customers/[customerId]`
+(la ficha del cliente, sin selector de mes) se resuelve anclado a **hoy**
+(`listPaymentPlanOptions(slug)` sin `month`, cae a la fecha actual en
+`app/actions/service-plans.ts`). Si el mostrador registra un pago desde la
+ficha del cliente y edita el período a mano a un mes que NO es el actual
+(un caso legítimo y común: cargar un pago por adelantado, o de un mes que
+ya pasó), el denominador queda congelado en los días del mes de "hoy"
+mientras el numerador son los días del mes que se tipeó — dos meses sin
+relación entre sí. Septiembre (denominador, 30 días) ÷ octubre (numerador
+tipeado, 31 días) reproduce exacto los $2.583,33 reportados.
+
+**Fix** (mismo día, `frontend/app/org/[slug]/customers/[customerId]/customer-forms.tsx`):
+el prorrateo por días de ADR-0038 sólo tenía sentido para su caso
+original — acortar/alargar el período *dentro* del mismo mes que ya
+sugirió el plan. Nunca debió aplicarse cuando el período editado es un
+mes completamente distinto (eso no es un prorrateo, es cobrar otro
+período). Se agregó un chequeo de solapamiento (`overlaps()`, ya
+existente en `lib/billing-blocks.ts`): si el período editado no se
+solapa con el período completo que resolvió el servidor, el prorrateo
+por días se desactiva y el monto sugerido cae al precio de lista del
+plan (o al prorrateo del servidor si aplica, igual que antes de ADR-0038).
+El caso original (acortar dentro del mismo mes) sigue funcionando igual.
+
+**No se tocó el pago ya registrado de María Hornos** — corregirlo o no es
+una decisión de negocio del dueño, no algo que el código deba decidir por
+su cuenta.
+
+**Auditoría completa (2026-09-28, corrida por el usuario contra
+producción)**: un solo pago afectado en todo el sistema —
+`fa018d14-f687-4a6e-b5c9-e882151436a4`, organización `kaimovete`, María
+Hornos, $2.583,33 cobrados vs. $2.500 de lista, diferencia $83,33. Sin
+otros casos. Corrección delegada al dueño vía el flujo normal de la app
+(anular ese pago + registrar uno nuevo por el monto correcto) — no hizo
+falta ninguna intervención directa sobre la base.
+
 ## ADR-0039 — Suite E2E de humo contra producción, después de cada deploy de frontend
 
 Fecha: 2026-09-24
