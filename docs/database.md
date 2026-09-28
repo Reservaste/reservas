@@ -2550,3 +2550,122 @@ otro `ScheduleRule` del mismo cliente que excede la cuota del plan (`OVER_QUOTA`
 mismas fechas pagas que la primera, para confirmar que lo que la bloquea es la cuota y
 no el pago); un no-miembro de la organización recibe `[]`; `anon` no puede ejecutar la
 RPC.
+
+## Fase 39 — ficha de cliente: `customer_standing_reservations()` y `customer_service_plan_quotas()` (migración `20260928120000_phase39_customer_standing_reservations.sql`)
+
+Pedido del dueño (con captura): la ficha de un cliente
+(`/org/[slug]/customers/[customerId]`) mostraba "Pagos" y "Créditos de recupero" pero
+nada decía qué horarios fijos tiene agendados ni si le faltan para completar la cuota
+semanal de su plan. Caso real: cliente con plan "Pilates Reformer 2 x S"
+(`weekly_quota=2`) sin forma de ver si tenía 0, 1 o 2 horarios fijos asignados.
+
+### `recurring_booking_upcoming_counts()`: los 5 conteos, extraídos a una función compartida
+
+`schedule_rule_standing_reservations()` (Fase 11/25) ya resolvía correctamente los 5
+contadores de "próximas fechas" de una `RecurringBooking` (`upcoming_confirmed` /
+`upcoming_not_generated` / `upcoming_unpaid` / `upcoming_over_quota` /
+`upcoming_beyond_period`, este último desdoblado de `PAYMENT_REQUIRED` contra
+`customer_billing_horizon()`), pero inline dentro de esa función, escaneada por
+`ScheduleRule`. Esta fase pedía lo inverso — por cliente, sin importar a qué regla
+pertenezca cada serie — así que en vez de repetir las cinco subconsultas se extraen a
+un helper interno nuevo:
+
+```sql
+recurring_booking_upcoming_counts(
+  p_recurring_booking_id uuid,
+  p_customer_id uuid,
+  p_service_id uuid,
+  p_organization_id uuid
+) returns table (
+  upcoming_confirmed int, upcoming_not_generated int,
+  upcoming_unpaid int, upcoming_over_quota int, upcoming_beyond_period int
+)
+```
+
+`security definer`, `stable`, `revoke ... from public, anon, authenticated,
+service_role` (Fase 19: helper interno, sólo lo llaman otras funciones
+`security definer` de este archivo, nunca invocable directo por PostgREST).
+`schedule_rule_standing_reservations()` se reescribe para llamarlo vía
+`cross join lateral` en vez de repetir las subconsultas — mismo `returns table`
+exacto, así que `CREATE OR REPLACE` alcanza y los grants de la Fase 25 siguen
+vigentes (el OID no cambia). El test de la Fase 25/38 (que compara este agregado
+contra el detalle fecha por fecha de `recurring_booking_occurrences()`) es la prueba
+de que el refactor no cambió el resultado — sigue pasando tal cual, sin tocarlo.
+
+### `customer_standing_reservations(p_customer_id uuid)`: el inverso de `schedule_rule_standing_reservations()`
+
+Todas las `RecurringBooking` `status = 'ACTIVE'` de un cliente puntual, con el
+`ScheduleRule`/servicio de cada una y los mismos 5 conteos de arriba:
+
+```sql
+returns table (
+  recurring_booking_id uuid, schedule_rule_id uuid, service_id uuid, service_name text,
+  weekday smallint, local_start_time time, duration_minutes int,
+  status recurring_booking_status, created_at timestamptz,
+  upcoming_confirmed int, upcoming_not_generated int,
+  upcoming_unpaid int, upcoming_over_quota int, upcoming_beyond_period int
+)
+```
+
+`security definer`, `stable`; `revoke ... from public, anon` + `grant ... to
+authenticated` (mismo patrón que `schedule_rule_standing_reservations()`).
+Autorización: `where ... and public.is_organization_member(rb.organization_id)` — un
+no-miembro de la organización del cliente recibe `[]`, no una excepción (mismo
+criterio que el resto de esta familia). Filtra a `status = 'ACTIVE'` a propósito
+(distinto de `schedule_rule_standing_reservations()`, que muestra también las
+`CANCELLED` de esa regla): la ficha pregunta "qué tiene agendado hoy", no el
+histórico de series de ese cliente.
+
+### `customer_service_plan_quotas(p_customer_id uuid)`: cuánto le corresponde, por servicio
+
+La segunda mitad del pedido — no sólo qué tiene agendado, sino cuánto le da derecho
+su plan. Una fila por servicio donde el cliente tiene al menos un horario fijo
+`ACTIVE`:
+
+```sql
+returns table (
+  service_id uuid, service_name text,
+  service_plan_id uuid, plan_name text, plan_kind service_plan_kind,
+  weekly_quota int, quota_scope plan_quota_scope, assigned_count int
+)
+```
+
+**No reinventa "cuál es el plan vigente de este cliente para este servicio"**: llama
+a `resolve_covering_service_plan(customer_id, service_id, hoy)` (ADR-0029, Fase 22),
+la misma función que usa `evaluate_payment_coverage()` en el camino de reserva — un
+`Payment PAID` cuyo período cubre la fecha local de hoy. `assigned_count` tampoco
+reinventa "cuántas series ya ocupan esa cuota": es `customer_series_in_force_count()`
+con el mismo conjunto de servicios que resuelve `service_plan_quota_service_ids()` —
+bajo un plan `SHARED_ACROSS_SERVICES` (ADR-0029) cuenta el pool compartido entre los
+servicios que el plan cubre, no sólo el servicio de esa fila, aunque la respuesta
+siga viniendo una fila por servicio (pedido explícito: "cuota por servicio, no una
+sola cuota global" — un cliente puede tener horarios fijos en varios servicios con
+planes de cuota distintos).
+
+`weekly_quota`/`plan_kind`/`quota_scope`/`service_plan_id` salen `null` cuando: (a) el
+servicio no tiene hoy ningún `Payment PAID` vigente para este cliente (plan lapsado o
+nunca pagado), o (b) el plan vigente es `UNLIMITED`/`DROP_IN` — ninguno de los dos
+tiene un tope de series que mostrar. `assigned_count` viaja **siempre**, con o sin
+plan vigente: son las `RecurringBooking ACTIVE` de este cliente en vigencia hoy para
+ese servicio (o el pool completo bajo `SHARED_ACROSS_SERVICES`), el mismo "N" que la
+ficha necesita mostrar aunque hoy no haya "M" contra qué compararlo.
+
+`language plpgsql` (no `sql`, a diferencia de las otras funciones de esta familia):
+necesita ramificar por fila entre "hay plan vigente" / "no hay" / "el plan tiene
+tope" antes de resolver `assigned_count`, mismo estilo `return next` por fila que
+`admin_preview_recurring_booking()` (Fase 11). `security definer`, `stable`;
+`revoke ... from public, anon` + `grant ... to authenticated`. Autorización explícita
+al principio de la función (`is_organization_member` sobre la organización del
+cliente resuelto por `p_customer_id`, no por un `organization_id` que pase el
+caller) — un cliente inexistente o de una organización ajena hace `return;` sin
+filas, mismo criterio que el resto.
+
+Test: `backend/test/phase39.customer-standing-reservations.test.ts` — un cliente con
+horarios fijos en 3 servicios (`WEEKLY_QUOTA` de cuotas 2/1/2, pagos vigentes hoy en
+los tres) donde dos están completos y uno tiene menos series que su cuota (`1 de 2`,
+para que el frontend pueda calcular "le falta 1"), verificando que
+`customer_standing_reservations()` trae las 4 series con su servicio correcto y que
+su agregado coincide con el que ya da `schedule_rule_standing_reservations()` para la
+misma serie; un servicio con plan de cuota creado pero nunca pagado
+(`weekly_quota`/`plan_kind` `null`, `assigned_count` viaja igual); un no-miembro de la
+organización recibe `[]` en ambas RPC; `anon` no puede ejecutar ninguna de las dos.

@@ -1372,3 +1372,97 @@ lista) y cachea el resultado por `recurringBookingId`. Estados: carga ("Buscando
 fechas…"), error con "Reintentar", vacío (`EmptyState`), y la lista con fecha +
 razón (`DESK_BOOKING_REASONS`, `frontend/lib/booking-reasons.ts`, ganó las 5
 entradas de `StandingOccurrenceStatus`).
+
+## Fase 39 — ficha de cliente: qué tiene agendado y qué cupo semanal le corresponde (`standing.ts`)
+
+Pedido del dueño: en la ficha de un cliente (`/org/[slug]/customers/[customerId]`)
+sólo se veía "Pagos" y "Créditos de recupero" — nada decía qué horarios fijos
+(`RecurringBooking` `ACTIVE`) tiene agendados el cliente, ni si le faltan para
+completar la cuota semanal de su plan. Caso real (captura): cliente con plan
+"Pilates Reformer 2 x S" (`weeklyQuota=2`) sin forma de ver si tenía 0, 1 o 2
+horarios fijos asignados. Dos acciones nuevas, backend puro — el JSX de la ficha
+queda pendiente de `frontend-engineer`.
+
+**1. `getCustomerStandingReservations(organizationSlug, customerId)` — el inverso de
+`listStandingReservations`.** Esa lista todas las reservas fijas de un
+`ScheduleRule`; esta lista todas las `RecurringBooking` `ACTIVE` de un cliente, sin
+importar a qué `ScheduleRule`/servicio pertenezca cada una.
+
+```ts
+export interface CustomerStandingReservation {
+  recurringBookingId: string;
+  scheduleRuleId: string;
+  serviceId: string;
+  serviceName: string;
+  weekday: number;           // 0 = domingo, igual que JS Date#getDay()
+  localStartTime: string;    // "HH:MM:SS", hora local de la Organization
+  durationMinutes: number;
+  status: "ACTIVE" | "CANCELLED";
+  createdAt: string;
+  upcomingConfirmed: number;
+  upcomingNotGenerated: number;
+  upcomingUnpaid: number;
+  upcomingOverQuota: number;
+  upcomingBeyondPeriod: number;
+}
+
+getCustomerStandingReservations(
+  organizationSlug: string,
+  customerId: string,
+): Promise<CustomerStandingReservation[]>
+```
+
+Llama a la RPC nueva `customer_standing_reservations(p_customer_id)` (ver
+`docs/database.md` § Fase 39). Los 5 campos `upcoming*` son exactamente los mismos
+que ya calcula `schedule_rule_standing_reservations()` — misma función SQL
+compartida por dentro (`recurring_booking_upcoming_counts()`), nunca reimplementada.
+Sólo trae series `status = 'ACTIVE'` (una serie cancelada no es "lo que tiene
+agendado hoy"). Mismo criterio de errores que el resto del archivo: si la RPC falla
+o el caller no es miembro de la organización del cliente, `[]`.
+
+**2. `getCustomerServicePlanQuotas(organizationSlug, customerId)` — cuánto le
+corresponde, por servicio.**
+
+```ts
+export interface CustomerServicePlanQuota {
+  serviceId: string;
+  serviceName: string;
+  servicePlanId: string | null;
+  planName: string | null;
+  planKind: "DROP_IN" | "WEEKLY_QUOTA" | "UNLIMITED" | null;
+  weeklyQuota: number | null;
+  quotaScope: "PER_SERVICE" | "SHARED_ACROSS_SERVICES" | null;
+  assignedCount: number;
+}
+
+getCustomerServicePlanQuotas(
+  organizationSlug: string,
+  customerId: string,
+): Promise<CustomerServicePlanQuota[]>
+```
+
+Llama a `customer_service_plan_quotas(p_customer_id)` (Fase 39). Una fila por
+servicio donde el cliente tiene al menos un horario fijo `ACTIVE` — nunca una cuota
+global, porque un cliente puede tener horarios fijos en varios servicios con planes
+de cuota distintos (pedido explícito del dueño). `weeklyQuota`/`planKind`/
+`quotaScope` vienen `null` cuando ese servicio no tiene hoy ningún `Payment PAID`
+vigente para el cliente, o cuando el plan vigente es `UNLIMITED`/`DROP_IN` (sin tope
+de series). `assignedCount` viaja siempre — con o sin plan vigente — así que el
+frontend puede mostrar "1 de 2" con `weeklyQuota - assignedCount` cuando
+`weeklyQuota` no es `null`, y sólo "1 horario fijo" cuando sí lo es.
+
+No reinventa "cuál es el plan vigente de este cliente para este servicio": la RPC
+llama a `resolve_covering_service_plan()`, la misma función que usa
+`evaluate_payment_coverage()` en el camino de reserva (ADR-0029). Bajo un plan
+`SHARED_ACROSS_SERVICES`, `assignedCount` cuenta el pool compartido entre todos los
+servicios que el plan cubre (vía `service_plan_quota_service_ids()`), no sólo el
+servicio de esa fila — la fila sigue siendo una por servicio, pero el número
+refleja la cuota real.
+
+**Implementado** (2026-09-28): `frontend/app/org/[slug]/customers/[customerId]/page.tsx`
+ya consume las dos acciones — sección "Horarios fijos" agrupada por servicio (día/hora/
+duración) con el badge "N de M turnos fijos asignados" (tono `warning` cuando
+`assignedCount < weeklyQuota`, oculto cuando `weeklyQuota` es `null`). El texto/tono de
+las notas de fechas pendientes (unpaid/overQuota/beyondPeriod) se extrajo a
+`components/standing-pending.tsx` (`StandingPendingNotes`/`StandingPendingBadges`),
+compartido con `standing-reservations.tsx` para no duplicar el copy.
