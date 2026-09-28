@@ -505,6 +505,25 @@ necesariamente la que acaba de tocar).
 Ninguna firma de función cambió (siguen `(slotOccurrenceId, prevState)` y
 `(bookingId)`); solo cambió el string al que redirigen.
 
+### `customer.ts` — `releaseMyBooking` gana `vista`/`fecha` opcionales (2026-09-28)
+
+Mismo motivo que `org=` arriba, mismo mecanismo: `/me` refleja la vista
+(día/semana) y la fecha ancla del calendario del cliente en la URL
+(`?vista=&fecha=`, `components/calendar/customer-calendar.tsx`), para que
+volver atrás restaure exactamente la pantalla anterior en vez de resetear a
+"hoy, semana". `releaseMyBooking(bookingId, vista?, fecha?)` gana los dos
+parámetros nuevos al final (`vista`/`fecha` como `string | undefined`,
+bindeados desde `/me/reserva/[bookingId]/page.tsx` con los mismos valores
+ya validados que usa el `BackLink` de esa pantalla) y los agrega a los tres
+redirects (`liberado=1`, con y sin `credito_hasta`, y `liberar_error=1`).
+Validación defensiva con `parseCalendarView`/`parseAnchorKey`
+(`lib/calendar.ts`) adentro de la propia action: un valor ausente o
+inválido no se agrega al querystring, nunca rompe el redirect. Mismo
+patrón aplicado al `BackLink` de esa pantalla (que es un destino fijo, no
+"atrás" de historial -- ver `components/back-link.tsx`) y a `AgendaCalendar`
+del lado admin (`app/org/[slug]/agenda/page.tsx`, mismo `?vista=&fecha=`,
+implementado antes).
+
 ## Fase 30 — `audit_log`: lectura para el OWNER (ADR-0032)
 
 **Ninguna firma existente cambió.** `set_organization_subscription()`
