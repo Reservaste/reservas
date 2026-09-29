@@ -1466,3 +1466,61 @@ duración) con el badge "N de M turnos fijos asignados" (tono `warning` cuando
 las notas de fechas pendientes (unpaid/overQuota/beyondPeriod) se extrajo a
 `components/standing-pending.tsx` (`StandingPendingNotes`/`StandingPendingBadges`),
 compartido con `standing-reservations.tsx` para no duplicar el copy.
+
+## Fase 40 — nonce de continuación de activación (ADR-0040)
+
+Backend implementado (migración `20260928130000_phase40_activation_continuation.sql`,
+detalle completo en `docs/database.md` Fase 40): dos RPC nuevas,
+`issue_activation_continuation(p_token text) returns text` (anon-callable, sin sesión)
+y `redeem_activation_continuation(p_nonce text) returns text` (anon-callable, después
+de `exchangeCodeForSession()`). Ninguna reemplaza `claim_customer_activation()` —
+sólo le permiten a un segundo contexto de navegador replantar la cookie
+`activation_token` que el primero no pudo llevarse consigo.
+
+**Pendiente, no implementado, para `frontend-engineer`** (gate obligatorio de
+`security-engineer` antes de desplegar — toca autenticación):
+
+1. **`frontend/lib/server-cookies.ts`** (mismo módulo que `readActivationToken()`,
+   fuera de `"use server"` por el mismo motivo documentado ahí: un helper que
+   devuelve/consume un secreto httpOnly no puede vivir en un módulo cuyos exports
+   son todos invocables por POST) — agregar una función que, dado el token leído de
+   la cookie, llame a `issue_activation_continuation` y devuelva el nonce. Firma
+   sugerida: `issueActivationContinuation(token: string): Promise<string | null>`
+   (`null` si la RPC falla — no relanzar el error crudo de Postgres al caller).
+
+2. **`frontend/app/activar/continuar/page.tsx`** — en la rama donde hay cookie pero
+   `!user` (la que hoy hace `redirect(\`/login?returnTo=...\`)`), antes de armar el
+   redirect: llamar al helper nuevo con el token ya leído por `readActivationToken()`
+   en esa misma función, y si devuelve un nonce, agregar `&c=<nonce>` (o `?c=` si
+   `returnTo` no tuviera querystring propio) al valor de `returnTo` que ya se arma
+   con `safeReturnTo("/activar/continuar")` — el nonce viaja DENTRO del querystring
+   de `returnTo`, no como un parámetro hermano, porque es `returnTo` el que
+   `login-form.tsx` → `/signup?returnTo=...` → `emailRedirectTo`/`next` de OAuth →
+   `/auth/callback` ya reenvían tal cual de punta a punta sin tocarlo (confirmar que
+   ninguno de esos saltos hace `encodeURIComponent` dos veces sobre el mismo string
+   ni descarta querystring extra en `returnTo`). Si `issueActivationContinuation`
+   devuelve `null` (token inválido/vencido/revocado), seguir con el `returnTo` de
+   hoy sin el `c=` — no bloquear el login por esto, `claim_customer_activation()`
+   sigue siendo quien manda el mensaje de error real más adelante.
+
+3. **`frontend/app/auth/callback/route.ts`** — hoy sólo lee `code` y `next`
+   (`safeReturnTo`). Agregar: parsear `?c=` del **`next` ya decodificado** (no de
+   `request.url` directamente — `next` es donde vive, embebido, después del paso 2),
+   y si está presente, después de `exchangeCodeForSession()` sin error, llamar a
+   `redeem_activation_continuation(p_nonce)`. Si devuelve un token: plantar la
+   cookie `activation_token` en la respuesta de este mismo route handler con
+   `activationCookieOptions()` (mismo helper que ya usa
+   `app/activar/[token]/route.ts` — evaluar extraer el `response.cookies.set(...)`
+   a un helper compartido en `lib/activation-cookie.ts`, ya que quedarían dos sitios
+   escribiendo la misma cookie con la misma política) y redirigir a
+   `${origin}/activar/continuar` **sin** el `?c=` (ya cumplió su función, y dejarlo
+   en la URL final es ruido/riesgo sin beneficio). Si `redeem_activation_continuation`
+   falla (nonce inválido/vencido/ya usado), no bloquear el resto del login: seguir
+   el `next` original tal cual — la persona simplemente vuelve a ver "no encontramos
+   la invitación en este navegador" en `/activar/continuar`, que ya es un estado que
+   esa página maneja hoy.
+
+**No cambia ningún contrato existente**: `claimActivation()`, `signOutForActivation()`
+y el shape de `ClaimActivationState` en `frontend/app/actions/activation.ts` quedan
+intactos — esta fase sólo agrega una forma nueva de que la cookie llegue a existir en
+el contexto correcto antes de que ese código, sin tocar, corra.

@@ -2687,3 +2687,314 @@ GitHub por su cuenta, así que **queda a cargo del usuario** cargarlos
 antes de que el job corra por primera vez.
 
 **Implementación**: delegada a `qa-engineer`.
+
+## ADR-0040 — Activación por WhatsApp sobrevive un cambio de contexto de navegador
+
+Fecha: 2026-09-28
+Estado: **Aceptada**
+Propuesta por: usuario en producción — reporte: "cuando un nuevo usuario
+quiere loguear o registrarse [para activar su cuenta] siempre aparece
+[el error 'no encontramos la invitación'], luego al refrescar queda como
+activo". Diagnóstico de `frontend-engineer`, con evidencia real contra
+producción (no sólo lectura de código): descartadas dos veces la hipótesis
+de un TTL de cookie vencido (ya se había arreglado el 2026-09-23, commit
+`3d865ea`, verificado en vivo con `curl` que la cookie de hoy dura 72h) y
+la de una carrera Set-Cookie/redirect (viajan en la misma respuesta HTTP,
+sin ventana). Causa real, por descarte y coherente con que el propio
+mensaje de error ya la anticipa ("volvé a abrir el link de WhatsApp desde
+este mismo navegador"): el cliente toca el link de WhatsApp en el
+navegador embebido de WhatsApp (ahí queda la cookie httpOnly del token),
+pero confirmar el email o completar el login de Google lo saca a OTRA
+app/contexto (Mail, o el navegador del sistema — Google bloquea el login
+dentro de WebViews embebidos desde 2021). Ese segundo contexto tiene un
+cookie jar distinto: la cookie de activación nunca llegó ahí, así que
+`/activar/continuar` no la encuentra aunque el token siga válido por sus
+72h. No es un bug de un TTL ni de una carrera — es que el diseño actual
+depende por completo de que la activación termine en el MISMO contexto de
+navegador donde empezó, y un teléfono real no garantiza eso.
+
+### Decisión
+
+En vez de depender sólo de la cookie httpOnly para reencontrar la
+activación después del desvío por login/signup/OAuth, se emite un
+**nonce de continuación** — corto, opaco, de un solo uso, vida corta
+(30 min) — que viaja por el único canal que sí sobrevive el cambio de
+contexto: el `emailRedirectTo`/`next` que Supabase Auth ya reenvía a
+través del link de confirmación de email o del callback de OAuth. Este
+nonce **nunca es el token de activación real** (eso sigue sin salir de
+la cookie httpOnly, ADR-0026 Sec 2.4 sigue vigente para el token en sí) —
+sólo le permite al contexto de navegador que SÍ terminó la autenticación
+volver a plantar la cookie de activación ahí, para que el resto del flujo
+(cookie + sesión → mostrar el form → clic explícito en "Confirmar y
+activar" → `claim_customer_activation()`) siga funcionando exactamente
+igual que hoy, sin tocar esa parte.
+
+**Mecánica**:
+
+1. `/activar/continuar`, cuando encuentra la cookie pero no hay sesión,
+   ya no arma `returnTo=/activar/continuar` a secas: primero llama a una
+   RPC nueva `issue_activation_continuation()` (lee el token de la cookie
+   server-side, nunca lo expone al cliente) que devuelve un nonce nuevo,
+   y arma `returnTo=/activar/continuar?c=<nonce>`. Ese querystring viaja
+   tal cual por todo el resto de la cadena que ya existe hoy
+   (`login-form.tsx` → `/signup?returnTo=...` → `emailRedirectTo`/OAuth
+   `next` → `/auth/callback`), sin tocar esos archivos más que para
+   preservar el nuevo param igual que ya preservan `returnTo`.
+2. `/auth/callback`, después de `exchangeCodeForSession()` (sesión ya
+   creada en ESTE contexto), si el `next` trae `?c=<nonce>`, llama a
+   `redeem_activation_continuation(p_nonce)` — valida sin usar y sin
+   vencer, lo marca usado, devuelve el token real (sigue sin tocar al
+   cliente) — y el propio route handler pone la cookie `activation_token`
+   en ESTA respuesta (mismo mecanismo que `/activar/[token]/route.ts`)
+   antes de redirigir a `/activar/continuar`, ahora sin el `?c=` (ya
+   cumplió su función).
+3. `/activar/continuar` corre exactamente como hoy: cookie + sesión →
+   confirma el form → clic explícito → RPC de siempre. Nada de esta ADR
+   toca esa mitad del flujo.
+
+**Corrección post-review de seguridad (2026-09-28) — el párrafo original
+de esta sección era falso, se deja tachado en el historial de git y
+reemplazado por lo que sigue.** La premisa "la activación real sigue
+exigiendo que la sesión coincida con el email del cliente invitado" **no
+es cierta**: `claim_customer_activation()` (Phase 21) sólo exige
+`auth.uid() is not null`, nunca compara email — un `Customer` gestionado
+ni siquiera tiene columna de email para comparar. `security-engineer`
+reprodujo en vivo que, con el nonce en mano, cualquier cuenta ajena
+puede canjearlo, recibir el token real, y llamar a
+`claim_customer_activation()` con éxito, quedando como dueña del
+`Customer` de otra persona (ve sus reservas y pagos, reserva con su
+plan).
+
+**Por qué se acepta igual el diseño, con esto por escrito**: el nonce
+equivale de hecho al token completo durante su vida útil — no es una
+capa adicional de seguridad, es el mismo secreto viajando por un canal
+más. Eso ya era cierto del token original (ADR-0026: quien lo intercepta
+en el link de WhatsApp/email ya podía hacer exactamente esto). El nonce
+viaja por canales de exposición equivalente (URL, logs de Vercel/Supabase,
+el email de la propia persona) y con ventana más corta (30 min ilustrado
+vs. 72h del token). **Riesgo residual nuevo y real, aceptado
+explícitamente**: si alguien tipea mal su propio email al registrarse, el
+mail de confirmación (con `?c=` embebido) le llega a un tercero, que con
+un solo clic hereda la sesión y el cliente de la víctima — sin el nonce,
+ese tercero nunca tenía la cookie httpOnly y no podía hacer nada. Se
+acepta este riesgo por ser de exposición baja (typo de email + tercero
+que efectivamente abre y hace clic, dentro de una ventana de 30 min) y
+consistente con el modelo de amenaza ya aceptado del token base, no por
+estar mitigado por un chequeo de email que no existe.
+
+**Cambios de diseño exigidos por el gate de seguridad antes de LISTO**
+(no opcionales, `security-engineer` los verificó funcionando contra la
+base local antes de proponerlos):
+
+1. **El token no se guarda en claro ni siquiera 30 minutos.** El diseño
+   original dejaba `activation_token` en texto plano en la fila mientras
+   el nonce no se usara — y si el nonce vencía sin canjearse (login con
+   contraseña en el mismo navegador nunca pasa por `/auth/callback`), el
+   texto plano quedaba para siempre, no 30 minutos. Se reemplaza por
+   `activation_token_enc bytea`, cifrado con `pgp_sym_encrypt(token,
+   nonce)` (pgcrypto, ya instalado) en `issue`, descifrado con
+   `pgp_sym_decrypt` en `redeem` usando el nonce recién validado como
+   clave — la base nunca tiene, en reposo, ninguna combinación de datos
+   que por sí sola reconstruya el token (igual garantía que el hash en
+   `customer_activations`).
+2. **Límite de nonces vivos por activación** (`issue`, `for update` sobre
+   la activación): antes de emitir uno nuevo, se borran los vencidos sin
+   usar de esa activación (limpieza, además cierra el resto del punto 1
+   si por algún motivo quedaran filas viejas) y se rechaza con
+   `TOO_MANY_CONTINUATIONS` si ya hay 10 sin usar.
+3. **`redeem_activation_continuation` verifica que la activación siga
+   viva** (no revocada/ya reclamada/vencida) antes de devolver el token —
+   mismo `INVALID_CONTINUATION` genérico si no lo está, para no filtrar
+   cuál de los tres casos aplica.
+4. **Defensa en profundidad, no bloqueante**: `revoke all on table
+   customer_activation_continuations from anon, authenticated` explícito
+   (además de RLS sin policies, que ya cierra el acceso vía PostgREST).
+
+**Frontend, a implementar junto con lo ya delegado**: `Referrer-Policy:
+no-referrer` en `/activar/continuar`, `/login` y `/signup` cuando la URL
+trae `?c=`; nunca loguear `next` ni `c`; `/auth/callback` saca `c` de la
+URL al redirigir; el allowlist `safeReturnTo` acepta `?c=` sin abrir un
+open redirect.
+
+**Alcance**: sólo la activación de clientes (ADR-0026). El mismo problema
+podría existir en la invitación de equipo (ADR-0034, `/equipo/[token]`,
+mismo patrón de cookie httpOnly) — no se toca en esta ADR; si se confirma
+el mismo síntoma ahí, es una extensión directa del mismo mecanismo, a
+evaluar por separado.
+
+**Implementación**: delegada a `backend-engineer` (migración: tabla
+`customer_activation_continuations` + las dos RPC, ahora con los 4 puntos
+de arriba) y `frontend-engineer` (construcción del `returnTo` con `?c=`,
+`/auth/callback`, más los puntos de frontend de arriba). Gate obligatorio
+de `security-engineer` antes de desplegar — toca autenticación. Corrió
+tres veces: 2026-09-28 NO LISTO (hallazgo de fondo sobre la premisa de
+seguridad, corregido arriba), 2026-09-28 LISTO sobre backend corregido,
+2026-09-29 LISTO sobre backend+frontend — con un hallazgo funcional que
+se documenta y resuelve en ADR-0041.
+
+---
+
+## ADR-0041 — Confirmación de email por `token_hash`/`verifyOtp` (reemplaza el link PKCE para ese camino)
+
+Fecha: 2026-09-29
+Estado: **Aceptada**
+Propuesta por: `security-engineer`, en el tercer pase del gate de
+ADR-0040 (hallazgo funcional "F1"), decisión de diseño tomada por el
+usuario entre las alternativas planteadas.
+
+**Problema:** el gate de seguridad de ADR-0040 encontró que su mecanismo
+de nonce, aun estando LISTO en seguridad, probablemente **no resuelve el
+escenario más común** del bug original que motivó toda la ADR. Causa:
+`@supabase/ssr` usa PKCE por defecto — `signUpWithPassword()`
+(`app/actions/auth.ts`) genera un link de confirmación cuyo canje
+(`exchangeCodeForSession(code)` en `/auth/callback`) exige una cookie
+`code_verifier` que sólo existe en el navegador donde arrancó el signup.
+Si el cliente toca el link de WhatsApp en el navegador embebido (contexto
+A) y después abre el link de confirmación de email desde la app de Mail
+(contexto B, sin relación de cookies con A), el intercambio de código
+**falla antes de llegar a usar el nonce** — nunca se ejecuta el canje que
+diseñó ADR-0040, y el usuario cae al mismo error de siempre. El nonce sí
+funciona para el camino de Google OAuth cuando el login arranca de cero
+en un único contexto (confirmado en vivo por `security-engineer`), pero
+no para un link de email clickeado en un contexto distinto al que lo
+generó — eso es estructural a PKCE, no algo que el nonce pueda arreglar
+por sí solo.
+
+**Alcance real de este problema**: no es exclusivo de la activación de
+clientes (ADR-0026/0040). `signUpWithPassword()` es el único camino de
+signup por contraseña de toda la plataforma — lo usa cualquier
+`OrganizationMember` que se registra igual que un `Customer` gestionado.
+El fix, por lo tanto, es una decisión de autenticación general, no un
+parche acotado a la activación.
+
+**Decisión**: reemplazar el link de confirmación de email basado en PKCE
+por uno basado en **`token_hash` + `supabase.auth.verifyOtp()`**, que no
+depende de ninguna cookie del navegador que originó el signup — el link
+mismo (más el `token_hash` que trae) es autosuficiente para crear sesión
+en cualquier navegador que lo abra, exactamente el caso de uso de un
+link de confirmación por email.
+
+**Mecánica**:
+1. Template de confirmación de email de Supabase Auth pasa de
+   `{{ .ConfirmationURL }}` (PKCE) a un link armado a mano:
+   `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=email&next={{ .RedirectTo }}`.
+   `{{ .RedirectTo }}` sigue siendo el mismo `emailRedirectTo` que ya
+   arma `signUpWithPassword()` hoy (incluye `next=<returnTo o
+   returnTo+?c=nonce>` sin cambios).
+2. Ruta nueva `frontend/app/auth/confirm/route.ts`: lee `token_hash` +
+   `type` + `next`, llama `supabase.auth.verifyOtp({ token_hash, type })`.
+   Si hay sesión, aplica **la misma lógica de nonce que ya vive en
+   `/auth/callback`** (extraer y quitar `?c=` de `next` antes de construir
+   cualquier redirect, canjear con `redeem_activation_continuation` si
+   está presente, plantar la cookie de activación con
+   `activationCookieOptions()`) — se factoriza en un helper compartido en
+   vez de duplicar el bloque, ya que la lógica es idéntica.
+3. `/auth/callback` (PKCE) queda intacto para Google OAuth, que no pasa
+   por un link de email y no tiene esta limitación de la misma forma
+   (confirmado en vivo: funciona si el login arranca de cero en un
+   único contexto, que es el caso que cubre el nonce de ADR-0040).
+
+**Verificado en vivo contra Supabase local** (`backend-engineer`,
+2026-09-29, CLI 2.118.0, Postgres 17): `supabase/config.toml` define
+`[auth.email.template.confirmation]` con `content_path =
+"./supabase/templates/confirmation.html"` conteniendo exactamente el link
+de la sección **Mecánica** arriba. Con `enable_confirmations = true`
+temporalmente (local vive con `false` por defecto — ver nota debajo) y un
+signup real contra `POST /auth/v1/signup?redirect_to=<url>` (`redirect_to`
+va como **query param**, no en el body JSON — es lo que `supabase-js`
+arma internamente a partir de `options.emailRedirectTo`), el mail que
+aparece en Mailpit (`http://127.0.0.1:54324`, no Inbucket — el proyecto ya
+migró a Mailpit aunque el env var viejo `INBUCKET_URL` se siga exponiendo
+por compatibilidad) trae:
+
+```
+http://127.0.0.1:3000/auth/confirm?token_hash=<hash>&type=email&next=http%3a%2f%2flocalhost%3a3000%2fauth%2fcallback%3fnext%3d%2factivar%2fcontinuar%3fc%3dabc123nonce
+```
+
+Es decir: **`type` es literalmente `email`**, tal como asume el borrador
+de la ADR — confirmado contra el comportamiento real, no asumido.
+`frontend-engineer` puede usar `verifyOtp({ token_hash, type: "email" })`
+sin ambigüedad. Se probó además el canje real: `POST /auth/v1/verify` con
+`{"type":"email","token_hash":"<hash>"}` devuelve sesión completa
+(`access_token`/`refresh_token`, `user_metadata.email_verified: true`) —
+el mecanismo funciona de punta a punta, no sólo el shape del link.
+
+**Hallazgo adicional (no introducido por esta ADR, pero bloqueaba poder
+probarla): `additional_redirect_urls` con match exacto de URL completa.**
+GoTrue arma `{{ .RedirectTo }}` a partir del `redirect_to` de la request,
+pero **sólo si esa URL está en la lista de redirects permitidos**; si no,
+cae en silencio al `site_url` pelado — sin `next`, sin el `?c=<nonce>` de
+ADR-0040. El `config.toml` que ya estaba commiteado sólo tenía
+`["https://127.0.0.1:3000"]` (ni siquiera el mismo esquema que
+`site_url = "http://127.0.0.1:3000"`, y sin el `/auth/callback` real que
+arma `signUpWithPassword()`), así que **este problema ya existía para el
+link PKCE viejo también** — nadie lo había notado porque local corre con
+`enable_confirmations = false` por defecto y nunca se ejerce este camino.
+Se corrigió agregando patrones glob del mismo origen:
+`additional_redirect_urls = ["https://127.0.0.1:3000",
+"http://127.0.0.1:3000/**", "http://localhost:3000/**"]` — confirmado con
+el mismo signup de arriba que con esto el `next` sobrevive completo
+(incluye `/auth/callback?next=/activar/continuar?c=...`). **Esto hay que
+verificarlo también en el dashboard de producción** (Authentication → URL
+Configuration → Redirect URLs) — si esa lista no incluye el equivalente
+del `/auth/callback` (y ahora `/auth/confirm`) reales de producción con
+wildcard de query, el `next=` se pierde en producción igual que acá,
+haciendo que el nonce de ADR-0040 nunca llegue aunque el resto de esta ADR
+esté bien implementado. Queda como parte del mismo pendiente manual de
+abajo.
+
+`enable_confirmations` quedó **repuesto a `false`** tras la verificación —
+no se cambió el default de desarrollo local, sólo se usó `true`
+temporalmente para poder observar el mail real en Mailpit.
+
+**Pendiente manual del usuario, no resoluble por CLI/migración** (mismo
+patrón que las credenciales de Google OAuth en ADR-0017), proyecto Supabase
+de producción `wgdlflhdjpqcxykblqme`:
+
+1. **Dashboard → Authentication → Email Templates → "Confirm signup"** →
+   reemplazar el HTML del cuerpo por (verificado arriba, tal cual):
+   ```html
+   <h2>Confirm your signup</h2>
+
+   <p>Follow this link to confirm your user:</p>
+   <p><a href="{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=email&next={{ .RedirectTo }}">Confirm your email</a></p>
+   ```
+   Sólo se toca **este** template. "Magic Link", "Reset Password", "Change
+   Email Address" y los demás no participan del flujo de signup con
+   contraseña y quedan intactos — el `type=email` de `verifyOtp` es
+   específico a confirmación de signup; los otros templates de Supabase
+   usan (y necesitan) otros valores de `type` (`magiclink`, `recovery`,
+   `email_change`) si el día de mañana se migran por la misma razón, pero
+   eso no es parte de esta ADR.
+2. **Dashboard → Authentication → URL Configuration → Redirect URLs**:
+   confirmar que la lista incluye el origen real de producción con
+   wildcard de path/query (equivalente a lo que se agregó en
+   `supabase/config.toml` para local), p. ej. `https://<dominio-prod>/**`.
+   Sin esto, `{{ .RedirectTo }}` cae al `Site URL` pelado y el `next=`
+   (incluido el nonce `?c=` de ADR-0040) se pierde — el hallazgo de arriba
+   aplica igual en producción.
+3. Hasta que el paso 1 se aplique, el link que reciben los usuarios sigue
+   siendo el viejo (PKCE) aunque el código ya soporte `/auth/confirm` — no
+   hay forma de que la app fuerce ese cambio de template de un proyecto
+   Supabase administrado.
+
+**Impacto**: `backend-engineer` actualizó `supabase/config.toml` (template
+local vía `[auth.email.template.confirmation]` +
+`supabase/templates/confirmation.html`, y el fix de
+`additional_redirect_urls` de arriba) y redactó las instrucciones exactas
+del cambio manual de dashboard para producción. `frontend-engineer`
+implementa `/auth/confirm` reusando la lógica de nonce ya construida para
+`/auth/callback`, con `type: "email"` confirmado (no `"signup"` ni otro
+valor). Mismo gate obligatorio de `security-engineer` antes de desplegar
+(es autenticación) — puntual sobre esta ruta nueva, no repite lo ya
+revisado de ADR-0040. **Nota de seguridad para ese gate:** el riesgo
+residual #8 de ADR-0040 (email mal tipeado → el nonce viaja en
+`redirect_to` a un tercero) asumía que PKCE por sí solo frenaba el "click
+directo" porque el tercero no tiene la cookie `code_verifier`; con
+`token_hash`/`verifyOtp` esa fricción adicional desaparece — el link ya
+no depende de ninguna cookie del navegador que lo generó, así que el
+tercero que reciba el mail por typo **sí puede** confirmarlo con un solo
+click. El TTL de 30 min, el single-use y el "Confirmar y activar" siguen
+vigentes, pero ya no hay una segunda barrera accidental encima; vale que
+`security-engineer` lo evalúe explícitamente en el gate, no asumir que
+sigue cubierto por el mismo razonamiento de ADR-0040.

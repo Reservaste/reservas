@@ -2669,3 +2669,173 @@ su agregado coincide con el que ya da `schedule_rule_standing_reservations()` pa
 misma serie; un servicio con plan de cuota creado pero nunca pagado
 (`weekly_quota`/`plan_kind` `null`, `assigned_count` viaja igual); un no-miembro de la
 organización recibe `[]` en ambas RPC; `anon` no puede ejecutar ninguna de las dos.
+
+## Fase 40 — nonce de continuación de activación (ADR-0040, migración `20260928130000_phase40_activation_continuation.sql`)
+
+Problema (reporte real de producción, diagnosticado en vivo, no solo por lectura de
+código — ver ADR-0040): la cookie httpOnly `activation_token` (ADR-0026 Sec 2.4) la
+escribe `/activar/[token]` en el contexto de navegador donde la persona tocó el link
+de WhatsApp. Confirmar el email o terminar el login de Google puede aterrizarla en
+OTRO contexto (Mail, el navegador del sistema — Google bloquea OAuth dentro de
+WebViews embebidos desde 2021), con un cookie jar distinto: `/activar/continuar` en
+ese segundo contexto nunca encuentra la cookie, aunque el token siga vigente por sus
+72h completas.
+
+### `customer_activation_continuations`
+
+```sql
+create table public.customer_activation_continuations (
+  id uuid primary key default gen_random_uuid(),
+  activation_id uuid not null references public.customer_activations (id) on delete cascade,
+  activation_token_enc bytea,      -- nullable a propósito, ver más abajo
+  nonce_hash bytea not null unique,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  used_at timestamptz,
+  constraint customer_activation_continuations_token_matches_used check (
+    (used_at is null and activation_token_enc is not null)
+    or (used_at is not null and activation_token_enc is null)
+  )
+);
+```
+
+RLS habilitada, **cero policies y cero grants** a `anon`/`authenticated`/`service_role`
+— mismo patrón que `customer_activations` (Fase 21): la única puerta son las dos RPC
+`security definer` de abajo. Además, al final de la migración: `revoke all on table
+customer_activation_continuations from anon, authenticated` explícito — defensa en
+profundidad redundante con la RLS sin policies, agregada a pedido del gate de
+seguridad (no bloqueante, pero de costo casi nulo).
+
+**Corrección post-review de seguridad (2026-09-28, ver ADR-0040 "Corrección
+post-review de seguridad"): la primera versión de esta tabla guardaba el token real en
+claro (`activation_token text`)**, bajo la teoría de que el TTL de 30 min acotaba la
+exposición igual que `customer_activations` acota su propio token. Esa teoría se
+rompía en un camino real: si el nonce nunca se redimía (ej. la persona vuelve a
+loguearse con contraseña en el MISMO contexto de navegador, que nunca pasa por
+`/auth/callback`), nada ponía la columna en `null` — la fila (y el token en claro
+adentro) quedaba ahí indefinidamente, y el propio `check` constraint (que exige token
+no-nulo mientras `used_at` sea nulo) hacía imposible limpiar la columna sin borrar la
+fila entera.
+
+**Fix, verificado por `security-engineer` contra la base local antes de aceptarse**:
+cifrar en reposo con el nonce mismo como clave simétrica (`pgcrypto`, ya instalado
+desde la Fase 21 — `pgp_sym_encrypt`/`pgp_sym_decrypt`, AES-256) en vez del nonce en
+claro. El nonce en claro nunca se persiste en ningún lado (`issue_activation_
+continuation()` sólo lo tiene en una variable local que devuelve al caller;
+`nonce_hash` es su sha256, igual que antes) — así que ninguna fila, por sí sola,
+reconstruye el secreto, misma garantía que ya daba el hash de `customer_activations.
+token_hash`. Se completa con dos medidas adicionales, ambas dentro de
+`issue_activation_continuation()`:
+
+- **Purga de vencidos sin usar** para esa `activation_id`, antes de contar o insertar
+  — cierra exactamente el mismo agujero que motivó el cifrado (un nonce abandonado ya
+  no deja un blob cifrado sentado para siempre, se borra en el próximo `issue`).
+- **Límite de 10 nonces vivos por activación** (`TOO_MANY_CONTINUATIONS` si ya hay 10
+  sin usar) — sin este límite, nada impedía acumular nonces indefinidamente para la
+  misma activación.
+
+Ambas corren bajo el mismo `select ... for update` sobre la fila de
+`customer_activations` que ya validaba vigencia (revocada/reclamada/vencida), para que
+el conteo sea consistente bajo llamadas concurrentes.
+
+Exposición acotada igual que antes: TTL de 30 min, un solo uso, y la columna
+`activation_token_enc` se pone en `null` en el mismo `update` que marca `used_at` — no
+queda un secreto cifrado vivo sentado en una fila ya usada, y ahora tampoco en una fila
+vencida sin usar (la purga se encarga). El `check` constraint sigue haciendo que las
+dos columnas nunca puedan discrepar (mismo estilo que
+`customers_claimed_requires_profile`, Fase 21).
+
+### `issue_activation_continuation(p_token text) returns text`
+
+Recibe el token real (leído server-side de la cookie, nunca expuesto al cliente),
+hace `select ... for update` sobre la `customer_activations` que resuelve el hash del
+token, y valida que esté vigente y no reclamada — mismo vocabulario de error que ya
+usa `claim_customer_activation()`: `INVALID_TOKEN` (no existe), `ACTIVATION_REVOKED`,
+`ALREADY_REDEEMED`, `ACTIVATION_EXPIRED`. Bajo ese mismo lock: borra las continuaciones
+vencidas sin usar de esa activación, cuenta las que quedan sin usar y rechaza con
+`TOO_MANY_CONTINUATIONS` si ya hay 10. Si pasa todo lo anterior, acuña un nonce nuevo
+con `new_activation_token()` (el mismo helper compartido de la Fase 34, sin grants a
+nadie salvo estas RPC `security definer`), inserta la fila con
+`activation_token_enc = pgp_sym_encrypt(token, nonce, 'cipher-algo=aes256')` y
+`expires_at = now() + interval '30 minutes'`, y devuelve el nonce **en claro, sólo
+esta vez** (igual que `issue_customer_activation()` con el token real).
+
+`security definer`, `set search_path = public`. **`grant execute ... to anon,
+authenticated`** — a propósito: esta RPC corre desde `/activar/continuar` exactamente
+en la rama donde **no hay sesión de Supabase todavía** (es la razón de ser de esta
+fase), así que el caller real llega con la anon key. No hay ninguna rama por
+`auth.uid()` — poseer el token de 256 bits es la autorización, mismo modelo de amenaza
+que `claim_customer_activation()` documenta para el token original (ADR-0026 Sec 2.2).
+
+### `redeem_activation_continuation(p_nonce text) returns text`
+
+Recibe el nonce, hace `select ... for update` por `nonce_hash`, y en una sola
+transacción: si la fila no existe, o `used_at is not null`, o `expires_at <= now()`,
+levanta `INVALID_CONTINUATION` — **un solo error genérico para esas tres razones a
+propósito** (a diferencia de `claim_customer_activation()`, que sí puede permitirse
+ser específica porque llegar hasta ahí ya exigió poseer el token real). Además,
+verifica que la `customer_activations` referenciada siga viva (no revocada, no
+reclamada, no vencida) — si no lo está, levanta el mismo `INVALID_CONTINUATION`
+genérico, sin distinguir cuál de los casos aplica (agregado post-review: el nonce
+puede ser válido aunque la activación haya cambiado de estado después de emitirlo). Si
+todo es válido, descifra con `pgp_sym_decrypt(activation_token_enc, nonce)` (el nonce
+recién validado hace de clave), hace
+`update ... set used_at = now(), activation_token_enc = null where id = ... and
+used_at is null`, y devuelve el token real descifrado. El `for update` ya serializa
+dos redenciones concurrentes del mismo nonce (la segunda transacción bloquea, y al
+desbloquear relee la fila ya marcada `used_at`); el `and used_at is null` del `update`
+es defensa en profundidad encima de eso, no la única guardia.
+
+`security definer`, `set search_path = public`. `grant execute ... to anon,
+authenticated` — corre desde `/auth/callback` justo después de
+`exchangeCodeForSession()`, en el contexto de navegador que recién terminó de
+autenticarse; no depende de `auth.uid()` por el mismo motivo que la RPC anterior, así
+que exigir sesión acá sólo agregaría un modo de falla si la sesión recién intercambiada
+todavía no se propagó al cliente de Supabase de ese request exacto.
+
+**Redimir no activa nada por sí solo.** Sólo le devuelve al caller el token real para
+que lo replante como cookie en el contexto nuevo; el resto del flujo (cookie + sesión
+→ `ConfirmActivationForm` → clic explícito → `claim_customer_activation()`) sigue
+exactamente igual, sin tocarse.
+
+**Corrección post-review de seguridad, importante**: a diferencia de lo que decía la
+versión original de esta sección, `claim_customer_activation()` (Fase 21) **no**
+exige que el email de la sesión coincida con el cliente invitado — sólo exige
+`auth.uid() is not null` (los clientes gestionados ni siquiera tienen columna de
+email para comparar). Esto significa que quien posea el nonce (o el token
+subyacente) puede reclamar la activación con **cualquier** cuenta autenticada, no
+sólo con la del destinatario real. Se acepta este diseño explícitamente en ADR-0040:
+el nonce equivale de hecho al token completo durante su vida útil, mismo modelo de
+amenaza ya aceptado para el token original (ADR-0026) — no es una regresión
+introducida por esta fase, es el comportamiento preexistente de
+`claim_customer_activation()`, ahora ejercitado también a través del nonce.
+
+Test: `backend/test/phase40.activation-continuation.test.ts` (9 casos) — un nonce
+válido (emitido con el cliente `anon`, reproduciendo la falta de sesión real del
+flujo) se redime una sola vez y un segundo intento inmediato falla con
+`INVALID_CONTINUATION`; un nonce vencido (backdateado directamente en la fila vía
+`admin`, ubicada por `activation_id`) falla igual; un nonce que nunca existió falla
+con el mismo error genérico; `redeem_activation_continuation()` devuelve el token
+real exacto, verificado comparándolo contra el token que emitió
+`issue_customer_activation()`; emitir una continuación para un token inválido o para
+una activación revocada reusa el vocabulario de error existente (`INVALID_TOKEN`,
+`ACTIVATION_REVOKED`); redimir un nonce y reclamar con una cuenta sin ninguna relación
+con el cliente invitado funciona (documentado en el test como comportamiento
+intencional, no un bug); la columna `activation_token_enc`, leída cruda vía `admin`
+justo después de emitir (antes de redimir), nunca contiene el token en claro bajo
+ninguna decodificación; pedir un onceavo nonce vivo para la misma activación falla
+con `TOO_MANY_CONTINUATIONS`; redimir un nonce cuya activación fue revocada después de
+emitido falla con `INVALID_CONTINUATION`.
+
+**Alcance de esta fase**: sólo la activación de clientes (ADR-0026). ADR-0040 señala
+que `team_invitations` (ADR-0034, `/equipo/[token]`) tiene la misma cookie httpOnly y
+podría sufrir el mismo síntoma — no se toca acá; sería una extensión directa del mismo
+mecanismo si se confirma, a evaluar por separado.
+
+**Estado**: gate de `security-engineer` corrió dos veces (2026-09-28) — la primera
+devolvió NO LISTO (token en claro sin límite de vida real, sin límite de nonces vivos,
+sin verificación de vigencia de la activación en `redeem`); los tres hallazgos están
+incorporados arriba y verificados con la suite de integración completa (`npx supabase
+db reset` + `npm run test:integration`, 9/9 tests de esta fase en verde). Falta que
+`security-engineer` vuelva a correr el gate sobre esta versión corregida antes de
+desplegar.

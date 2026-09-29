@@ -2134,6 +2134,172 @@ Reglas (auditoría security-engineer, 2026-09-25):
 4. Si se sospecha que un artifact con la credencial llegó a subirse: borrar el
    artifact y **rotar la contraseña**.
 
+## Fase 40 — nonce de continuación de activación (ADR-0040) — reglas
+
+Migración: `20260928130000_phase40_activation_continuation.sql`. Gate de
+security-engineer del 2026-09-28: primera pasada **NO LISTO** (reglas 2 a 4);
+segunda pasada (mismo día, sobre la migración corregida, `db reset` + 9/9
+tests + ataque manual con psql) **LISTO**.
+
+1. **El nonce es un portador equivalente al token de activación durante su
+   vida (30 min).** `claim_customer_activation()` **no** compara el email de
+   la sesión con nada: un cliente gestionado sólo tiene `display_name` +
+   `phone`, y el token es "ser este cliente" para cualquier cuenta que lo
+   presente (ver la sección de ADR-0026). Verificado en vivo: nonce →
+   `redeem_activation_continuation()` → token → una cuenta **ajena** canjea
+   y queda como `customers.profile_id`. Todo razonamiento de la forma "el
+   nonce no alcanza porque el claim exige el email del invitado" es falso.
+   El nonce se protege igual que el token: nunca en logs propios, nunca en
+   `Referer` (`Referrer-Policy: no-referrer` en las páginas que lo llevan en
+   la URL), y `/auth/callback` lo saca de la URL en el redirect.
+2. **El token nunca se guarda en claro en `customer_activation_continuations`.**
+   Se guarda cifrado con el propio nonce como clave
+   (`extensions.pgp_sym_encrypt(token, nonce, 'cipher-algo=aes256')`); la
+   base sólo tiene `sha256(nonce)`, así que un dump, backup o un grant/policy
+   futuro mal puesto no entrega tokens vivos. `redeem_*` descifra con
+   `p_nonce` y pone el cifrado en `null` en el mismo `update` que `used_at`.
+3. **Nonces vivos acotados por activación**: `issue_*` bloquea la fila de
+   `customer_activations` (`for update`), borra las continuaciones vencidas
+   sin usar de esa activación y rechaza con `TOO_MANY_CONTINUATIONS` si ya
+   hay 10 sin usar.
+4. **`redeem_*` no devuelve el token de una activación que ya no está viva**
+   (revocada, canjeada o vencida): `INVALID_CONTINUATION` genérico.
+5. **Grants**: `anon`/`authenticated` sólo tienen `EXECUTE` en las dos RPC
+   (`security definer`, owner `postgres`). Sobre la tabla, `revoke all ...
+   from anon, authenticated` explícito además de RLS con cero policies
+   (verificado: `set role anon`/`authenticated` → `permission denied`; las
+   RPC siguen funcionando para `anon` vía PostgREST). `service_role` conserva
+   `ALL` por default privileges de Supabase y hace bypass de RLS — aceptable
+   porque la key nunca sale del servidor, y el contenido está cifrado.
+6. **Chequeo de "activación viva" en `redeem_*` sin `for update`: correcto,
+   no es carrera explotable.** Si la activación se revoca/canjea entre esa
+   lectura y el commit de `redeem_*`, lo único que sale es el token, que por
+   sí solo no hace nada: `claim_customer_activation()` vuelve a leer la
+   activación con `for update` y re-chequea `revoked_at`/`redeemed_at`/
+   `expires_at` antes de escribir. Regla: **la autoridad sobre el estado de
+   la activación es siempre `claim_customer_activation()` bajo lock**; los
+   chequeos previos (issue/redeem) son fail-fast, no la garantía. Si algún
+   día un camino devuelve algo más que el token (p. ej. crea sesión o
+   vincula el customer directamente), ese camino sí necesita `for update`.
+7. **Cifrado verificado**: paquete OpenPGP SKESK con AES-256 y S2K iterado
+   con sal (`c3 0d 04 09 03 02 …`). Con 10 nonces emitidos y vencidos sin
+   canjear: ninguna fila contiene el token en claro, y `pgp_sym_decrypt` con
+   `nonce_hash` (hex/base64) o clave vacía falla. PostgREST pasa `p_token`
+   como `$1`, así que `pg_stat_statements` no captura el literal. Las filas
+   vencidas de una activación que nunca vuelve a emitir quedan como
+   ciphertext irreversible (sólo se purgan en el próximo `issue_*` de la
+   misma activación o por `on delete cascade`).
+8. Riesgo residual aceptado: si la persona tipea mal su email al
+   registrarse, el mail de confirmación (con el nonce en `redirect_to`) llega
+   a un tercero, que durante 30 min puede leer el nonce del link. Con PKCE
+   (default de `@supabase/ssr`) el clic directo del tercero **falla** en
+   `exchangeCodeForSession` (no tiene el `code_verifier`), así que no es
+   "un clic": tiene que extraer el nonce y armar a mano su propio login
+   (p. ej. Google) con `returnTo=/activar/continuar?c=<nonce>`. Mitigan el
+   TTL, el single-use y el clic explícito de "Confirmar y activar".
+   **Superado por ADR-0041** (ver sección siguiente): con `token_hash` la
+   fricción de PKCE desaparece y el tercero sí llega con un clic hasta la
+   pantalla "Confirmar y activar".
+9. **Frontend (tercera pasada del gate, 2026-09-28, LISTO en seguridad):**
+   - `/auth/callback` calcula el destino sin `c` **antes** de cualquier
+     llamada de red (`exchangeCodeForSession`/`redeem_*`); ninguna salida
+     (éxito, nonce inválido, error de auth, excepción → 500 sin `Location`)
+     puede llevar `c=`. El destino se re-valida con `safeReturnTo()` después
+     de pasar por `new URL()` (la normalización de dot-segments puede
+     producir `//host`), y se sigue prefijando con `siteUrl()` como string.
+   - La cookie replantada usa literalmente `activationCookieOptions()` (misma
+     que `/activar/[token]`), con `Cache-Control: no-store` en esa respuesta.
+   - `safeReturnTo()` no cambió: `?c=` no amplía la superficie (probado con
+     `//`, `\`, `%5C`, `%2F%2F`, dot-segments, `@`, `javascript:`, tab/LF,
+     `∕`/`／`, fragmento): todo lo que se rechazaba sin `c` se sigue rechazando.
+   - `Referrer-Policy: no-referrer` en `/activar/continuar`, `/login` y
+     `/signup` sólo con `?c=` (directo o en `returnTo` con un nivel de
+     encoding, que es lo único que la app genera). Falsos negativos con
+     `returnTo` doble-encodeado o anidado no son alcanzables por la app, y
+     aun así el default de Caddy (`strict-origin-when-cross-origin`) no manda
+     path ni query cross-origin. Sin `?c=` el header de esas rutas no cambia.
+   - Regla: el nonce sólo se canjea en `/auth/callback` tras una sesión
+     creada en ESE request. Si se agrega otro punto de canje (p. ej.
+     `/activar/continuar` con sesión ya existente), tiene que exigir sesión,
+     sacar `c` de la URL y replantar con `activationCookieOptions()`.
+   - Desde ADR-0041 el cálculo del destino sin `c` vive en
+     `lib/activation-continuation.ts` y corre **después** de crear la sesión,
+     no antes. El invariante que importa se mantiene (ninguna salida lleva
+     `c=`: el camino de error redirige a `/login?error=...` sin `next`, y una
+     excepción da 500 sin `Location`), pero cualquier cambio futuro que
+     agregue `next`/`returnTo` a la redirección de error tiene que pasar
+     primero por el helper.
+
+## Confirmación de email por `token_hash` (ADR-0041) — reglas
+
+Gate de security-engineer del 2026-09-29. Verificado en vivo contra Supabase
+local + `next build`/`next start` apuntando a local (scripts en scratchpad,
+no en el repo).
+
+1. **`/auth/confirm` es un segundo punto de canje del nonce** (el primero es
+   `/auth/callback`). Ambos usan `redeemActivationContinuationIfPresent()`
+   y sólo después de crear sesión en ESE request (`verifyOtp` /
+   `exchangeCodeForSession` sin error). Mismas reglas que la Fase 40 §9:
+   `c` nunca en el `Location`, cookie con `activationCookieOptions()`,
+   `Cache-Control: no-store`, nonce/token_hash nunca logueados.
+2. **`next` en `/auth/confirm` llega ABSOLUTO.** El template usa
+   `next={{ .RedirectTo }}`, y `RedirectTo` es el `emailRedirectTo` que arma
+   `signUpWithPassword()`: `${siteUrl()}/auth/callback?next=<returnTo>`.
+   `safeReturnTo()` lo rechaza (no empieza con `/`) y cae a `/dashboard`.
+   Regla: `/auth/confirm` sólo puede desenvolverlo si `new URL(next).origin
+   === new URL(siteUrl()).origin` **y** `pathname === "/auth/callback"`,
+   tomando su `next` interno y pasándolo por `safeReturnTo()`; cualquier
+   otra forma absoluta cae al fallback. Nunca se redirige a una URL absoluta
+   recibida por query, ni se relaja `safeReturnTo()` para aceptar absolutas.
+3. **`type` con allowlist** (implementado): `/auth/confirm` sólo acepta
+   `type === "email"` estricto (el único que genera el template de
+   confirmación) — cualquier otro valor (`recovery`, `magiclink`,
+   `email_change`, `invite`, ausente) cae al mismo fallback de error sin
+   llamar a `verifyOtp`, así que la ruta ya no funciona como verificador
+   OTP genérico. Verificado en el código (`app/auth/confirm/route.ts`) y
+   con `type=recovery` tampeado sobre un `token_hash` real: rechaza sin
+   consumir el token.
+4. **TTL real del link**: `otp_expiry` (`GOTRUE_MAILER_OTP_EXP`), 3600 s en
+   local — verificado en vivo (`confirmation_sent_at` retrasado 59 min →
+   sesión; 61 min → `403 otp_expired`). Single-use verificado (segundo clic
+   → `/login?error`). **Producción: confirmar en el dashboard** (Auth →
+   Providers → Email → "Email OTP Expiration"); no debe superar 3600 s.
+5. **Riesgo residual aceptado (reemplaza el #8 de la Fase 40): email mal
+   tipeado.** El tercero que recibe el mail entra con un clic, con sesión,
+   y aterriza en `/activar/continuar` con la cookie de activación ya
+   plantada; si toca "Confirmar y activar" queda como dueño del `Customer`
+   ajeno. Lo que NO es riesgo nuevo: la cuenta en sí (el dueño del buzón ya
+   controla esa cuenta vía recuperación de contraseña, con o sin PKCE). La
+   ventana efectiva es la del **nonce (30 min desde que se emitió en
+   `/activar/continuar`)**, no la del OTP: pasado ese lapso el link sigue
+   confirmando la cuenta pero ya no planta la cookie. Mitigan: TTL 30 min,
+   single-use del nonce y del `token_hash`, clic explícito de "Confirmar y
+   activar" con el email de la sesión a la vista, y que la persona real ve la
+   invitación como ya usada. Es el riesgo que la decisión de ADR-0040 ya
+   aceptó por escrito ("con un solo clic").
+6. **Login-CSRF (nuevo con `token_hash`, aceptado):** un atacante puede
+   mandarle a la víctima el link de confirmación de SU PROPIA cuenta sin
+   confirmar; al abrirlo, la víctima queda logueada como el atacante (PKCE lo
+   impedía). Si la víctima después abre su link de activación en ese
+   navegador, `/activar/continuar` muestra "Vas a activar esta invitación con
+   la cuenta <email del atacante>" y "No soy yo — usar otra cuenta": la
+   pantalla de confirmación explícita (ADR-0026, confused-deputy) es la
+   mitigación y **no se puede quitar ni automatizar**.
+7. **Prefetch de links (recomendado, no bloqueante):** `/auth/confirm`
+   consume `token_hash` Y nonce en un GET. Un escáner de links (Outlook Safe
+   Links, gateways corporativos) que siga el link quema los dos: la persona
+   real recibe error y pierde la continuidad. Con PKCE el escáner quemaba el
+   token de confirmación pero no el nonce (el canje de código fallaba antes).
+   Mitigación mínima: que el GET de `/auth/confirm` renderice una página con
+   un botón que haga POST (server action) y recién ahí llame a `verifyOtp`.
+8. **Orden de despliegue**: (a) migración de la Fase 40; (b) frontend con
+   `/auth/confirm` (con la regla 2 implementada); (c) recién después, el
+   template en el dashboard. El `Site URL` de Supabase tiene que ser
+   idéntico a `NEXT_PUBLIC_SITE_URL` (el link usa `{{ .SiteURL }}` y la
+   sesión se planta en ese host; si difiere, p. ej. `www` vs. apex, la
+   cookie queda en otro host que el del redirect). **Nunca `supabase config
+   push`** contra producción: subiría `site_url`/redirects de local.
+
 ## Pendiente de definir (Phase 1)
 
 - Proveedor de auth concreto: **Supabase Auth** (ADR-0002, cerrado).
