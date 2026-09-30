@@ -3641,3 +3641,419 @@ fijó en `theme: "light"` (antes seguía el tema del sistema).
 
 ADR-0043 queda completamente implementada, desplegada y verificada de
 punta a punta, sin pasos pendientes.
+
+---
+
+## ADR-0044 — Recursos exclusivos: anti-solapamiento a nivel de base de datos
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario ("necesito revisar toda la lógica que hay y
+cuánta es custom y cuánta no" — auditoría de qué tan genérico es el
+producto de cara a vender a una barbería), diseñada por `Plan` con tres
+rondas de investigación previa (modelo `ScheduleRule`/`SlotOccurrence`,
+modelo `Resource`, patrón de generación).
+
+**Problema:** una auditoría completa del sistema (ver resumen ejecutivo
+en la conversación, no repetido acá) encontró que el gap más riesgoso
+operativamente para un negocio de turno individual (ej. una barbería) es
+que **no existe ningún chequeo, a ningún nivel, que impida que el mismo
+`Resource` (ej. un barbero) quede reservado dos veces a la misma hora en
+servicios distintos**. El único `EXCLUDE USING gist` de todo el proyecto
+protege pagos (`daterange` de períodos), no reservas. `book_slot()` y
+`can_customer_book()` sólo validan capacidad de la ocurrencia puntual, y
+`generate_slot_occurrences_for_rule()` no consulta otras reglas del mismo
+recurso al generar.
+
+**Decisión — campo genérico en `Resource`, respaldado por un exclusion
+constraint en base de datos** (no sólo una validación en la RPC, porque
+el generador, el cron y los triggers insertan por su cuenta sin pasar por
+un único punto de entrada):
+
+- `resources.is_exclusive boolean not null default false` — "se ocupa de
+  a uno, no admite turnos superpuestos". Genérico, sin ninguna palabra de
+  rubro (sirve igual para un profesional, una camilla, una cancha de
+  1-a-1).
+- `slot_occurrences.resource_is_exclusive boolean not null default
+  false` — denormalizado desde `resources.is_exclusive` vía trigger
+  (`BEFORE INSERT OR UPDATE OF resource_id`, y un segundo trigger `AFTER
+  UPDATE OF is_exclusive` en `resources` que propaga sólo a ocurrencias
+  futuras `ACTIVE` — el pasado no se revalida). Necesario porque un
+  `EXCLUDE` no puede mirar otra tabla.
+- Constraint:
+  ```sql
+  alter table slot_occurrences add constraint slot_occurrences_exclusive_resource_no_overlap
+    exclude using gist (resource_id with =, tstzrange(start_at, end_at, '[)') with &&)
+    where (status = 'ACTIVE' and resource_is_exclusive);
+  ```
+  (`btree_gist` ya está instalado desde `phase7_payments.sql`). Con
+  `'[)'`, dos turnos pegados (10:00–10:30 y 10:30–11:00) no chocan.
+  `BLOCKED`/`CANCELLED` quedan afuera del constraint, así que cancelar
+  libera el hueco.
+- `generate_slot_occurrences_for_rule()` se recrea para envolver cada
+  insert en `begin ... exception when exclusion_violation then ... end`
+  y saltear esa ocurrencia puntual en vez de abortar toda la regeneración
+  del tenant (sin esto, un conflicto en una organización frenaría el
+  `pg_cron` diario para todas).
+- Nueva función `check_schedule_rule_conflicts(...)` que proyecta la
+  ventana de 90 días y devuelve los choques ANTES de crear/editar una
+  regla — el constraint es el respaldo final, esta función da un mensaje
+  útil (`RESOURCE_SCHEDULE_CONFLICT`) en vez de dejar que el usuario se
+  entere por un error de Postgres.
+- Activar el flag en un recurso que ya tiene solapamientos: el propio
+  constraint rechaza el `update` (`RESOURCE_HAS_OVERLAPS`), hay que
+  resolver los choques antes de marcarlo exclusivo.
+
+**Alternativas descartadas** (evaluadas explícitamente por el diseño):
+- **Inferir el conflicto sólo por solapamiento, sin campo nuevo**:
+  descartada — rompería datos hoy válidos (ej. un gimnasio con una sala
+  compartida entre dos clases a la misma hora pasaría a ser un error),
+  cambiando comportamiento en el deploy para tenants existentes. Además
+  deja el modelado ambiguo (la única forma de "compartir de verdad"
+  sería crear recursos fantasma).
+- **`concurrency_limit int` en vez de `boolean`**: descartada por ahora
+  — con N>1 el constraint deja de ser un `EXCLUDE` declarativo y pasa a
+  requerir un conteo con trigger y lock, más complejo y con riesgo de
+  carreras, para un caso de uso ("cancha que admite 2 servicios
+  simultáneos a la vez") que no tiene demanda real todavía. El boolean
+  migra a int sin romper nada si aparece la necesidad.
+
+**Impacto:** `backend-engineer` implementa la migración
+`phase42_exclusive_resources.sql`. `frontend-engineer` agrega el
+checkbox "Se ocupa de a uno" al formulario de recursos, y mapea
+`RESOURCE_SCHEDULE_CONFLICT`/`RESOURCE_HAS_OVERLAPS`. No requiere gate de
+`security-engineer` (no toca auth/RLS/fronteras de tenant, hereda la RLS
+existente de `resources`) — sí pasa por `reviewer`, con foco en el manejo
+de excepciones del generador y en que el trigger de propagación respete
+`organization_id`. Es la base de ADR-0045 (generador por franja) y deja
+lista la capacidad=1 implícita que ADR-0046 (cobrar turno) asume para
+recursos exclusivos.
+
+---
+
+## ADR-0045 — Generador de horarios por franja horaria
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario (auditoría de generalización), diseñada por
+`Plan`.
+
+**Problema:** cargar la agenda de un negocio de turno individual hoy
+significa crear una `ScheduleRule` por cada horario de inicio, uno a la
+vez — para una barbería con 2 profesionales, lunes a sábado de 10 a 20
+con turnos de 30 minutos, son unos 40 envíos de formulario. El formulario
+actual (`schedule-rule-form.tsx`) sólo acepta un único `localStartTime`
+por regla.
+
+**Decisión — extender el precedente ya existente de ADR-0022
+(`create_schedule_rule_group()`, que itera `weekdays[]`) al producto
+cartesiano `weekdays[] × local_start_times[]`**, sin cambiar el modelo de
+`ScheduleRule` (sigue siendo una fila por día+hora, nunca un rango):
+
+- Nueva RPC `create_schedule_rule_span(p_service_id, p_resource_id,
+  p_weekdays int[], p_range_start time, p_range_end time, p_step_minutes
+  int, p_duration_minutes int, p_capacity int) returns uuid` (el
+  `group_id`), mismo chequeo de permiso que `create_schedule_rule_group`
+  vigente.
+- Expansión de `local_start_time` en SQL con `generate_series(range_start,
+  range_end - duration, step)`, incluyendo sólo inicios donde `start +
+  duration <= range_end`.
+- Topes defensivos obligatorios: `step_minutes >= 5`, máximo 96 inicios
+  por día, máximo 7×96 reglas por llamada — sin esto, un solo request
+  podría generar decenas de miles de `SlotOccurrence` en la ventana de 90
+  días (vector de DoS de almacenamiento).
+- Si el recurso es exclusivo (ADR-0044) y `step_minutes < duration_minutes`
+  (turnos que se pisarían entre sí dentro de la misma franja), se
+  rechaza de entrada con `SPAN_SELF_OVERLAP_ON_EXCLUSIVE_RESOURCE`. Si es
+  exclusivo y `p_capacity > 1`, se rechaza con
+  `EXCLUSIVE_RESOURCE_CAPACITY_MUST_BE_ONE` (regla genérica: un recurso
+  exclusivo atiende de a uno).
+- Llama a `check_schedule_rule_conflicts()` (ADR-0044) una vez para todo
+  el lote; la operación es atómica (todo o nada).
+
+**Por qué no un `ScheduleRule` con rango propio** (alternativa
+descartada, mismo motivo que ADR-0022 ya documentó en
+`docs/decisions.md:1154-1161`): rompería `ScheduleException` (clave
+regla+fecha puntual), la cascada de `discontinue_schedule_rule`, y
+`RecurringBooking.schedule_rule_id` — los tres asumen una regla puntual,
+no un rango expandible.
+
+**Impacto:** `backend-engineer` implementa la migración
+`phase43_schedule_rule_spans.sql` (idealmente refactorizando
+`create_schedule_rule_group` para compartir la rutina interna de
+expansión+inserción). `frontend-engineer` agrega un toggle "Un
+horario / Franja" en `schedule-rule-form.tsx`, con vista previa de los N
+horarios resultantes (sólo informativa, calculada en cliente) y
+agrupación por `group_id` en el listado. No requiere gate de
+`security-engineer` — mismo perímetro de permisos que
+`create_schedule_rule_group`. `reviewer` debe confirmar los topes
+defensivos explícitamente. Depende de que ADR-0044 esté mergeada primero
+(sin el constraint, una franja sobre un recurso exclusivo puede generar
+dobles turnos silenciosamente) aunque el código puede escribirse en
+paralelo.
+
+---
+
+## ADR-0046 — `book_slot_paying()`: cobrar un turno suelto, versión sólo-mostrador
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario, diseñada por `Plan`, implementa el §2.8 de
+`docs/proposals/adr-0025-makeup-credits.md` (documento de diseño nunca
+implementado, escrito junto con ADR-0025 original).
+
+**Problema:** el modelo `DROP_IN` (turno suelto, un pago por ocurrencia
+puntual) ya existe completo en el schema desde ADR-0024/ADR-0022
+(`service_plan_kind`, `payments.slot_occurrence_id`, el trigger
+`PAYMENT_PLAN_KIND_REQUIRES_OCCURRENCE`, el índice anti-doble-cobro) —
+pero nunca se construyó la pieza que lo cobra. `RegisterPaymentForm`
+excluye `DROP_IN` a propósito ("eso se cobra desde el turno, no desde
+acá"), y esa pantalla del turno nunca se construyó. Consecuencia real: un
+servicio configurado con `DROP_IN` + `payment_required=true` queda con
+reservas bloqueadas sin ninguna salida — no es un bug de lógica de
+`evaluate_payment_coverage()` (que hace exactamente lo que tiene que
+hacer: un `DROP_IN` nunca cubre por período), es una pieza de UI/RPC que
+falta.
+
+**Decisión — implementar `quote_booking()`/`book_slot_paying()` tal como
+especifica §2.8 de la propuesta original, con dos precisiones nuevas**:
+
+1. **Por ahora, `book_slot_paying()` lo invoca sólo el staff** (mismo
+   permiso que `admin_book_for_customer`, ej. `MANAGE_BOOKINGS`) — sin
+   una pasarela de pago real conectada (ADR-0027, postergada, sin fecha),
+   dejar que el cliente se auto-marque como `PAID` sería autodeclararse
+   pagado sin ninguna verificación. La firma queda lista para engancharse
+   con `payment_intents` (§2.8.2) el día que ADR-0027 se implemente,
+   pero eso es explícitamente fuera de este alcance. **Confirmado con el
+   usuario**: cobro por mostrador (efectivo/tarjeta en el local,
+   registrado en el sistema) alcanza para la primera venta — no se
+   necesita pago online para vender.
+2. **Cubre también "ya anotado, falta cobrar"**: si la `Booking` ya
+   existe y la cobertura no está resuelta, sólo crea el `Payment`. Si ya
+   está cubierta, `ALREADY_COVERED` sin cobrar de nuevo — cubre el caso
+   de un negocio con `payment_required=false` que igual quiere dejar
+   registro de un cobro hecho en efectivo después del servicio.
+
+**Mecánica** (dos RPC nuevas, `phase44_drop_in_booking.sql`):
+- `quote_booking(p_slot_occurrence_id, p_customer_id)` — `stable`, sin
+  side-effects, devuelve `{can_book, reason, coverage_path, price,
+  currency, makeup_credit_id?, makeup_credit_expires_on?}`. Envuelve
+  `evaluate_payment_coverage()`/`evaluate_customer_booking()` ya
+  existentes. Invocable por staff con permiso, o por el propio cliente
+  consultando su propia cobertura (sólo lectura, sin riesgo).
+- `book_slot_paying(p_slot_occurrence_id, p_customer_id, p_amount?)` —
+  `security definer`, mismo orden de locks que `book_slot()`
+  (`FOR UPDATE` sobre la ocurrencia primero, para no generar deadlocks
+  con reservas concurrentes). Exige permiso de staff. Valida que
+  `customer_id` pertenece a la misma organización que la ocurrencia
+  (`CUSTOMER_NOT_IN_ORG` si no — es la frontera multi-tenant principal de
+  esta pieza). Re-evalúa cobertura antes de cobrar. Resuelve el `DROP_IN`
+  activo del servicio (`NO_DROP_IN_PLAN` si no hay uno); `amount =
+  coalesce(p_amount, plan.price)`, nunca negativo. El índice
+  `payments_one_paid_per_occurrence_idx` ya existente es la red contra
+  doble cobro concurrente (`unique_violation` → `ALREADY_PAID`). Si no
+  existe `Booking` todavía, la crea en la misma transacción (mismo camino
+  interno que `admin_book_for_customer`) — o quedan `Payment PAID` +
+  `Booking CONFIRMED` juntos, o no queda nada.
+- `agenda_occurrences()`/el detalle de asistentes se extienden
+  (patrón aditivo, `drop function` + `create function`) con
+  `drop_in_plan_id, drop_in_price, drop_in_currency` por ocurrencia y
+  `is_covered, paid_payment_id` por asistente.
+
+**Impacto**: `backend-engineer` implementa la migración.
+`frontend-engineer` agrega "Cobrar $X" (o badge "Pagado") junto a cada
+asistente en `occurrence-actions.tsx`, y "Anotar y cobrar" en la sección
+de anotar cliente; nueva server action en `app/actions/`. **Gate
+obligatorio de `security-engineer`** — toca pagos y fronteras
+multi-tenant: foco en (a) pertenencia de `customer_id`/ocurrencia a la
+misma organización, (b) que el cliente nunca pueda fijar `amount` ni
+plan y que la RPC no sea invocable sin el permiso de staff, (c) orden de
+locks bajo concurrencia (doble cobro, sobre-reserva), (d) que
+`quote_booking` no filtre precios/cobertura de otro cliente o otra
+organización. Independiente de ADR-0044/0045, pero se recomienda
+mergearla antes de ADR-0047 (ambas tocan `book_slot()`/el árbol de
+reserva y un merge en paralelo garantiza conflicto).
+
+---
+
+## ADR-0047 — Reserva abierta: alta de `Customer` en el momento de reservar, detrás de un flag
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario, diseñada por `Plan`. **Priorizada explícitamente
+para la primera semana de trabajo** (no la segunda, como recomendaba el
+plan original) — decisión del usuario tras confirmar que es el
+bloqueante comercial más visible (una auditoría previa ya lo había
+marcado como el punto #1: hoy ningún cliente nuevo puede reservar sin
+que el dueño lo dé de alta a mano primero, lo cual además contradice el
+FAQ de la propia landing page, que dice "sólo necesitan una cuenta
+simple").
+
+**Problema:** `can_customer_book()` devuelve `NOT_A_CUSTOMER` para
+cualquier cuenta autenticada que no sea ya `Customer` activo de esa
+organización — no existe ningún camino de autoservicio, ni ningún flag
+para relajarlo. Confirmado que esto es así por diseño desde ADR-0005/
+ADR-0022, no un bug.
+
+**Decisión — columna `organizations.open_booking_enabled boolean not
+null default false`**, mismo patrón ya establecido 3 veces en este
+proyecto (`makeup_credits_enabled`, `customer_activation_enabled`,
+`public_availability_display`): flag opt-in por organización, default
+que no cambia comportamiento existente, editable desde Configuración con
+el mismo mecanismo de checkbox+hidden-input+`formData.has()` que ya usa
+`settings-form.tsx`/`actions/settings.ts` — la policy
+`organizations_update_owner` ya alcanza como control de acceso, sin RPC
+nueva para el flag en sí.
+
+**El alta on-the-fly vive DENTRO de `book_slot()`, nunca dentro de
+`can_customer_book()`** — decisión de diseño explícita y no trivial: 
+`can_customer_book()`/`evaluate_customer_booking()` se invocan también
+desde `preview_recurring_booking()` y `can_customer_book_detail()` en
+contextos de **preview de solo lectura**, sin intención real de reservar.
+Si el alta viviera ahí, un preview inocente crearía `Customer`s reales
+como side-effect no deseado. `book_slot()` ya toma `FOR UPDATE` sobre la
+ocurrencia en el intento real de reserva — es el único lugar seguro.
+Mecánica exacta: después del lock de la ocurrencia y antes de invocar
+`can_customer_book()`, si no hay `Customer` activo para `(org,
+auth.uid())`, el flag está prendido y pasa el rate limit (ver abajo), se
+inserta `customers(organization_id, profile_id=auth.uid(),
+display_name=profiles.full_name, is_active=true, source='SELF_SERVICE')`
+dentro de la misma transacción que la reserva — si la reserva falla
+después (sin cupo, sin cobertura), el rollback revierte también el alta,
+así que nunca quedan `Customer`s huérfanos. Concurrencia (dos pestañas):
+maneja `unique_violation` sobre `(organization_id, profile_id)` con
+re-select. **Si existe un `Customer` inactivo para ese `profile_id`, NO
+se reactiva** — `NOT_A_CUSTOMER` igual; si el staff lo dio de baja, la
+reserva abierta no puede pasar por encima de esa decisión.
+
+`can_customer_book()` cambia sólo su código de retorno en este caso: con
+el flag prendido y sin `Customer`, devuelve un reason nuevo (ej.
+`OK_OPEN_BOOKING`) en vez de `NOT_A_CUSTOMER`, para que la UI pública
+muestre "Reservar" en vez del mensaje de "escribile al negocio". La
+cobertura de pago se evalúa como si fuera un `Customer` nuevo, sin
+planes ni créditos previos — si el servicio exige pago, el resultado es
+`PAYMENT_REQUIRED` normalmente.
+
+**Regla de seguridad citada explícitamente, por ser la más relevante de
+esta zona** (`docs/security.md`, regla ya establecida en el gate de
+ADR-0043): *"El email de `auth.users` es un factor de conocimiento,
+nunca de posesión."* El alta on-the-fly se basa exclusivamente en
+`auth.uid()` de la sesión ya autenticada (mismo patrón IDOR-proof de
+ADR-0005) — **nunca** busca ni vincula un `Customer` gestionado
+preexistente por email (ADR-0026). Si ya existe un `Customer` gestionado
+con el mismo email sin `profile_id`, se crea uno nuevo (duplicado a
+fusionar por el staff más adelante) en vez de vincular por email — un
+duplicado es preferible a un vínculo no verificado.
+
+**Riesgo heredado de ADR-0043, nombrado explícitamente y mitigado**:
+desde que el signup no tiene confirmación de email, "reservar" con este
+flag prendido baja a "pasar el captcha de Turnstile". Mitigaciones
+obligatorias en esta misma fase:
+1. Rate limit dentro de la RPC, mismo patrón que
+   `issue_customer_activation()` (`phase21:335-353`): tope de altas
+   on-the-fly por `auth.uid()` en 24h, y tope por organización por hora.
+2. El `Customer` creado lleva `source='SELF_SERVICE'` para que el staff
+   pueda filtrarlo/limpiarlo.
+3. El flag es opt-in — la organización acepta el riesgo residual al
+   prenderlo, con el texto de advertencia correspondiente en Settings.
+
+**Impacto**: `backend-engineer` implementa
+`phase45_open_booking.sql` (recrea `book_slot()` desde la versión
+vigente de `phase20`). `frontend-engineer` agrega el checkbox en
+Settings y ajusta el flujo público de reserva para tratar
+`OK_OPEN_BOOKING` como reservable. **Gate obligatorio de
+`security-engineer`, el más importante de todo este lote** — foco en:
+(a) que `organization_id` salga siempre de la ocurrencia, nunca de un
+input del caller; (b) el rate limit; (c) la no-reactivación de cuentas
+inactivas; (d) la ausencia total de vínculo por email; (e) un test
+explícito de que los caminos de preview NO crean `Customer`s con el flag
+prendido; (f) si hace falta un tope de reservas futuras activas por
+`Customer` `SELF_SERVICE` para acotar el abuso de cupo con cuentas
+descartables. Se recomienda mergear después de ADR-0046 (ambas tocan
+`book_slot()`) para evitar conflicto de merge garantizado si van en
+paralelo.
+
+---
+
+## ADR-0048 — Disponibilidad pública por recurso (opt-in)
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario, diseñada por `Plan`.
+
+**Problema:** `get_public_availability()` nunca devolvió `resource_id`
+ni el nombre del recurso — un cliente que reserva no puede elegir "con
+quién" (ej. qué barbero). El RPC equivalente de staff
+(`agenda_occurrences()`) sí lo expone; sólo falta en el camino público.
+
+**Decisión**: agregar al final del `returns table` (patrón aditivo ya
+usado 3 veces: fase 5, 16, 20) `resource_id uuid, resource_name text`.
+`resource_id` siempre se devuelve (es opaco, sirve para agrupar/filtrar
+sin revelar nada). `resource_name` **sólo se devuelve si
+`organizations.public_resource_names boolean not null default false`
+está prendido**; si no, `null`. Es una regla de disclosure nueva,
+análoga en espíritu a ADR-0008 pero sobre identidad en vez de cupo: si el
+recurso es una persona, su nombre es un dato que hoy nunca salió por
+`anon`, y no debería empezar a salir por default silenciosamente.
+
+**Impacto**: `backend-engineer` implementa
+`phase46_public_availability_resource.sql` (`drop function` + `create
+function`, grants re-emitidos a `anon, authenticated`).
+`frontend-engineer` mapea las columnas nuevas a mano en
+`app/actions/public.ts` (el paquete `@reservaste/domain` está fijado a
+un commit SHA, no a HEAD — mismo patrón ya usado 2 veces cuando esto
+pasa) y agrega un selector "Con quién" en la reserva pública cuando haya
+más de un recurso y el flag esté prendido, con "Cualquiera" como
+comportamiento por default. **Gate liviano de `security-engineer`** (es
+una RPC `anon`): confirmar que no se filtra nada más de `resources`
+(ej. `description`) y que el flag se lee de la organización correcta.
+Tiene más sentido después de ADR-0044 (recursos exclusivos) pero es
+técnicamente independiente — no bloqueante para la primera venta (con un
+servicio por profesional, ej. "Corte con Juan", se puede operar sin
+esto).
+
+---
+
+## Plan de generalización a turno individual — orden y alcance mínimo
+
+Fecha: 2026-09-30
+
+Registro de coordinación para ADR-0044 a ADR-0048 (más dos ajustes
+menores sin ADR propia, ver abajo) — no es una ADR nueva, es el mapa de
+secuenciación acordado con el usuario tras la auditoría de qué tan
+genérico es el sistema.
+
+**Orden acordado** (reordenado tras la decisión explícita del usuario de
+priorizar ADR-0047 — reserva abierta — en la primera semana, no la
+segunda como recomendaba el plan original, aceptando que el gate de
+seguridad puede estirar el tiempo):
+
+1. ADR-0044 (recursos exclusivos) — base de todo lo demás.
+2. ADR-0045 (generador por franja) — depende de 0044 mergeada.
+3. ADR-0046 (cobrar turno, sólo mostrador) — independiente, en paralelo
+   con 1-2.
+4. ADR-0047 (reserva abierta) — después de 0046 (ambas tocan
+   `book_slot()`).
+5. ADR-0048 (con quién) — no bloqueante, puede ir después o en paralelo
+   si sobra tiempo.
+
+**Dos ajustes menores, sin migración ni ADR propia, sólo `reviewer`**:
+- Ocultar la pestaña "Créditos" del portal del cliente
+  (`frontend/components/me-nav.tsx`) cuando `makeup_credits_enabled` esté
+  apagado para todas las organizaciones del usuario — el flag ya existe
+  en el backend, sólo falta que el frontend lo respete visualmente.
+  Revisar también el copy de "clase"/"liberar cupo" en `app/me/*`.
+- ~20 strings de copy con "clase"/"CrossFit"/"Iron Gym"/"socio" en
+  placeholders y empty states pasan a términos neutros.
+
+**Confirmado con el usuario**: cobro sólo por mostrador (sin pasarela de
+pago online) alcanza para la primera venta — ADR-0027 (integrar una
+pasarela real) sigue fuera de alcance y no se menciona a la barbería como
+disponible.
+
+**Alcance mínimo honesto para la primera semana**: recurso exclusivo por
+profesional, agenda armada por franja horaria en vez de 40 formularios,
+cobro registrado por mostrador, y reserva abierta para que un cliente
+nuevo pueda reservar por link sin alta manual previa — con el gate de
+seguridad de ADR-0047 corrido con el mismo rigor de siempre, sin
+recortar pasos aunque apriete el tiempo.
