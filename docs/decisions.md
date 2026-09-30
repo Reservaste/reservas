@@ -1993,3 +1993,2179 @@ prueba contra una copia de los datos reales, no solo contra `db reset`
 sobre una base vacía — es la primera de esta iteración con ese requisito,
 porque es la primera que retrofitea una tabla que ya tiene filas de un
 cliente real.
+
+## ADR-0030 — Refresh visual: marca de plataforma (violeta/cian), landing tipo funnel
+
+Fecha: 2026-09-22
+Estado: **Aceptada**
+Propuesta por: `ux-ui-designer`, a pedido del usuario ("mejorar el diseño y
+la UX de todo el producto" tomando `https://turnito.app/uy/` como
+referencia de nivel). Propuesta completa en
+`docs/proposals/adr-0030-visual-refresh.md` — este ADR registra la
+decisión, no la repite.
+
+**El hallazgo que reordenó la propuesta**: `--primary` significaba a la vez
+"acento de esta pantalla" y "color de Reservaste", así que el logo de la
+plataforma se pintaba con el `accent_color` de cada organización dentro de
+`[data-brand]` — lo opuesto a lo que ADR-0020 decidió ("la consola de
+plataforma es nuestra marca, no la del cliente"). Se separa en tres capas:
+**P** (`--brand-violet`/`-strong`/`-deep`, `--brand-cyan`/`-deep`, fijos,
+nunca sobreescribibles por un tenant — logo, landing, `/admin`), **S**
+(semánticos success/warning/destructive, sin cambios), **T** (`--primary`,
+default = violeta, pisado por `[data-brand]` exactamente igual que hoy). Una
+organización con acento configurado no ve cambiar su página; una sin acento
+pasa de índigo a violeta junto con el resto del producto sin marca de
+tenant.
+
+### Resoluciones a las preguntas abiertas de la propuesta (decididas con el usuario, 2026-09-22)
+
+1. **Violeta `#7c3aed`: aprobado tal cual propuesto.**
+2. **CTA principal de la landing → página `/contacto` con formulario**, no
+   el link directo a WhatsApp que recomendaba la propuesta por ser el de
+   menor esfuerzo. Es la opción de mayor alcance de las tres — genera un
+   lead real, no solo abre un chat — y el usuario la eligió a sabiendas de
+   que implica capturar el envío en algún lado, no solo maquetar un
+   formulario. Alcance mínimo: una tabla nueva y chica para las
+   submissions (`backend-engineer` define el shape exacto — algo en la
+   línea de `platform_contact_requests`, `INSERT` público vía RPC o policy
+   estricta, `SELECT` solo `is_platform_admin()`), visible desde `/admin`.
+   No es alta de organización ni toca `ServicePlan`/booking — no arrastra
+   ninguna otra decisión estructural.
+3. **Precios: USD tal cual**, sin aclaración de IVA ni conversión a UYU.
+4. **Dominio: todavía no hay uno real.** La landing y el copy de onboarding
+   no deben prometer `reservaste.app` — ajustar para no citar un dominio
+   que no resuelve, hasta que haya uno comprado.
+
+### Resoluciones del Orchestrator sobre las preguntas menores (no bloqueantes, criterio de bajo riesgo)
+
+5. **Testimonios: sin fabricar ninguno**, tal como ya proponía §3.6 —
+   señales factuales verificables hasta que el cliente real autorice ser
+   nombrado.
+6. **`.brand-band` (banda oscura acotada de la landing): aprobada tal como
+   está escrita en §1.6** — no es dark mode (sin toggle, sin persistencia,
+   sin inputs adentro), es una sección con fondo literal de capa P.
+7. **`font-optical-sizing: auto` global: no por ahora.** Queda confinado a
+   la landing (la escala `.display-*`/`.lead` ya vive solo en
+   `components/marketing/`) para no tocar la tipografía de las 60
+   pantallas de producto en un pase que ya es grande.
+8. **Vocabulario de rubro filtrado ("la clase" en copy de `/me` y
+   asistencia): corrección mínima ahora** (neutralizar a "la fecha"/"el
+   turno"), **no** la columna configurable por `Organization` que
+   proponía la propuesta como alternativa — eso es un cambio de dominio
+   nuevo y por lo tanto su propio ADR si se decide encararlo, no algo que
+   se cuela dentro de un pase de diseño visual.
+
+### Plan de fases (de la propuesta, sin cambios)
+
+Fase 1 (tokens, aditiva, riesgo nulo) → Fase 2 (landing + `/contacto`) →
+Fase 3 (de-fuga de `Brand`/`BrandMark` a capa P — **visible para tenants
+con acento configurado, avisar al cliente actual antes de desplegar**) →
+Fase 4 (flip de `--primary` + neutros, requiere pasada visual con
+`next dev`) → Fase 5 (superficies de cliente, verificar con ≥3 acentos de
+tenant distintos) → Fase 6 (deuda de densidad del panel admin, no arranca
+sin `next dev`) → Fase 7 (`/admin`). Se arranca por la Fase 1 y 2 ahora;
+3-7 quedan para las próximas rondas de este mismo ADR, no para fases
+nuevas del roadmap — es un solo cambio de identidad visual ejecutado en
+etapas por riesgo, no siete features distintas.
+
+## ADR-0031 — Prorrateo del primer período en ciclos de facturación largos
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario (feedback de
+producción). Propuesta completa en
+`docs/proposals/adr-0031-prorrateo-ciclos-largos.md` — este ADR registra
+la decisión, no la repite.
+
+Extiende `billing_period_for()` (no la duplica) con `CALENDAR_PERIOD`/
+`ROLLING_PERIOD` + `billing_period_months`/`billing_anchor_month` en
+`service_plans`, aditivo, sin tocar `CALENDAR_MONTH`/`ROLLING_MONTH`
+existentes. `quote_service_plan_period()`, función nueva de solo lectura,
+cotiza — el mostrador sigue registrando el pago con `amount` libre.
+
+### Resoluciones del Orchestrator a las preguntas abiertas
+
+1. **Prorrateo por meses enteros, no por días.** Es lo que el mostrador
+   puede explicar en una frase y no depende de cuántos días tiene el mes.
+2. **Se prorratea el precio, no el período.** La cobertura del cliente
+   arranca al principio del ciclo calendario, no el día que se hizo
+   cliente — la asimetría es real pero explicable, y recortar
+   `period_start` rompe el `EXCLUDE` y la alineación de renovación de
+   todo el plan.
+3. **El prorrateo aplica solo al alta inicial en un ciclo largo, nunca al
+   cambio de plan a mitad de período.** ADR-0024 resolución 1 (VOID +
+   recargar) es una regla de resolución, no de cobro — mezclar las dos
+   metería una jerarquía entre planes en la función de cotización, que es
+   justo lo que esa resolución evitó del lado del motor.
+4. **Sin nota de crédito por lo no consumido de un plan anterior.** No es
+   parte de lo que se pidió (el pedido era sobre ciclos largos, no sobre
+   cambios de plan) — si en algún momento se necesita, es una entidad
+   nueva y su propio ADR, no un campo escondido en `quote_service_plan_period()`.
+5. **`organizations.currency_minor_units` se difiere a ADR-0027.** Hoy no
+   hay ningún consumidor que necesite el centavo; redondeo a unidad
+   entera de moneda alcanza.
+6. **El default de vencimiento del crédito de recupero en planes de ciclo
+   largo pasa a `END_OF_MONTH`, no `END_OF_BILLING_PERIOD`.** Un crédito
+   vivo tres meses en un plan trimestral triplica el riesgo que ADR-0025
+   ya había dejado anotado como abierto (cuántos créditos vivos tolera la
+   capacidad real). `END_OF_BILLING_PERIOD` sigue siendo válido para
+   ciclos mensuales, donde no cambia nada de lo ya aceptado.
+
+**Implementación**: backend completo (2026-09-23) — Fase 31,
+`20260923180000_phase31_long_billing_periods.sql`. Pendiente: revisión
+de `security-engineer`, formulario de plan + formulario de pago
+(`frontend-engineer`, especificado en `docs/api.md` §Fase 31).
+
+## ADR-0032 — `audit_log`: registro de acciones sensibles
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario (feedback de
+producción, alcance acotado explícitamente por el usuario a acciones
+sensibles/administrativas, no todo el sistema). Propuesta completa en
+`docs/proposals/adr-0032-audit-log.md`.
+
+**El hallazgo que decide el diseño**: la mitad de las escrituras del
+alcance (alta y anulación de pago, cambios de precio/nombre de plan) no
+pasan por ninguna RPC — son `INSERT`/`UPDATE` de PostgREST directo. Un
+insert explícito por RPC dejaría afuera la mayoría de lo que se pidió
+auditar. Por eso el diseño es por **trigger** (`AFTER INSERT/UPDATE` con
+predicado `WHEN`, no evadible) con contexto opcional desde la RPC vía
+`set_config('app.audit_note', ...)`. Tabla `audit_log` con `action` enum
+(8 valores), `target_table`+`target_id` (sin FK al target, a propósito:
+el log tiene que sobrevivir al borrado de lo que audita), `metadata`
+jsonb con el diff mínimo (nunca la fila entera ni datos personales),
+inmutable (RLS sin policies de escritura + trigger que rechaza
+`UPDATE`/`DELETE`, sin excepción para `service_role`).
+
+### Resoluciones del Orchestrator a las preguntas abiertas
+
+1. **Lectura**: `is_platform_admin()` ve todo; `OWNER` ve el log de su
+   propia organización; `STAFF` no ve nada. Aprobado tal cual propuesto.
+2. **El `OWNER` sí ve las filas de `ORGANIZATION_SUBSCRIPTION_CHANGED`**
+   (que la plataforma le suspendió/reactivó la cuenta) — una suspensión
+   que el dueño no puede rastrear genera desconfianza. **Con un matiz**:
+   la identidad del actor de plataforma (`actor_id` de un platform admin)
+   **no se resuelve a un nombre en la UI del cliente** — el dueño ve que
+   pasó y cuándo, no quién de nuestro lado lo hizo.
+3. **Sin política de retención por ahora.** Mantener el índice
+   `(organization_id, created_at desc)` listo para cuando haga falta, sin
+   implementar el borrado todavía.
+
+**Alcance confirmado, sin cambios sobre lo propuesto**: pagos (alta,
+cambio de estado incluida anulación), reservas de mostrador (alta y
+cancelación cuando el actor no es el propio cliente), planes (alta,
+cambio de precio/nombre, activar/desactivar), suspensión/cambio de plan
+SaaS de la organización. Fuera de alcance, explícito: asistencia,
+créditos de recupero (ya tienen su propio log en `makeup_credits`),
+acciones del propio cliente, altas de cliente/servicio/horario/branding,
+logins y lecturas.
+
+**Implementación**: backend completo (Fase 30,
+`20260923170000_phase30_audit_log.sql`, 226/226 tests de integración) —
+tabla + enum + 4 triggers de auditoría + trigger de inmutabilidad +
+policy de `SELECT` + `organization_audit_log()` como lectura que
+enmascara al actor de plataforma (resolución 2). Detalle en
+`docs/database.md` (Fase 30), `docs/security.md` y `docs/api.md`.
+Pendiente: revisión de `security-engineer` (obligatoria por el propio
+ADR), la server action `getOrganizationAuditLog()` y la pantalla de solo
+lectura del `OWNER` en `/org/[slug]/configuracion` (especificada en
+`docs/api.md`).
+
+## ADR-0033 — Roles configurables por organización
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario (feedback de
+producción — un rol de "profesor" no debería ver pagos, configurable por
+organización). Propuesta completa en
+`docs/proposals/adr-0033-roles-configurables.md`.
+
+`OWNER` se mantiene como enum fijo, no configurable — es la raíz de
+confianza (evita el ciclo "me edito el rol para poder editar roles",
+corta antes de mirar permisos así que un rol mal configurado nunca deja
+a la organización sin quien lo arregle, y cero riesgo de migración sobre
+las policies/RPCs que ya usan `is_organization_owner()`). Lo nuevo es una
+capa de roles configurables **dentro** de `STAFF`: tabla
+`organization_roles` (por organización, nombre libre, uno default) +
+`organization_members.role_id` nullable con fallback al default.
+Permisos como columnas booleanas (no jsonb, para no reintroducir lógica
+de tres valores — la causa de un bypass de autorización ya documentado
+en ADR-0026/ADR-0028) con clave de permiso en enum.
+
+### Resoluciones del Orchestrator a las preguntas abiertas
+
+1. **`VIEW_PAYMENTS` y `MANAGE_PAYMENTS` separados**, no un solo permiso
+   — con `CHECK` de que `MANAGE` implica `VIEW`.
+2. **Se acepta la fuga residual de `upcoming_unpaid`/`PAYMENT_REQUIRED`**
+   en pantallas operativas (asistencia, horario fijo) para un rol sin
+   `VIEW_PAYMENTS` — documentada, no oculta: sin ese dato un rol no
+   entiende por qué no puede anotar a alguien. "No ver pagos" no es "no
+   ver que algo depende de un pago".
+3. **Se cierra ahora, en la misma migración, el hueco ya existente** de
+   que el precio/nombre de un `ServicePlan` solo está protegido a nivel
+   `OWNER` en TypeScript (`frontend/app/actions/service-plans.ts`), no en
+   la base — cualquier `STAFF` puede cambiarlo hoy por PostgREST directo.
+   No es parte del pedido original pero la propuesta no se puede
+   construir con ese hueco abierto debajo.
+4. **Asistencia (`MANAGE_ATTENDANCE`) es un permiso configurable.**
+5. **Sin tope de cantidad de roles por organización.**
+
+Alcance del primer corte, sin más: `VIEW_PAYMENTS`, `MANAGE_PAYMENTS`,
+`MANAGE_BOOKINGS`, `MANAGE_CUSTOMERS`, `MANAGE_ATTENDANCE`. Fuera:
+invitar equipo/administrar roles (`OWNER` únicamente — un rol no puede
+ampliarse a sí mismo), configuración/branding, planes y precios,
+suscripción SaaS, créditos manuales.
+
+**Migración**: un rol "Equipo" por organización con los cinco booleanos
+en `true` + backfill de `role_id` — comportamiento idéntico el día del
+deploy para todo `STAFF` existente.
+
+**Implementación**: backend completo (2026-09-23) — Fase 32,
+`20260923190000_phase32_configurable_roles.sql`, 255/255 tests de
+integración, 17 RPCs endurecidas (más allá de las 8 mínimas de la
+propuesta) y el hueco preexistente de precio de plan editable por
+`STAFF` cerrado en la misma migración. Pendiente: revisión de
+`security-engineer` (obligatoria), pantalla de roles + esconder por
+permiso (`frontend-engineer`, especificado en `docs/api.md` §Fase 32).
+
+**Implementación**: pendiente, con revisión obligatoria de
+`security-engineer` antes de cerrarse (toca auth y roles).
+
+## ADR-0034 — Alta de equipo (STAFF) sin registro previo
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario (feedback de
+producción — invitar a alguien al equipo hoy exige que ya tenga cuenta;
+extender el patrón de activación por WhatsApp de ADR-0026 al personal).
+Propuesta completa en `docs/proposals/adr-0034-team-invitations.md`.
+
+Mecanismo **separado** de `customer_activations` (tabla propia
+`team_invitations`), aunque comparte el acuñado del token: el destino
+del token no existe todavía como fila operable (a diferencia de un
+cliente gestionado), otorga acceso a datos de terceros con mayor radio
+de explosión, y la unicidad de "un link vivo" es por `(organización,
+email)`, no por fila. **Link de activación, no contraseña temporal**: una
+contraseña obligaría a usar la Admin API de Supabase con la
+`service_role` key fuera de todo camino de request normal, seguiría
+viva después de la ventana de 24h salvo rotación forzada, y no sirve si
+la persona entra por Google OAuth. El canje exige que el email de la
+sesión coincida con el de la invitación (mismo precedente que
+`INVITE_WRONG_EMAIL` de `create_organization_with_owner()`) — el canal
+es WhatsApp, el vínculo real es el email.
+
+### Resoluciones del Orchestrator a las preguntas abiertas
+
+1. **Se conserva `invite_member_by_email()`** como camino rápido cuando
+   la persona ya tiene cuenta — elegido explícitamente por quien invita,
+   nunca automático (automático reintroduciría el oráculo de
+   `PROFILE_NOT_FOUND` que ya existe).
+2. **El canje exige coincidencia de email**, sin excepción.
+3. **TTL de 24 horas** (el pedido original del usuario, textual).
+4. **Se guarda el teléfono en la invitación**, para el link de WhatsApp.
+5. **Una invitación nunca puede crear un `OWNER`** — `CHECK` en la tabla,
+   no una convención que la RPC deba recordar.
+
+Riesgos ya identificados y aceptados con su mitigación: `enforce_plan_limit()`
+se chequea también al **emitir** la invitación además de al canjearla (si
+no, se pueden emitir más invitaciones que cupo libre); el canje **nunca**
+pisa el rol de un miembro que ya existe (a diferencia de
+`invite_member_by_email()`, que si lo hace, y ahí es correcto porque es
+sincrónico y `OWNER`-gated); `organization_team_invitations()` como read
+model nuevo para que el dueño vea a quién invitó, no solo a quién ya se
+sumó; cookie/ruta propia (`/equipo/[token]`) para no pisar el token de
+activación de un cliente que además fue invitado al equipo.
+
+**Orden de implementación: ADR-0033 primero, después ADR-0034** — si se
+implementan las dos, conviene que `team_invitations` nazca con
+`role_id` en vez de una segunda migración sobre una tabla con tokens
+vivos. Si ADR-0033 nunca se implementara, ADR-0034 es igual de
+implementable con el enum `STAFF`/`OWNER` liso.
+
+**Implementación**: backend completo (2026-09-23) — Fase 33,
+`20260923200000_phase33_team_invitations.sql`, 276/276 tests de
+integración (21 nuevos), nace con `role_id` sobre ADR-0033 ya aplicada.
+Pendiente: revisión de `security-engineer` (obligatoria por este mismo
+ADR), server actions y UI (`frontend-engineer`, especificado en
+`docs/api.md` §Fase 33).
+
+## ADR-0035 — La solicitud de cambio de plan no es el cambio
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `backend-engineer`, a pedido del usuario ("si excedo
+frecuencia de plan, ofrecer upgrade/downgrade de planes y redireccionar
+a planes"). Implementación completa en la migración Fase 28
+(`docs/database.md`).
+
+**El problema**: sin cobro online (ADR-0027 bloqueada por elección de
+pasarela), dejar que un cliente cambie de plan por su cuenta implicaría
+crear cobertura (`Payment` PAID + `payment_service_coverage`) que nadie
+cobró — exactamente lo que "pago ≠ permiso" (ADR-0005/ADR-0013) existe
+para impedir. Y relajar el `EXCLUDE` de `payment_service_coverage` para
+que el cliente pueda anular su propio pago ya fue descartado como
+alternativa en ADR-0024.
+
+**Decisión**: `plan_change_requests` registra un **hecho accionable**
+("este cliente pidió cambiarse a este plan"), no una cobertura. **Ninguna
+función de decisión de reserva la lee** — un pedido pendiente no habilita
+ni bloquea ninguna reserva. El cliente ve el catálogo público de planes
+de un servicio y pide el cambio; el mostrador lo cobra como ya cobra
+cualquier alta/cambio de plan hoy (`RegisterPaymentForm`, VOID +
+recargar de ADR-0024), y ese pago cierra el pedido solo (trigger
+`after insert on payments`). Mismo patrón que el lead de `/contacto`
+(ADR-0030, Fase 24) pero dentro del portal, con identidad real (autor
+= `Customer` autenticado, no anónimo — alcanza un índice único parcial
++ tope de 5 pendientes, sin necesitar rate limit por IP).
+
+Sin este ADR, la alternativa "el cambio se aplica solo, sin cobro" habría
+sido más rápida de construir pero rompía dos invariantes ya cerradas del
+producto — no era una opción real, era la misma pregunta de ADR-0024
+resolución 1 vuelta a abrir desde otro ángulo.
+
+**Implementación**: backend completo (Fase 28, 214/214 tests). Pendiente:
+`frontend-engineer` (pantalla de catálogo + redirigir el rechazo de
+cuota ahí, en vez de a "ver mi plan actual" como está hoy) y
+`security-engineer` (RLS de la tabla nueva, disclosure del catálogo
+público, el trigger sobre `payments`).
+
+## ADR-0036 — `DELETE` por la Data API queda cerrado en tablas con hijos en cascada
+
+Fecha: 2026-09-23
+Estado: **Aceptada**
+Propuesta por: `security-engineer`, verificación independiente de la
+Fase 34 (ADR-0033). No es un hallazgo de ADR-0033 — es preexistente
+desde que esas tablas tienen policy `ALL using is_organization_member()`
+— pero ADR-0033 lo vuelve urgente: el valor entero de un rol restringido
+(`MANAGE_BOOKINGS`/`MANAGE_PAYMENTS` en `false`) queda vacío si el mismo
+actor puede lograr el mismo efecto con un `DELETE` directo por
+PostgREST, que **no evalúa RLS en la cascada de FK**.
+
+**El problema, verificado con reproducción real**: `schedule_rules`,
+`services`, `resources` (y probablemente `customers`) tienen policy
+`ALL` para cualquier miembro activo, con hijos `ON DELETE CASCADE`
+(`schedule_rules → slot_occurrences → bookings`,
+`services → payments`). Un `DELETE /rest/v1/schedule_rules?id=eq.<X>`
+por un STAFF con los cinco permisos de ADR-0033 en `false` borra en
+cascada `Booking`s `CONFIRMED` — no las cancela, las **borra**: sin
+`cancelled_at`/`cancelled_by`, sin `MakeupCredit`, sin fila en
+`audit_log`. Rompe directamente el invariante de negocio ya escrito en
+`CLAUDE.md` ("las reservas canceladas nunca se borran"). Un
+`DELETE /rest/v1/services` con un `ServicePlan` de alcance global borra
+en cascada pagos `PAID` — historial financiero destruido por un rol sin
+`VIEW_PAYMENTS` ni `MANAGE_PAYMENTS`.
+
+### Decisión
+
+**Ninguna de estas tablas tiene un caso de uso legítimo para `DELETE`
+por la Data API.** Todo lo que hoy se "borra" en el producto ya tiene su
+camino correcto: `discontinue_schedule_rule()` (cancela y libera, no
+borra), desactivar (`is_active = false`) para `Service`/`Resource`,
+`revoke_member()` para equipo. Ninguna pantalla del panel ofrece un
+botón "eliminar" sobre estas tablas — lo confirmé revisando `docs/api.md`
+antes de aceptar esto como decisión, no lo asumí.
+
+**Se cierra el `DELETE` de la Data API para `schedule_rules`,
+`services`, `resources`, `customers`, `schedule_exceptions`,
+`service_entitlements`, `service_resources`** — las policies `ALL`
+pasan a `SELECT`/`INSERT`/`UPDATE` explícitos, sin `DELETE`. Bajo RLS,
+la ausencia de policy de `DELETE` deniega por default: no hace falta
+ningún trigger nuevo, es remover el comando de la policy existente.
+`OWNER` tampoco tiene `DELETE` directo — si algún día se necesita borrar
+de verdad (no cancelar/desactivar), es una RPC nueva con su propia
+decisión explícita, no un `DELETE` genérico.
+
+**No se toca** ninguna FK `ON DELETE CASCADE` existente (siguen siendo
+correctas para cuando la fila padre sí se borra por una vía legítima
+futura) ni ninguna RPC ya gateada (`discontinue_schedule_rule()` sigue
+usando `UPDATE`, no `DELETE`, así que no se ve afectada).
+
+**Implementación**: backend completo (2026-09-23) — Fase 35,
+`20260923220000_phase35_close_data_api_delete.sql`, 301/301 tests de
+integración (11 nuevos). Las 7 policies `ALL` pasan a `INSERT`/`UPDATE`
+explícitos, sin `SELECT` duplicado (las tablas ya tenían policy de
+lectura propia, subconjunto o igual a la que se retiró — verificado
+tabla por tabla, no se agregó una policy redundante). Confirmado que
+ninguna de las 7 tenía un `DELETE` legítimo en todo el código (grep
+completo en `backend/` y `frontend/`) y que ningún RPC interno usa
+`DELETE FROM` sobre ellas. El test se validó al revés (restaurando las
+policies viejas temporalmente): sin el fix, 8 de los 11 casos fallan,
+incluidos los dos escenarios exactos que encontró `security-engineer`.
+Pendiente: barrido de `security-engineer` sobre el resto del schema por
+otras policies `FOR ALL` con hijos en cascada fuera de estas 7 tablas.
+**Hecho, ver ADR-0037 — encontró algo peor.**
+
+## ADR-0037 — Las vistas públicas dejan de ser escribibles por `anon`
+
+Fecha: 2026-09-23
+Estado: **Aceptada, urgente**
+Propuesta por: `security-engineer`, en el barrido que pidió ADR-0036.
+**Vulnerabilidad crítica preexistente, no introducida por ninguna ADR de
+hoy** — existe desde la Fase 4 (ADR-0008, hace meses), recién detectada.
+
+**El hallazgo, reproducido contra la base real, actor `anon` sin
+sesión**: `organizations_public`/`services_public` se crearon sin
+`security_invoker` a propósito (el calendario público necesita saltear
+RLS en **lectura**), pero el bypass alcanza los cuatro comandos, y
+`anon`/`authenticated` tienen `INSERT`/`UPDATE`/`DELETE` sobre las dos
+vistas por default privileges de Postgres (el `grant select` explícito
+de la migración es decorativo, ya tenían todo). Confirmado con requests
+reales, sin autenticar:
+
+- `DELETE services_public` sobre un servicio sin plan → **borra en
+  cascada una `Booking` `CONFIRMED`** (sin `cancelled_at`, sin
+  `MakeupCredit`, sin auditoría).
+- Lo mismo sobre un servicio cubierto por un plan
+  `applies_to_all_services` → **borra un `Payment` `PAID`**.
+- `PATCH organizations_public` sobre otro tenant → reescribe
+  `slug`/`name`/`timezone` de una organización ajena.
+- `POST organizations_public` → **crea una organización saltando
+  `create_organization_with_owner()`**, el gate de invitación
+  (ADR-0017) y `enforce_plan_limit()`.
+- Encadenado (`PATCH` para liberar un slug + `POST` para reclamarlo) →
+  **secuestro completo del slug de un negocio real**: su URL pública
+  pasa a resolver a la organización falsa del atacante.
+- `GET services_public` sin filtro → enumera servicios de **154
+  organizaciones** en un solo request, sin necesidad de adivinar nada.
+
+### Decisión
+
+```sql
+revoke insert, update, delete, truncate on public.organizations_public from anon, authenticated;
+revoke insert, update, delete, truncate on public.services_public  from anon, authenticated;
+```
+
+**`security_invoker = on` es el fix equivocado** — haría que el
+`SELECT` evaluara RLS con los privilegios del llamador y el calendario
+público (todo el punto de ADR-0008) dejaría de funcionar para un
+visitante anónimo. Se cierra la escritura, se conserva la lectura
+intacta.
+
+**De paso, mismo barrido, dos hallazgos menores en el mismo lote**:
+`organization_members_write_owner` (policy `ALL`) permite que el propio
+`OWNER` se borre a sí mismo por `DELETE` directo saltando el guard
+`LAST_OWNER` de `revoke_member()` — deja la organización sin ningún
+`OWNER`, inadministrable para siempre salvo por un platform admin.
+Mismo fix que ADR-0036 (`ALL` → `INSERT`+`UPDATE`, misma expresión). Y,
+como defensa en profundidad de bajo riesgo, la misma partición en
+`organization_roles`/`service_plan_services` (hoy protegidas solo por
+trigger, no por ausencia de policy).
+
+**Regla nueva para el repo**: toda vista de `public` se cierra con
+`REVOKE` explícito de escritura para `anon`/`authenticated` en el mismo
+momento en que se crea — el default de Postgres/Supabase es entregar
+los cuatro comandos, no solo `SELECT`, y "hicimos `grant select`" no
+implica que el resto esté cerrado.
+
+**Implementación**: completa (2026-09-23) — Fase 36, en **dos
+migraciones** que se commitean por separado:
+
+- `20260923230000_phase36_public_views_read_only.sql` — el fix de la
+  vulnerabilidad crítica: las dos vistas, `organization_members` y
+  `audit_public_view_write_grants()`. No depende de nada posterior a la
+  Fase 13, así que **se puede commitear sola**.
+- `20260923240000_phase36b_role_and_plan_scope_delete_closed.sql` — las
+  dos defensas en profundidad (`organization_roles`,
+  `service_plan_services`). **Se commitea junto con la Fase 32**, de la
+  que dependen las dos.
+
+El split no es cosmético: la versión original, en un solo archivo,
+volteó el PR en CI. CI aplica las migraciones **desde cero sobre lo que
+hay en git**, y `organization_roles` es una tabla de la Fase 32, que
+todavía no está commiteada → `relation "public.organization_roles" does
+not exist` y la migración entera aborta. El caso de
+`service_plan_services` era más peligroso por silencioso: la tabla
+existe desde la Fase 22, pero la policy que se reemplaza
+(`service_plan_services_write_owner`) la crea la Fase 32 — la Fase 22 la
+había llamado `service_plan_services_write_staff` —, así que el
+`drop policy if exists` no borraba nada y la policy `FOR ALL` con
+`DELETE` seguía viva, con los tests en verde por el motivo equivocado.
+
+**Regla que deja el incidente**: una migración sólo puede referenciar
+objetos creados por migraciones **ya commiteadas**, y la verificación de
+"aplica desde cero" se corre contra el estado real de git, no contra el
+working tree. Correr la suite completa con todo el WIP presente no dice
+nada sobre lo que CI va a aplicar.
+
+Verificado en los dos estados: sólo-commiteado + Fase 36 → 231/231
+integración en 23 archivos + 43 unitarios, `db reset` limpio; working
+tree completo (Fases 30-35 + 36 + 36b) → 321/321 en 30 archivos + 60
+unitarios. Validado al revés: restaurando temporalmente
+los grants/policies viejos, 16 de 19 fallan, incluidos los seis
+vectores anónimos y el secuestro de slug encadenado. `anon` sigue
+pudiendo `SELECT` ambas vistas (el calendario público no se rompió).
+`REFERENCES`/`TRIGGER`/`MAINTAIN` quedan sin revocar a propósito
+(inalcanzables por la Data API — PostgREST no emite DDL — y ADR-0037
+especificaba los cuatro verbos de escritura, no estos tres): deuda
+aceptada de riesgo nulo, no bloqueante.
+
+**Nota operativa**: como esta vulnerabilidad ya estaba en producción,
+corresponde revisar `audit_log` y los conteos de `organizations`/
+`services` contra lo esperado una vez aplicado el fix, para descartar
+que haya sido explotada antes de encontrarla hoy. La `anon key` es
+pública por diseño (no hay secreto que rotar).
+
+## ADR-0038 — El monto sugerido se recalcula por días cuando se edita el período de un pago
+
+Fecha: 2026-09-24
+Estado: **Aceptada**
+Propuesta por: usuario en producción, reportando una captura de
+`/payments/[customerId]`: un plan mensual (Pilates, $1.700) con el
+período acortado a mano de 03-01→03-31 a 03-01→03-10 seguía mostrando
+$1.700 al registrar el pago. Decisión tomada por el Orchestrator
+después de presentar tres opciones (recalcular por días, sólo avisar,
+dejarlo manual) — el usuario eligió recalcular.
+
+**El hallazgo**: en `RegisterPaymentForm`, "Período desde/hasta" y
+"Monto" son dos inputs independientes que sólo se precargan **una vez**
+al elegir el plan (`selectedPlan.periodStart/periodEnd` y
+`suggestion.amount`). Después de eso no hay ningún vínculo entre
+ellos — es a propósito, el hint dice literalmente "podés ajustarlos" —
+pero nada distingue "edité el monto a propósito" de "acorté el período
+y me olvidé de tocar el monto", y el segundo caso queda en pantalla
+como una inconsistencia que parece un bug.
+
+### Decisión
+
+El monto sugerido se **recalcula en el cliente, proporcional a los
+días**, cada vez que se edita "Período desde" o "Período hasta" —
+**solo para planes de un mes** (`billingPeriodMonths` ausente o `1`,
+es decir, fuera del flujo de `LongPeriodQuote`):
+
+```
+tarifaDiaria = selectedPlan.price / díasEnElPeríodoCompletoDelPlan
+montoSugerido = round2(tarifaDiaria × díasEnElPeríodoEditado)
+```
+
+- `díasEnElPeríodoCompletoDelPlan` se congela al elegir el plan (el
+  `periodStart`/`periodEnd` que ya resuelve `billing_period_for()` en
+  el servidor), no se recalcula con cada tecla — es el denominador
+  estable de la proporción.
+- Sigue siendo **una sugerencia editable**, nunca algo que el backend
+  imponga: el campo `amount` se puede pisar a mano después, igual que
+  hoy. `registerPayment()` no cambia — sigue grabando el `amount` que
+  llegue en el `FormData`, sin volver a calcularlo ni validarlo contra
+  el período.
+- **No toca el flujo de ciclos largos de ADR-0031.** Ese prorrateo es
+  por meses enteros y sólo aplica al alta inicial — mezclarlo con un
+  prorrateo por días aquí contradiría esa decisión ya cerrada. Un plan
+  con `billingPeriodMonths > 1` sigue mostrando su `LongPeriodQuote`
+  sin este recálculo.
+- No requiere cambios de schema, RPC ni server action: es lógica
+  puramente de presentación, igual que `suggestedAmount()`
+  (ADR-0031) — vive en el mismo componente cliente.
+
+**Implementación**: completa (2026-09-24) — `frontend-engineer` la hizo en
+`lib/billing-period.ts` (`inclusiveDays()`, `round2()`) y
+`RegisterPaymentForm`; `qa-engineer` agregó `lib/billing-period.test.ts`
+(13 casos) tras un primer NO LISTO del reviewer por falta de cobertura;
+segunda pasada, LISTO. Commit `6ff1902` (frontend), mergeado a `main` vía
+PR #6. Verificado además a mano contra producción el mismo día (ver nota
+de Fase de verificación visual, más abajo): plan de $1.700/mes, período
+editado a 10 días → sugiere $566,67 exacto.
+
+**Bug real encontrado en producción (2026-09-28), con dinero real de por
+medio** — reportado por el dueño: un plan `WEEKLY_QUOTA` de $2.500
+("Pilates Reformer 2 x S", organización `mathias-gym`), pago de un
+cliente real registrado para 2026-10-01→2026-10-31 (octubre completo,
+31 días, sin que el dueño sintiera que estaba "editando" nada raro) quedó
+guardado en **$2.583,33** en vez de $2.500 — exactamente
+`2500 / 30 × 31`.
+
+Causa confirmada por `frontend-engineer` (sin necesitar acceso a
+producción — el mismatch está forzado por la lógica del código, no por la
+configuración particular del plan): `RegisterPaymentForm` se usa en dos
+pantallas. Desde `/org/[slug]/payments/[customerId]?mes=` el período
+completo del plan (el denominador del prorrateo) se resuelve anclado al
+mes que dice la URL — correcto. Desde `/org/[slug]/customers/[customerId]`
+(la ficha del cliente, sin selector de mes) se resuelve anclado a **hoy**
+(`listPaymentPlanOptions(slug)` sin `month`, cae a la fecha actual en
+`app/actions/service-plans.ts`). Si el mostrador registra un pago desde la
+ficha del cliente y edita el período a mano a un mes que NO es el actual
+(un caso legítimo y común: cargar un pago por adelantado, o de un mes que
+ya pasó), el denominador queda congelado en los días del mes de "hoy"
+mientras el numerador son los días del mes que se tipeó — dos meses sin
+relación entre sí. Septiembre (denominador, 30 días) ÷ octubre (numerador
+tipeado, 31 días) reproduce exacto los $2.583,33 reportados.
+
+**Fix** (mismo día, `frontend/app/org/[slug]/customers/[customerId]/customer-forms.tsx`):
+el prorrateo por días de ADR-0038 sólo tenía sentido para su caso
+original — acortar/alargar el período *dentro* del mismo mes que ya
+sugirió el plan. Nunca debió aplicarse cuando el período editado es un
+mes completamente distinto (eso no es un prorrateo, es cobrar otro
+período). Se agregó un chequeo de solapamiento (`overlaps()`, ya
+existente en `lib/billing-blocks.ts`): si el período editado no se
+solapa con el período completo que resolvió el servidor, el prorrateo
+por días se desactiva y el monto sugerido cae al precio de lista del
+plan (o al prorrateo del servidor si aplica, igual que antes de ADR-0038).
+El caso original (acortar dentro del mismo mes) sigue funcionando igual.
+
+**No se tocó el pago ya registrado de María Hornos** — corregirlo o no es
+una decisión de negocio del dueño, no algo que el código deba decidir por
+su cuenta.
+
+**Auditoría completa (2026-09-28, corrida por el usuario contra
+producción)**: un solo pago afectado en todo el sistema —
+`fa018d14-f687-4a6e-b5c9-e882151436a4`, organización `kaimovete`, María
+Hornos, $2.583,33 cobrados vs. $2.500 de lista, diferencia $83,33. Sin
+otros casos. Corrección delegada al dueño vía el flujo normal de la app
+(anular ese pago + registrar uno nuevo por el monto correcto) — no hizo
+falta ninguna intervención directa sobre la base.
+
+## ADR-0039 — Suite E2E de humo contra producción, después de cada deploy de frontend
+
+Fecha: 2026-09-24
+Estado: **Aceptada**
+Propuesta por: usuario, después de una sesión de verificación visual
+manual (Playwright ad-hoc, agente Orchestrator operando el navegador con
+las credenciales de un owner real) que encontró todo el trabajo del día
+funcionando correctamente en producción — pidió que esa verificación deje
+de ser manual y corra sola en cada deploy futuro.
+
+**Decisión, con las dos preguntas que el Orchestrator le hizo al usuario
+ya resueltas:**
+
+1. **Cuándo corre**: después del deploy, como *smoke test* contra el
+   sitio real (`https://161-35-63-60.sslip.io`) — no como gate de CI
+   antes de mergear. Un job nuevo en `frontend/.github/workflows/ci.yml`,
+   `needs: deploy`, que corre Playwright contra producción una vez que el
+   healthcheck del contenedor ya dio verde. Si falla, no bloquea nada
+   (el deploy ya pasó) pero el workflow queda en rojo — visible, no
+   silencioso.
+2. **Rigor de "consistencia visual"**: **sin capturas de referencia**
+   (no hay pixel-diff ni baseline que aprobar a mano en cada cambio
+   visual intencional). En su lugar, reglas concretas y automatizables:
+   escaneo de accesibilidad (`axe-core`, que entre otras cosas mide
+   contraste de color) en cada pantalla clave, sin scroll horizontal a
+   390px de ancho, y presencia de los componentes esperados
+   (`EmptyState`, `FormError`/`FormSuccess`) donde el patrón del resto
+   del producto los exige.
+
+### Organización de prueba: `redentor`, permanente
+
+La organización `redentor` (dueño real del usuario, antes vacía) se usó
+hoy para crear datos de prueba a mano vía la UI real (no SQL directo) y
+verificar visualmente: horario, agenda con tres estados de ocupación,
+plan mensual, prorrateo por días (ADR-0038), roles, invitación de equipo,
+auditoría. El usuario pidió explícitamente **dejar esos datos, no
+limpiarlos** — pasa a ser la organización de pruebas permanente de la
+suite, con datos con prefijo/nombre reconocible (`Cliente Uno`..,
+`Pilates`, plan `Mensual`) para no confundirse con una organización real.
+
+**Regla no negociable para la suite (la razón de este párrafo es un
+hallazgo de hoy, no hipotético)**: cada test que cree estado en
+`redentor` tiene que **limpiarlo al final** o **reusar lo que ya existe**
+en vez de crear de nuevo, porque:
+
+- **Los cupos de equipo son finitos** (2 en el plan actual) — armar una
+  invitación de prueba sin revocarla al terminar deja el cupo ocupado
+  para siempre; a la segunda corrida la suite ya no puede probar el
+  flujo de invitación (se topa con "Tu plan no tiene más lugares de
+  equipo"). **Toda invitación de prueba se revoca en el mismo test.**
+- **Una reserva duplicada del mismo cliente en el mismo turno rechaza**
+  (invariante del dominio, no negociable) — si un test reserva y no
+  cancela, la corrida de la semana que viene sobre el mismo horario
+  fijo falla por una razón que no tiene nada que ver con lo que se
+  quiere probar. **Toda reserva de prueba se cancela (`Quitar`, staff)
+  al final del test que la creó.**
+- **No hay `DELETE`** para casi nada de esto (ADR-0036/0037): "limpiar"
+  significa anular el pago, cancelar la reserva, revocar la invitación —
+  nunca borrar filas.
+- Recursos/servicios/planes/clientes de prueba se crean **una sola vez**
+  (buscar por nombre antes de crear) — no hace falta recrearlos en cada
+  corrida, y `ScheduleRule` sigue generando `SlotOccurrence` futuras solas
+  (ventana rodante de 90 días, ADR-0009), así que un horario fijo creado
+  una vez alcanza para siempre.
+
+### Credenciales
+
+Cuenta QA: la del dueño real de `redentor` que el usuario ya usa. Viven
+como secrets de GitHub Actions del repo `frontend` (`QA_EMAIL`,
+`QA_PASSWORD`) — el Orchestrator no tiene forma de crear secrets de
+GitHub por su cuenta, así que **queda a cargo del usuario** cargarlos
+antes de que el job corra por primera vez.
+
+**Implementación**: delegada a `qa-engineer`.
+
+## ADR-0040 — Activación por WhatsApp sobrevive un cambio de contexto de navegador
+
+Fecha: 2026-09-28
+Estado: **Aceptada**
+Propuesta por: usuario en producción — reporte: "cuando un nuevo usuario
+quiere loguear o registrarse [para activar su cuenta] siempre aparece
+[el error 'no encontramos la invitación'], luego al refrescar queda como
+activo". Diagnóstico de `frontend-engineer`, con evidencia real contra
+producción (no sólo lectura de código): descartadas dos veces la hipótesis
+de un TTL de cookie vencido (ya se había arreglado el 2026-09-23, commit
+`3d865ea`, verificado en vivo con `curl` que la cookie de hoy dura 72h) y
+la de una carrera Set-Cookie/redirect (viajan en la misma respuesta HTTP,
+sin ventana). Causa real, por descarte y coherente con que el propio
+mensaje de error ya la anticipa ("volvé a abrir el link de WhatsApp desde
+este mismo navegador"): el cliente toca el link de WhatsApp en el
+navegador embebido de WhatsApp (ahí queda la cookie httpOnly del token),
+pero confirmar el email o completar el login de Google lo saca a OTRA
+app/contexto (Mail, o el navegador del sistema — Google bloquea el login
+dentro de WebViews embebidos desde 2021). Ese segundo contexto tiene un
+cookie jar distinto: la cookie de activación nunca llegó ahí, así que
+`/activar/continuar` no la encuentra aunque el token siga válido por sus
+72h. No es un bug de un TTL ni de una carrera — es que el diseño actual
+depende por completo de que la activación termine en el MISMO contexto de
+navegador donde empezó, y un teléfono real no garantiza eso.
+
+### Decisión
+
+En vez de depender sólo de la cookie httpOnly para reencontrar la
+activación después del desvío por login/signup/OAuth, se emite un
+**nonce de continuación** — corto, opaco, de un solo uso, vida corta
+(30 min) — que viaja por el único canal que sí sobrevive el cambio de
+contexto: el `emailRedirectTo`/`next` que Supabase Auth ya reenvía a
+través del link de confirmación de email o del callback de OAuth. Este
+nonce **nunca es el token de activación real** (eso sigue sin salir de
+la cookie httpOnly, ADR-0026 Sec 2.4 sigue vigente para el token en sí) —
+sólo le permite al contexto de navegador que SÍ terminó la autenticación
+volver a plantar la cookie de activación ahí, para que el resto del flujo
+(cookie + sesión → mostrar el form → clic explícito en "Confirmar y
+activar" → `claim_customer_activation()`) siga funcionando exactamente
+igual que hoy, sin tocar esa parte.
+
+**Mecánica**:
+
+1. `/activar/continuar`, cuando encuentra la cookie pero no hay sesión,
+   ya no arma `returnTo=/activar/continuar` a secas: primero llama a una
+   RPC nueva `issue_activation_continuation()` (lee el token de la cookie
+   server-side, nunca lo expone al cliente) que devuelve un nonce nuevo,
+   y arma `returnTo=/activar/continuar?c=<nonce>`. Ese querystring viaja
+   tal cual por todo el resto de la cadena que ya existe hoy
+   (`login-form.tsx` → `/signup?returnTo=...` → `emailRedirectTo`/OAuth
+   `next` → `/auth/callback`), sin tocar esos archivos más que para
+   preservar el nuevo param igual que ya preservan `returnTo`.
+2. `/auth/callback`, después de `exchangeCodeForSession()` (sesión ya
+   creada en ESTE contexto), si el `next` trae `?c=<nonce>`, llama a
+   `redeem_activation_continuation(p_nonce)` — valida sin usar y sin
+   vencer, lo marca usado, devuelve el token real (sigue sin tocar al
+   cliente) — y el propio route handler pone la cookie `activation_token`
+   en ESTA respuesta (mismo mecanismo que `/activar/[token]/route.ts`)
+   antes de redirigir a `/activar/continuar`, ahora sin el `?c=` (ya
+   cumplió su función).
+3. `/activar/continuar` corre exactamente como hoy: cookie + sesión →
+   confirma el form → clic explícito → RPC de siempre. Nada de esta ADR
+   toca esa mitad del flujo.
+
+**Corrección post-review de seguridad (2026-09-28) — el párrafo original
+de esta sección era falso, se deja tachado en el historial de git y
+reemplazado por lo que sigue.** La premisa "la activación real sigue
+exigiendo que la sesión coincida con el email del cliente invitado" **no
+es cierta**: `claim_customer_activation()` (Phase 21) sólo exige
+`auth.uid() is not null`, nunca compara email — un `Customer` gestionado
+ni siquiera tiene columna de email para comparar. `security-engineer`
+reprodujo en vivo que, con el nonce en mano, cualquier cuenta ajena
+puede canjearlo, recibir el token real, y llamar a
+`claim_customer_activation()` con éxito, quedando como dueña del
+`Customer` de otra persona (ve sus reservas y pagos, reserva con su
+plan).
+
+**Por qué se acepta igual el diseño, con esto por escrito**: el nonce
+equivale de hecho al token completo durante su vida útil — no es una
+capa adicional de seguridad, es el mismo secreto viajando por un canal
+más. Eso ya era cierto del token original (ADR-0026: quien lo intercepta
+en el link de WhatsApp/email ya podía hacer exactamente esto). El nonce
+viaja por canales de exposición equivalente (URL, logs de Vercel/Supabase,
+el email de la propia persona) y con ventana más corta (30 min ilustrado
+vs. 72h del token). **Riesgo residual nuevo y real, aceptado
+explícitamente**: si alguien tipea mal su propio email al registrarse, el
+mail de confirmación (con `?c=` embebido) le llega a un tercero, que con
+un solo clic hereda la sesión y el cliente de la víctima — sin el nonce,
+ese tercero nunca tenía la cookie httpOnly y no podía hacer nada. Se
+acepta este riesgo por ser de exposición baja (typo de email + tercero
+que efectivamente abre y hace clic, dentro de una ventana de 30 min) y
+consistente con el modelo de amenaza ya aceptado del token base, no por
+estar mitigado por un chequeo de email que no existe.
+
+**Cambios de diseño exigidos por el gate de seguridad antes de LISTO**
+(no opcionales, `security-engineer` los verificó funcionando contra la
+base local antes de proponerlos):
+
+1. **El token no se guarda en claro ni siquiera 30 minutos.** El diseño
+   original dejaba `activation_token` en texto plano en la fila mientras
+   el nonce no se usara — y si el nonce vencía sin canjearse (login con
+   contraseña en el mismo navegador nunca pasa por `/auth/callback`), el
+   texto plano quedaba para siempre, no 30 minutos. Se reemplaza por
+   `activation_token_enc bytea`, cifrado con `pgp_sym_encrypt(token,
+   nonce)` (pgcrypto, ya instalado) en `issue`, descifrado con
+   `pgp_sym_decrypt` en `redeem` usando el nonce recién validado como
+   clave — la base nunca tiene, en reposo, ninguna combinación de datos
+   que por sí sola reconstruya el token (igual garantía que el hash en
+   `customer_activations`).
+2. **Límite de nonces vivos por activación** (`issue`, `for update` sobre
+   la activación): antes de emitir uno nuevo, se borran los vencidos sin
+   usar de esa activación (limpieza, además cierra el resto del punto 1
+   si por algún motivo quedaran filas viejas) y se rechaza con
+   `TOO_MANY_CONTINUATIONS` si ya hay 10 sin usar.
+3. **`redeem_activation_continuation` verifica que la activación siga
+   viva** (no revocada/ya reclamada/vencida) antes de devolver el token —
+   mismo `INVALID_CONTINUATION` genérico si no lo está, para no filtrar
+   cuál de los tres casos aplica.
+4. **Defensa en profundidad, no bloqueante**: `revoke all on table
+   customer_activation_continuations from anon, authenticated` explícito
+   (además de RLS sin policies, que ya cierra el acceso vía PostgREST).
+
+**Frontend, a implementar junto con lo ya delegado**: `Referrer-Policy:
+no-referrer` en `/activar/continuar`, `/login` y `/signup` cuando la URL
+trae `?c=`; nunca loguear `next` ni `c`; `/auth/callback` saca `c` de la
+URL al redirigir; el allowlist `safeReturnTo` acepta `?c=` sin abrir un
+open redirect.
+
+**Alcance**: sólo la activación de clientes (ADR-0026). El mismo problema
+podría existir en la invitación de equipo (ADR-0034, `/equipo/[token]`,
+mismo patrón de cookie httpOnly) — no se toca en esta ADR; si se confirma
+el mismo síntoma ahí, es una extensión directa del mismo mecanismo, a
+evaluar por separado.
+
+**Implementación**: delegada a `backend-engineer` (migración: tabla
+`customer_activation_continuations` + las dos RPC, ahora con los 4 puntos
+de arriba) y `frontend-engineer` (construcción del `returnTo` con `?c=`,
+`/auth/callback`, más los puntos de frontend de arriba). Gate obligatorio
+de `security-engineer` antes de desplegar — toca autenticación. Corrió
+tres veces: 2026-09-28 NO LISTO (hallazgo de fondo sobre la premisa de
+seguridad, corregido arriba), 2026-09-28 LISTO sobre backend corregido,
+2026-09-29 LISTO sobre backend+frontend — con un hallazgo funcional que
+se documenta y resuelve en ADR-0041.
+
+---
+
+## ADR-0041 — Confirmación de email por `token_hash`/`verifyOtp` (reemplaza el link PKCE para ese camino)
+
+Fecha: 2026-09-29
+Estado: **Aceptada**
+Propuesta por: `security-engineer`, en el tercer pase del gate de
+ADR-0040 (hallazgo funcional "F1"), decisión de diseño tomada por el
+usuario entre las alternativas planteadas.
+
+**Problema:** el gate de seguridad de ADR-0040 encontró que su mecanismo
+de nonce, aun estando LISTO en seguridad, probablemente **no resuelve el
+escenario más común** del bug original que motivó toda la ADR. Causa:
+`@supabase/ssr` usa PKCE por defecto — `signUpWithPassword()`
+(`app/actions/auth.ts`) genera un link de confirmación cuyo canje
+(`exchangeCodeForSession(code)` en `/auth/callback`) exige una cookie
+`code_verifier` que sólo existe en el navegador donde arrancó el signup.
+Si el cliente toca el link de WhatsApp en el navegador embebido (contexto
+A) y después abre el link de confirmación de email desde la app de Mail
+(contexto B, sin relación de cookies con A), el intercambio de código
+**falla antes de llegar a usar el nonce** — nunca se ejecuta el canje que
+diseñó ADR-0040, y el usuario cae al mismo error de siempre. El nonce sí
+funciona para el camino de Google OAuth cuando el login arranca de cero
+en un único contexto (confirmado en vivo por `security-engineer`), pero
+no para un link de email clickeado en un contexto distinto al que lo
+generó — eso es estructural a PKCE, no algo que el nonce pueda arreglar
+por sí solo.
+
+**Alcance real de este problema**: no es exclusivo de la activación de
+clientes (ADR-0026/0040). `signUpWithPassword()` es el único camino de
+signup por contraseña de toda la plataforma — lo usa cualquier
+`OrganizationMember` que se registra igual que un `Customer` gestionado.
+El fix, por lo tanto, es una decisión de autenticación general, no un
+parche acotado a la activación.
+
+**Decisión**: reemplazar el link de confirmación de email basado en PKCE
+por uno basado en **`token_hash` + `supabase.auth.verifyOtp()`**, que no
+depende de ninguna cookie del navegador que originó el signup — el link
+mismo (más el `token_hash` que trae) es autosuficiente para crear sesión
+en cualquier navegador que lo abra, exactamente el caso de uso de un
+link de confirmación por email.
+
+**Mecánica**:
+1. Template de confirmación de email de Supabase Auth pasa de
+   `{{ .ConfirmationURL }}` (PKCE) a un link armado a mano:
+   `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=email&next={{ .RedirectTo }}`.
+   `{{ .RedirectTo }}` sigue siendo el mismo `emailRedirectTo` que ya
+   arma `signUpWithPassword()` hoy (incluye `next=<returnTo o
+   returnTo+?c=nonce>` sin cambios).
+2. Ruta nueva `frontend/app/auth/confirm/route.ts`: lee `token_hash` +
+   `type` + `next`, llama `supabase.auth.verifyOtp({ token_hash, type })`.
+   Si hay sesión, aplica **la misma lógica de nonce que ya vive en
+   `/auth/callback`** (extraer y quitar `?c=` de `next` antes de construir
+   cualquier redirect, canjear con `redeem_activation_continuation` si
+   está presente, plantar la cookie de activación con
+   `activationCookieOptions()`) — se factoriza en un helper compartido en
+   vez de duplicar el bloque, ya que la lógica es idéntica.
+3. `/auth/callback` (PKCE) queda intacto para Google OAuth, que no pasa
+   por un link de email y no tiene esta limitación de la misma forma
+   (confirmado en vivo: funciona si el login arranca de cero en un
+   único contexto, que es el caso que cubre el nonce de ADR-0040).
+
+**Verificado en vivo contra Supabase local** (`backend-engineer`,
+2026-09-29, CLI 2.118.0, Postgres 17): `supabase/config.toml` define
+`[auth.email.template.confirmation]` con `content_path =
+"./supabase/templates/confirmation.html"` conteniendo exactamente el link
+de la sección **Mecánica** arriba. Con `enable_confirmations = true`
+temporalmente (local vive con `false` por defecto — ver nota debajo) y un
+signup real contra `POST /auth/v1/signup?redirect_to=<url>` (`redirect_to`
+va como **query param**, no en el body JSON — es lo que `supabase-js`
+arma internamente a partir de `options.emailRedirectTo`), el mail que
+aparece en Mailpit (`http://127.0.0.1:54324`, no Inbucket — el proyecto ya
+migró a Mailpit aunque el env var viejo `INBUCKET_URL` se siga exponiendo
+por compatibilidad) trae:
+
+```
+http://127.0.0.1:3000/auth/confirm?token_hash=<hash>&type=email&next=http%3a%2f%2flocalhost%3a3000%2fauth%2fcallback%3fnext%3d%2factivar%2fcontinuar%3fc%3dabc123nonce
+```
+
+Es decir: **`type` es literalmente `email`**, tal como asume el borrador
+de la ADR — confirmado contra el comportamiento real, no asumido.
+`frontend-engineer` puede usar `verifyOtp({ token_hash, type: "email" })`
+sin ambigüedad. Se probó además el canje real: `POST /auth/v1/verify` con
+`{"type":"email","token_hash":"<hash>"}` devuelve sesión completa
+(`access_token`/`refresh_token`, `user_metadata.email_verified: true`) —
+el mecanismo funciona de punta a punta, no sólo el shape del link.
+
+**Hallazgo adicional (no introducido por esta ADR, pero bloqueaba poder
+probarla): `additional_redirect_urls` con match exacto de URL completa.**
+GoTrue arma `{{ .RedirectTo }}` a partir del `redirect_to` de la request,
+pero **sólo si esa URL está en la lista de redirects permitidos**; si no,
+cae en silencio al `site_url` pelado — sin `next`, sin el `?c=<nonce>` de
+ADR-0040. El `config.toml` que ya estaba commiteado sólo tenía
+`["https://127.0.0.1:3000"]` (ni siquiera el mismo esquema que
+`site_url = "http://127.0.0.1:3000"`, y sin el `/auth/callback` real que
+arma `signUpWithPassword()`), así que **este problema ya existía para el
+link PKCE viejo también** — nadie lo había notado porque local corre con
+`enable_confirmations = false` por defecto y nunca se ejerce este camino.
+Se corrigió agregando patrones glob del mismo origen:
+`additional_redirect_urls = ["https://127.0.0.1:3000",
+"http://127.0.0.1:3000/**", "http://localhost:3000/**"]` — confirmado con
+el mismo signup de arriba que con esto el `next` sobrevive completo
+(incluye `/auth/callback?next=/activar/continuar?c=...`). **Esto hay que
+verificarlo también en el dashboard de producción** (Authentication → URL
+Configuration → Redirect URLs) — si esa lista no incluye el equivalente
+del `/auth/callback` (y ahora `/auth/confirm`) reales de producción con
+wildcard de query, el `next=` se pierde en producción igual que acá,
+haciendo que el nonce de ADR-0040 nunca llegue aunque el resto de esta ADR
+esté bien implementado. Queda como parte del mismo pendiente manual de
+abajo.
+
+`enable_confirmations` quedó **repuesto a `false`** tras la verificación —
+no se cambió el default de desarrollo local, sólo se usó `true`
+temporalmente para poder observar el mail real en Mailpit.
+
+**Pendiente manual del usuario, no resoluble por CLI/migración** (mismo
+patrón que las credenciales de Google OAuth en ADR-0017), proyecto Supabase
+de producción `wgdlflhdjpqcxykblqme`:
+
+1. **Dashboard → Authentication → Email Templates → "Confirm signup"** →
+   reemplazar el HTML del cuerpo por (mecánica verificada en vivo con el
+   template original en inglés; el copy se tradujo después, sin tocar
+   ninguno de los tres parámetros — `token_hash`, `type=email`, `next` —
+   ni la lógica que `/auth/confirm` espera, consistente con que el resto
+   del producto está en español):
+   ```html
+   <h2>Confirmá tu cuenta</h2>
+
+   <p>Hacé clic en el siguiente link para confirmar tu cuenta:</p>
+   <p><a href="{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=email&next={{ .RedirectTo }}">Confirmar mi email</a></p>
+   ```
+   Sólo se toca **este** template. "Magic Link", "Reset Password", "Change
+   Email Address" y los demás no participan del flujo de signup con
+   contraseña y quedan intactos — el `type=email` de `verifyOtp` es
+   específico a confirmación de signup; los otros templates de Supabase
+   usan (y necesitan) otros valores de `type` (`magiclink`, `recovery`,
+   `email_change`) si el día de mañana se migran por la misma razón, pero
+   eso no es parte de esta ADR.
+2. **Dashboard → Authentication → URL Configuration → Redirect URLs**:
+   confirmar que la lista incluye el origen real de producción con
+   wildcard de path/query (equivalente a lo que se agregó en
+   `supabase/config.toml` para local), p. ej. `https://<dominio-prod>/**`.
+   Sin esto, `{{ .RedirectTo }}` cae al `Site URL` pelado y el `next=`
+   (incluido el nonce `?c=` de ADR-0040) se pierde — el hallazgo de arriba
+   aplica igual en producción.
+3. Hasta que el paso 1 se aplique, el link que reciben los usuarios sigue
+   siendo el viejo (PKCE) aunque el código ya soporte `/auth/confirm` — no
+   hay forma de que la app fuerce ese cambio de template de un proyecto
+   Supabase administrado.
+
+**Impacto**: `backend-engineer` actualizó `supabase/config.toml` (template
+local vía `[auth.email.template.confirmation]` +
+`supabase/templates/confirmation.html`, y el fix de
+`additional_redirect_urls` de arriba) y redactó las instrucciones exactas
+del cambio manual de dashboard para producción. `frontend-engineer`
+implementa `/auth/confirm` reusando la lógica de nonce ya construida para
+`/auth/callback`, con `type: "email"` confirmado (no `"signup"` ni otro
+valor). Mismo gate obligatorio de `security-engineer` antes de desplegar
+(es autenticación) — puntual sobre esta ruta nueva, no repite lo ya
+revisado de ADR-0040. **Nota de seguridad para ese gate:** el riesgo
+residual #8 de ADR-0040 (email mal tipeado → el nonce viaja en
+`redirect_to` a un tercero) asumía que PKCE por sí solo frenaba el "click
+directo" porque el tercero no tiene la cookie `code_verifier`; con
+`token_hash`/`verifyOtp` esa fricción adicional desaparece — el link ya
+no depende de ninguna cookie del navegador que lo generó, así que el
+tercero que reciba el mail por typo **sí puede** confirmarlo con un solo
+click. El TTL de 30 min, el single-use y el "Confirmar y activar" siguen
+vigentes, pero ya no hay una segunda barrera accidental encima; vale que
+`security-engineer` lo evalúe explícitamente en el gate, no asumir que
+sigue cubierto por el mismo razonamiento de ADR-0040.
+
+---
+
+## ADR-0042 — Pipeline autónomo de bugs: GitHub Issues → fix → deploy, sin aprobación manual del usuario
+
+Fecha: 2026-09-29
+Estado: **Aceptada**
+Propuesta por: usuario ("hoy me levantan los bugs a mí y yo te los escalo
+a vos, quiero dejar de ser cuello de botella... llevarlos a prod y
+atajarlos completamente vos sin depender de mí, backend front, todo").
+
+**Problema:** hasta ahora, todo bug reportado en producción llegaba a
+través del usuario (screenshot o descripción pegada en el chat), y toda
+migración de schema quedaba esperando su merge + aprobación manual del
+deploy en el GitHub Environment "production" — el patrón usado sin
+excepción en ADR-0038, 0040 y 0041 de esta misma sesión. El usuario pasó
+a ser, él mismo lo dice, el cuello de botella de todo el ciclo.
+
+**Decisión:**
+
+1. **Canal de entrada: GitHub Issues**, en `Reservaste/reservas` (el repo
+   raíz de coordinación, no `backend`/`frontend` — el Orchestrator hace la
+   triage y decide a qué repo(s) toca el fix, evitando que quien reporta
+   tenga que adivinar si es un bug de front, de back, o de los dos).
+   Reemplaza que el usuario pegue el reporte a mano en el chat.
+2. **Autonomía completa de deploy, sin excepción de schema**: el
+   Orchestrator mergea a `main` y aprueba el deploy de producción él
+   mismo — incluidas migraciones de base de datos — para cualquier bug
+   que entre por este pipeline. Reemplaza el patrón de "el usuario mergea
+   + aprueba manualmente" que regía hasta ADR-0041 inclusive. **Decisión
+   explícita del usuario, tomada con el trade-off dicho en estos
+   términos**: la única red de seguridad real contra un cambio automático
+   mal hecho llegando a producción sin revisión humana deja de existir a
+   cambio de velocidad — el usuario la aceptó a sabiendas, eligiendo
+   "sacarlo del todo" sobre la alternativa de mantenerlo sólo para
+   schema.
+3. **Lo que NO se relaja, porque es un gate entre agentes y no una
+   dependencia del usuario** (`CLAUDE.md`, sección "Decisiones que
+   SIEMPRE pasan por el Orchestrator" — esto sigue vigente, esta ADR sólo
+   quita al usuario del loop, no las reglas del proyecto):
+   - Gate obligatorio de `security-engineer` (LISTO/NO LISTO) para
+     cualquier cambio de auth, roles, RLS, aislamiento multi-tenant, IDOR,
+     datos públicos/privados o pagos — igual que en toda esta sesión.
+   - Gate de `reviewer` antes de cualquier commit.
+   - `qa-engineer` corre la suite de integración completa y tiene que dar
+     verde antes de mergear — no sólo el archivo tocado.
+   - Todo bug + fix se documenta en `docs/decisions.md` (si toca algo
+     estructural) o en `.claude/knowledge/curation-inbox.md` (si es un
+     bug puntual sin decisión de diseño detrás) — la autonomía no
+     significa perder el registro histórico que el resto de esta sesión
+     mantuvo sin excepción.
+   - El Orchestrator sigue siendo quien decide si un bug reportado implica
+     en realidad un cambio estructural (modelo de dominio, contratos de
+     API, estrategia de slots/pagos/recurrencia) — en ese caso, aunque el
+     deploy ya no espere aprobación humana, la decisión de diseño sigue
+     necesitando su propia entrada de ADR antes de implementarse, igual
+     que siempre.
+4. **Mecánica de intake** (a definir/documentar en la siguiente entrada de
+   este archivo una vez armada, ver "Pendiente" abajo): el Orchestrator
+   necesita algún mecanismo de despertar periódico (cron/wakeup) para
+   revisar issues nuevos sin que el usuario tenga que iniciar la
+   conversación — a diferencia de todo lo anterior en esta sesión, que
+   dependía de que el usuario abriera el chat y pegara el reporte.
+
+**Riesgo aceptado explícitamente:** un bug mal diagnosticado, o un fix
+con un error que ningún gate automático detecta, puede llegar a
+producción (incluido un cambio de schema) sin que ningún humano lo haya
+visto antes. Los gates de `security-engineer`/`reviewer`/`qa-engineer`
+siguen siendo la única defensa — se vuelven, de hecho, más importantes
+que antes, porque ya no hay una revisión humana de respaldo detrás
+esperando al final de la cadena.
+
+**Impacto:** cambia el rol operativo del Orchestrator de "coordina cuando
+el usuario abre una conversación con un reporte" a "vigila un canal de
+entrada y opera de punta a punta sin intervención". No cambia ninguna
+regla de `CLAUDE.md` sobre decisiones estructurales ni sobre los gates
+obligatorios entre agentes — sólo elimina al usuario como aprobador
+humano del deploy.
+
+**Pendiente:** definir y documentar el mecanismo concreto de polling/cron
+para GitHub Issues (qué lo dispara, con qué frecuencia, qué pasa si dos
+issues llegan a la vez) antes de considerar este pipeline operativo.
+
+**Seguimiento 2026-09-29 — mecanismo elegido y primer paso ejecutado:**
+en vez de un cron atado a esta sesión de chat (se corta al cerrar la
+ventana, expira solo a los 7 días — no cumple "sin depender de mí"), se
+opta por **GitHub Actions con `anthropics/claude-code-action`**, el
+integration oficial de Anthropic para correr Claude Code disparado por
+eventos de GitHub. Decisión tomada conscientemente con el trade-off de
+costo explícito: a diferencia del cron de sesión (gratis), esto consume
+API de Anthropic por token en cada corrida — el usuario lo aceptó sabiendo
+que no es gratis, priorizando autonomía real sobre costo cero.
+
+Como parte de esto, se ejecutó **ya** la mitad de esta ADR que no dependía
+de infraestructura nueva: se sacó el `required_reviewers` del GitHub
+Environment `production` de `Reservaste/backend` (antes exigía la
+aprobación manual de `mathiasfernandez`, ver comentario en
+`.github/workflows/ci.yml` sobre por qué existía ese gate desde Phase 22).
+Efecto inmediato: el deploy de la migración de ADR-0040/0041 (PR #12/#13,
+run `36588865913`), que llevaba varias horas esperando esa aprobación,
+se destrabó solo y corrió — backup pre-migración tomado como siempre,
+`deploy-migrations` en verde. Es la primera migración de este proyecto
+desplegada a producción sin que ningún humano apruebe el paso final.
+
+Falta todavía: que el usuario corra `/install-github-app` (requiere su
+propia autorización de OAuth, no delegable) para instalar la GitHub App
+de Claude a nivel organización sobre los 3 repos y cargar
+`ANTHROPIC_API_KEY` como secret compartido; y que el Orchestrator escriba
+el workflow específico de este proyecto (no el genérico que
+`/install-github-app` propone por defecto) — checkout de los 3 repos,
+prompt consciente de `CLAUDE.md`/`docs/agent-responsibilities.md`, y
+disparo por label `bug` en vez de cualquier issue nuevo.
+
+**Seguimiento 2026-09-29 — pipeline operativo.** El usuario completó
+`/install-github-app` (GitHub App instalada a nivel organización
+`Reservaste`, autenticando con el token de su propia suscripción —
+`CLAUDE_CODE_OAUTH_TOKEN`, no una API key separada, decisión consciente
+de costo: usa el plan que ya paga en vez de facturación nueva). El
+Orchestrator escribió `.github/workflows/claude.yml` en
+`Reservaste/reservas` (rama `main`): dispara sólo con la etiqueta `bug`
+en un Issue (nunca en cualquier Issue nuevo — la etiqueta es la válvula
+manual de "esto entra al pipeline", aplicable sólo por alguien con
+permiso de escritura en el repo, lo que además resuelve sin configuración
+extra el caso de un vendedor/tercero sin acceso reportando bugs: puede
+abrir el Issue en el repo público, pero no puede etiquetarlo él mismo).
+El prompt de ese workflow reproduce el rol de Orchestrator completo
+(lee `CLAUDE.md`, delega a subagentes, exige los mismos gates de
+`qa-engineer`/`reviewer`/`security-engineer`, mergea y determina si hay
+deploy automático sin aprobación humana, documenta el resultado).
+Dos pushes/merges de infraestructura (el workflow en sí y el PR que lo
+llevó a `main`) fueron bloqueados por el clasificador de auto mode de
+Claude Code del lado del Orchestrator ("Create Unsafe Agents") — un
+control de seguridad del propio entorno, no de GitHub. No se intentó
+rodear: el usuario ejecutó esos dos pasos (push + merge) directamente
+desde su propia terminal. Secret cross-repo (`CROSS_REPO_PAT`, un fine-
+grained PAT con permisos de Contents/Issues/Pull requests/Workflows
+sobre los 3 repos) cargado por el usuario — con un incidente menor en el
+camino: el primer valor del token se pegó en el chat (por lo tanto
+expuesto) y se revocó/regeneró antes de cargarlo, mismo criterio que la
+regla de credenciales de ADR-0039. Pipeline confirmado operativo (los 2
+secrets existen, el workflow está en `main`, la etiqueta `bug` existe por
+default en GitHub) pero **todavía no procesó ningún bug real** al momento
+de este seguimiento.
+
+---
+
+## ADR-0043 — Se elimina la confirmación de email del signup
+
+Fecha: 2026-09-29
+Estado: **Aceptada**
+Propuesta por: usuario ("no quiero ningún mecanismo que dependa del envío
+de emails porque ahí se me va a ir mucho costo"), alcance confirmado
+explícitamente como "sacar la confirmación de email del todo" (no sólo
+evitar SMTP pago) tras pregunta directa del Orchestrator sobre qué,
+puntualmente, le preocupaba.
+
+**Problema:** ADR-0041 (confirmación por `token_hash`/`verifyOtp`)
+resolvía que el link de confirmación de email sobreviviera un cambio de
+navegador, pero seguía dependiendo de que Supabase Auth mande un email
+por cada signup — con el servicio por defecto de Supabase (gratis pero
+con un rate limit bajo, no apto para producción según su propia
+documentación) o con SMTP propio (Resend u otro, con costo real más allá
+del tier gratis si el volumen crece). El usuario, vendiendo el proyecto a
+un precio bajo, no quiere que ningún costo de infraestructura escale con
+la cantidad de signups — prefiere sacar la dependencia de raíz antes que
+optimizar el proveedor de email.
+
+**Decisión:** se deshabilita "Confirm email" en Supabase Auth. `signUp()`
+devuelve sesión inmediatamente, sin mandar ningún email ni esperar
+ninguna confirmación — ni para clientes gestionados (ADR-0026) ni para
+`OrganizationMember` (dueños/staff), porque `signUpWithPassword()` es el
+mismo código compartido para los dos casos (ya señalado en ADR-0041).
+
+**Efecto en cadena sobre ADR-0040/0041:**
+- **ADR-0041 queda sin objeto y se da de baja.** Sin ningún email de
+  confirmación, no existe ningún link que canjear — `/auth/confirm`,
+  `frontend/lib/confirm-next.ts` y el template
+  `supabase/templates/confirmation.html` quedan sin ningún caller posible
+  y se eliminan (no se dejan como código muerto).
+- **ADR-0040 (nonce de continuación) se ACOTA, no se elimina.** Seguía
+  necesitándose para el camino de Google OAuth (Google fuerza salir del
+  WebView embebido de WhatsApp a un navegador del sistema, cambio de
+  contexto real, sin relación con email). Para el camino de
+  email/contraseña, el problema que motivó ADR-0040 desaparece por
+  completo con esta ADR: sin redirección a ningún lado (ni a Mail, ni a
+  un link externo), la cuenta queda activa en el mismo navegador/contexto
+  donde se completó el formulario de signup — no hay salto de contexto
+  que perder. El mecanismo de nonce sigue viviendo (RPC
+  `issue_activation_continuation`/`redeem_activation_continuation`,
+  helper `activation-continuation.ts`) pero ejercitado sólo por
+  `/auth/callback` (OAuth), nunca por `/auth/confirm` (que deja de
+  existir).
+
+**Trade-off de seguridad, aceptado explícitamente por el usuario** (se le
+explicó antes de decidir, ver pregunta del Orchestrator en esta misma
+conversación): sin confirmación de email, cualquiera puede registrarse
+con un email que no le pertenece (typo propio o ajeno, o a propósito) sin
+que el dueño real de esa casilla se entere ni pueda impedirlo. Dos
+poblaciones distintas, con exposición real distinta:
+- **`OrganizationMember` (dueños/staff)**: es donde el riesgo pega más —
+  alguien podría "ocupar" el email de otra persona antes de que esa
+  persona intente registrarse ahí, o registrarse con un email inventado
+  sin límite. Sin mitigación nueva en esta ADR más allá de lo que ya
+  existía (unicidad de email a nivel de Supabase Auth evita que dos
+  cuentas compartan el mismo email, así que no hay *account takeover* de
+  una cuenta ya existente — el riesgo es "alguien se adelanta a crear la
+  cuenta con tu email", no "alguien entra a tu cuenta ya creada").
+- **Clientes gestionados (ADR-0026)**: la exposición real es menor de lo
+  que parece a primera vista — `claim_customer_activation()` (Phase 21,
+  sin cambios en esta ADR) **nunca comparó email** como parte de su
+  chequeo de seguridad (hallazgo del gate de ADR-0040, ya corregido en la
+  ADR misma) — la autorización real siempre fue "tener el token del link
+  de WhatsApp" + "clic explícito en Confirmar y activar", nunca la
+  confirmación de email. Sacar la confirmación de email no cambia la
+  superficie de seguridad de este flujo particular, sólo la vuelve
+  explícita en vez de una barrera accidental que ya se había documentado
+  como no-existente en ADR-0040.
+
+**Implementación**: `backend-engineer` deshabilita "Confirm email" en
+`supabase/config.toml` (local) y redacta las instrucciones del cambio
+manual equivalente en el dashboard de producción (Authentication →
+Providers → Email → "Confirm email", toggle off) — mismo patrón que ya
+usa este proyecto para cambios que sólo se pueden hacer a mano en el
+proyecto Supabase administrado (ADR-0017, ADR-0041). `frontend-engineer`
+elimina `/auth/confirm`, `confirm-next.ts` y su test, y ajusta
+`signUpWithPassword()` si el `notice` de "revisá tu email" deja de
+aplicarse (redirige directo, como cualquier login exitoso). Gate
+obligatorio de `security-engineer` antes de desplegar — toca
+autenticación, mismo criterio que toda esta sesión, aunque el trade-off
+principal ya fue explicado y aceptado por el usuario antes de esta
+decisión.
+
+**Implementado y verificado en vivo (`backend-engineer`, 2026-09-29, CLI
+2.118.0)**: `enable_confirmations = false` en `[auth.email]` de
+`supabase/config.toml` ya era el default de desarrollo local desde
+ADR-0041 (se usaba `true` sólo temporalmente para observar el mail en
+Mailpit y se revertía después de cada prueba) — con esta ADR pasa a ser
+el estado **permanente y definitivo** del proyecto, documentado como tal
+inline. Se eliminó `[auth.email.template.confirmation]` (la sección que
+ADR-0041 había agregado) junto con `supabase/templates/confirmation.html`
+— sin ningún email de confirmación, no queda ningún caller posible del
+template. El comentario de `additional_redirect_urls` se reescribió: la
+lista de patrones (`http://127.0.0.1:3000/**`, `http://localhost:3000/**`)
+sigue haciendo falta porque `signInWithOAuth()` arma el mismo
+`redirect_to=/auth/callback?next=<...>` que necesitaba el link de email
+viejo — sin la lista, GoTrue pierde el `?c=<nonce>` de ADR-0040 igual para
+Google OAuth — pero el motivo documentado pasa a ser exclusivamente OAuth,
+no el flujo de email que ya no existe. Las RPC
+`issue_activation_continuation`/`redeem_activation_continuation` y la
+tabla `customer_activation_continuations` (ADR-0040) no se tocaron.
+
+Verificado en vivo contra Supabase local reiniciado con el config nuevo
+(`supabase stop && supabase start`, sin esto GoTrue sigue el proceso
+viejo en memoria): `POST /auth/v1/signup` real (vía `supabase-js`,
+`auth.signUp({ email, password })`, sin `admin.createUser`) devuelve
+`session`/`access_token` no nulos en la misma respuesta, sin generar
+ningún mail en Mailpit. Se ejecutó además el flujo completo de activación
+de cliente gestionado (ADR-0026) de punta a punta contra RPCs reales,
+en el mismo cliente/contexto que hizo el `signUp()`: `create_managed_customer`
+→ `issue_customer_activation` (como owner) → `signUp()` del cliente
+(sesión inmediata, sin mail) → `claim_customer_activation(token)` con esa
+misma sesión → `status: "OK"` y `customers.profile_id` apuntando al
+usuario recién creado — nunca se pasó por `/auth/confirm` (ya no existe)
+ni por `issue_activation_continuation`/`redeem_activation_continuation`
+(el nonce de ADR-0040), confirmando que ese mecanismo queda acotado a
+Google OAuth como preveía esta ADR.
+
+**Tests**: no se encontró ningún test de integración de `backend/` que
+llame a `auth.signUp()` directamente ni que asuma `data.session === null`
+tras un signup — todos los fixtures de usuario (`test/helpers.ts`,
+`createSignedInUser`) usan `admin.auth.admin.createUser({ email_confirm:
+true })` + `signInWithPassword()`, que ya bypaseaba la confirmación por
+vía de service role independientemente de esta ADR. No hizo falta ajustar
+ningún test existente. Suite completa corrida contra una base reseteada
+(`npx supabase db reset`, 46 migraciones aplicadas limpio): unit
+(`npm test`) **62/62 verdes**. Integración (`npm run test:integration`,
+**350 tests en total**) corrida dos veces en paralelo (modo por default):
+la primera con **349/350** verdes (1 falla,
+`phase34.permission-boundary-fixes.test.ts`, `Hook timed out in 30000ms`
+en el `afterAll` de limpieza), la segunda con **349/350** verdes (1 falla
+distinta, `phase32.configurable-roles.test.ts`, `Test timed out in
+20000ms`). Ambos archivos, corridos en aislado inmediatamente después,
+pasan limpio (`phase34`: 14/14 en 88s, un tercio del tiempo que bajo
+contención) — es la misma contención de GoTrue por hashing de contraseñas
+concurrente entre archivos que ya documenta el comentario de
+`hookTimeout`/`testTimeout` en `vitest.integration.config.ts`
+(preexistente a esta ADR, no introducida por ella: cambiar
+`enable_confirmations` no agrega ningún hash ni ninguna llamada de red
+nueva al signup, si acaso quita una). Confirmado eliminando la variable
+de contención: una tercera corrida con `--no-file-parallelism` (sin
+paralelismo entre archivos) dio **350/350 verdes, 36/36 archivos**, en
+704s — cero fallas relacionadas con esta ADR. `npm run typecheck` verde.
+
+**Corrección post-review de seguridad (2026-09-29) — el trade-off
+explicado al usuario antes de decidir era más chico que el real, se deja
+por escrito acá para que el historial de la decisión sea preciso.** El
+razonamiento original de esta ADR decía que sin confirmación de email "no
+hay *account takeover* de una cuenta ya existente — el riesgo es que
+alguien se adelanta a crear la cuenta con tu email". El gate de
+`security-engineer` encontró, y verificó en vivo contra Supabase local,
+que **sí hay una forma real de terminar con acceso de OWNER a un negocio
+ajeno**, por tres caminos distintos:
+
+1. **Ocupación de email + invitación de equipo**: `invite_member_by_email()`
+   (Phase 32) le da membresía — incluido rol OWNER — a quien tenga
+   registrado ese email en `auth.users`, sin ninguna prueba de que sea la
+   persona real. Un atacante que se registra primero con el email
+   previsible de un futuro dueño/empleado queda con acceso apenas alguien
+   lo invita por ese email.
+2. **Secuestro vía Google OAuth**: GoTrue sólo borra identidades no
+   confirmadas al vincular una cuenta nueva de OAuth a un email ya
+   registrado quen no está confirmado — con `enable_confirmations=false`
+   toda cuenta por contraseña queda confirmada de una, así que esa
+   protección deja de aplicar. Un atacante que se registra por contraseña
+   con el Gmail de una futura dueña queda con la cuenta vinculada cuando
+   ella entra por primera vez con "Continuar con Google" — ella no ve
+   ningún error, termina dentro de la cuenta del atacante.
+3. **Usuarios viejos sin confirmar, en el instante de apagar el toggle en
+   producción**: cualquiera que haga `signUp()` con el mismo email de una
+   cuenta que ya existía sin confirmar recibe sesión como ESE `user.id`
+   (mismo UUID) — si esa cuenta ya tenía membresías/clientes vinculados,
+   quedan expuestos apenas se apaga el toggle.
+
+Adicional: `claim_team_invitation()` (ADR-0034) pierde su segunda barrera
+— la invitación por email ya no prueba posesión de la casilla, sólo
+conocimiento del email (rompe la regla 1 del gate de seguridad de
+ADR-0034, documentada en `docs/security.md`).
+
+**Decisión, presentado el riesgo real al usuario: se aplican las
+mitigaciones sin costo de email** (ninguna reintroduce envío de mails ni
+SMTP):
+
+1. Se revoca el `grant execute` de `invite_member_by_email()` y
+   `enroll_customer_by_email()` — quedan sin camino de invocación desde
+   `anon`/`authenticated`. Ya existen reemplazos que no dependen de
+   "email = identidad verificada": la invitación de equipo por token de
+   ADR-0034 (`/equipo/[token]`) y la activación de cliente gestionado por
+   link de WhatsApp de ADR-0026. La UI que llamaba a las versiones por
+   email se saca o se redirige al flujo por token.
+2. Trigger nuevo sobre `auth.identities`: cuando se vincula una identidad
+   no-email (Google) a un usuario que ya tiene una identidad de
+   email/contraseña, si esa cuenta fue creada por signup público (no por
+   invitación/activación administrada) se rechaza la vinculación o se
+   fuerza a tratar la cuenta como si no tuviera contraseña utilizable —
+   mismo comportamiento que GoTrue ya aplica hoy para cuentas no
+   confirmadas, replicado a mano porque `enable_confirmations=false` lo
+   desactiva.
+3. **Antes de apagar el toggle en producción**: auditar
+   `auth.users where email_confirmed_at is null`. Cuentas sin ningún dato
+   vinculado (membership/customer) se pueden borrar sin más; cuentas con
+   datos vinculados se resuelven a mano (confirmarlas explícitamente
+   corta el vector, porque `signUp()` vuelve a dar `user_already_exists`
+   para un email ya confirmado).
+4. `docs/security.md` (regla 1 del gate de ADR-0034) se actualiza:
+   la invitación de equipo por email pasa a ser un factor de
+   *conocimiento*, no de *posesión* — documentado como cambio de modelo
+   de amenaza, no como bug.
+5. No bloqueante, aplicado igual por ser gratis: mensaje de error
+   genérico en español para `user_already_exists` (evita enumeración de
+   emails registrados), y Turnstile (`[auth.captcha]`, gratis, soportado
+   nativamente por Supabase) como mitigación de creación masiva de
+   cuentas.
+
+**Riesgo que queda abierto y se acepta explícitamente**: el mensaje "Tu
+cuenta todavía no está confirmada" en `signInWithPassword()` no es código
+muerto — lo siguen recibiendo cuentas viejas sin confirmar hasta que se
+complete la auditoría del punto 3. El texto se actualiza para no decirle
+a esa persona que busque un mail que ya no se va a reenviar.
+
+**Implementación**: delegada a `backend-engineer` (revocar los dos
+`grant execute`, trigger de `auth.identities`, query de auditoría para
+producción, captcha) y `frontend-engineer` (sacar/redirigir la UI de
+invitación directa por email, mensaje de error genérico). Segundo pase de
+`security-engineer` obligatorio sobre estos cambios antes de release —
+el primer gate ya dio la mecánica base por buena, esto es incremental.
+
+**Implementado (`backend-engineer`, 2026-09-29, puntos 1, 2, 3 y 5 de la
+lista de arriba)**: migración `backend/supabase/migrations/20260929140000_phase41_adr0043_post_review_hardening.sql`.
+Detalle técnico completo en `docs/database.md` ("Fase 41"); acá sólo lo
+que hace falta para decidir y para que `frontend-engineer`/`security-engineer`
+sepan qué esperar.
+
+1. `revoke execute ... from anon, authenticated, service_role` sobre
+   `invite_member_by_email()` y `enroll_customer_by_email()` — no se
+   borraron. Investigado antes: ningún caller de este repo las invocaba
+   vía `service_role` (todos usan la sesión del usuario), y de hecho
+   `service_role` ya no tenía `EXECUTE` sobre ninguna de las dos desde la
+   Fase 19 (revocó el grant heredado del default de Supabase); el revoke
+   explícito documenta ese estado y evita que una migración futura se lo
+   devuelva por accidente.
+
+   **Rompe `frontend/app/actions/admin.ts` (`enrollCustomer()`,
+   `inviteMember()`) de inmediato** — las dos pasan a devolver
+   `42501 permission denied` en vez de su comportamiento actual. Es la
+   consecuencia esperada y ya prevista arriba ("la UI que llamaba a las
+   versiones por email se saca o se redirige al flujo por token"), pero
+   **no desplegar esta migración sin coordinar el orden con ese cambio de
+   frontend** — si se despliega primero, esos dos botones del panel
+   empiezan a fallar en producción hasta que `frontend-engineer` los saque
+   o los redirija.
+
+2. Trigger `auth_identities_block_oauth_hijack` sobre `auth.identities`
+   (`before insert`): bloquea vincular una identidad no-`email` (Google) a
+   una cuenta que ya tiene una identidad `email`/contraseña. No distingue
+   "signup público" de "invitación/activación administrada" — con
+   `enable_manual_linking = false` (ya así en `supabase/config.toml`) no
+   existe ningún flujo soportado por el que alguien agregue Google a su
+   propia cuenta de forma deliberada, así que cualquier insert de este
+   tipo es, por definición, el camino automático vulnerable. Verificado en
+   vivo contra Supabase local: un insert simulando el secuestro (identidad
+   `google` para un `user_id` con contraseña preexistente) falla con
+   `OAUTH_LINK_BLOCKED_EXISTING_PASSWORD_IDENTITY`; un signup nuevo por
+   Google (sin identidad previa) no se ve afectado.
+
+   **Riesgo residual aceptado, documentado explícitamente**: esto es
+   fail-closed, no fail-silent — la persona real recibe un error genérico
+   de Postgres al hacer "Continuar con Google" por primera vez con un
+   email ya ocupado, en vez de quedar vinculada en silencio a la cuenta
+   ajena (que era el bug). El texto de error que ve el usuario depende de
+   cómo GoTrue/`frontend/app/actions/auth.ts` traduzcan ese fallo — no
+   evaluado en esta fase porque el flujo de Google real (con credenciales
+   de Cloudflare/Google de verdad) no se puede ejercitar completo contra
+   Supabase local; sólo se verificó el `insert` a nivel de base. Si
+   `security-engineer` o `frontend-engineer` observan un mensaje crudo de
+   Postgres llegando al usuario en este camino, es un seguimiento de UI,
+   no una regresión de este trigger.
+
+3. **Query de auditoría para producción, lista para copiar/pegar** (no
+   corrida contra producción por `backend-engineer` — la corrida real la
+   hace el usuario o el Orchestrator, con supervisión, antes de apagar
+   `enable_confirmations` en el dashboard):
+
+   ```sql
+   -- 1. Todas las cuentas sin confirmar (candidatas al problema del
+   --    camino 3: mismo email, mismo user_id, expuestas apenas se apaga
+   --    el toggle).
+   select id, email, created_at
+   from auth.users
+   where email_confirmed_at is null
+   order by created_at asc;
+
+   -- 2. De esas, cuáles tienen algo vinculado (membership u/o Customer) --
+   --    esas NO se pueden borrar sin más, hay que resolverlas a mano
+   --    (p.ej. confirmarlas explícitamente, lo que corta el vector porque
+   --    signUp() vuelve a dar user_already_exists para un email
+   --    confirmado). Las que no aparecen en ningún lado de este segundo
+   --    resultado se pueden borrar directo.
+   select
+     u.id,
+     u.email,
+     u.created_at,
+     (select count(*) from public.organization_members om where om.profile_id = u.id) as membership_count,
+     (select count(*) from public.customers c where c.profile_id = u.id) as customer_count
+   from auth.users u
+   where u.email_confirmed_at is null
+     and (
+       exists (select 1 from public.organization_members om where om.profile_id = u.id)
+       or exists (select 1 from public.customers c where c.profile_id = u.id)
+     )
+   order by u.created_at asc;
+   ```
+
+5. `[auth.captcha]` habilitado en `supabase/config.toml` con
+   `provider = "turnstile"` y el secreto de prueba público que Cloudflare
+   documenta para automatizar tests sin navegador ("always passes", no es
+   un secreto real). **Confirmado en vivo, hallazgo importante**: GoTrue
+   exige el `captcha_token` tanto en `/signup` como en
+   `/token?grant_type=password` — **no sólo en signup**. Esto significa
+   que habilitar este toggle en el dashboard de producción, sin que
+   `frontend/app/actions/auth.ts` mande un token real de Turnstile en
+   `signUp()` **y** en `signInWithPassword()`, deja **todo login por
+   contraseña roto**, no sólo el alta de cuentas nuevas.
+
+   **Aviso explícito para el Orchestrator, tal como pedía la tarea**: esto
+   es trabajo de `frontend-engineer` — agregar el widget de Turnstile
+   (Cloudflare, Site Key público) al formulario de signup/login y pasar el
+   token resultante como `options.captchaToken` en `signUp()` y
+   `signInWithPassword()`. Hasta que eso exista, **no tocar el toggle
+   equivalente en el dashboard de producción** (Authentication → Attack
+   Protection o la sección equivalente) — local sí quedó con el toggle
+   activo porque `backend/test/helpers.ts` ya manda un `captchaToken` fijo
+   (la clave de prueba acepta cualquier valor no vacío), pero un usuario
+   real de producción no tiene ese atajo.
+
+   Producción además necesita un Site Key + Secret Key reales (gratis) de
+   <https://dash.cloudflare.com/?to=/:account/turnstile> — el Secret Key
+   se carga en el dashboard de Supabase, el Site Key lo necesita
+   `frontend-engineer` para el widget.
+
+**Verificación en vivo (`backend-engineer`, 2026-09-29)**: ataques
+reproducidos y confirmados bloqueados contra Supabase local reseteado
+(`npx supabase db reset` con la migración aplicada) —
+*email-squatting + invitación*: `enroll_customer_by_email()`/
+`invite_member_by_email()` devuelven `42501` para un `OWNER` autenticado
+real (antes hubieran dado membresía/acceso a Customer sin más). *Robo de
+cuenta vieja sin confirmar vía Google*: un insert de identidad `google`
+sobre un `user_id` con contraseña preexistente fue rechazado por el
+trigger; el mismo insert para una cuenta Google nueva (sin contraseña
+previa) no se vio afectado.
+
+**Tests**: la migración obligó a actualizar 5 archivos de
+`backend/test/` que usaban las dos RPC revocadas como fixture o como
+sujeto de prueba (`phase8.admin-operations.test.ts`,
+`phase10.plans.test.ts`, `phase13.branding.test.ts`,
+`phase32.configurable-roles.test.ts`,
+`phase33.team-invitations.test.ts`) — los que las usaban sólo para armar
+un `Customer`/`STAFF` de prueba pasaron a un insert directo con el cliente
+del `OWNER` (misma política `organization_members_write_owner` que ya
+probaba `phase32`); los que probaban el comportamiento propio de las RPC
+pasaron a afirmar `error.code === '42501'`. `npm run typecheck` verde.
+Suite completa (`npx supabase db reset` + `npx vitest run --config
+vitest.integration.config.ts --no-file-parallelism`, sin paralelismo entre
+archivos por la misma contención de GoTrue que ya documenta ADR-0043 base):
+**350/350 tests en verde, 36/36 archivos** (mismo total que antes de esta
+fase — los cambios en `phase8`/`phase32` se compensan: `phase8` pasa de 3 a
+2 tests, `phase32` pasa de 1 a 2). `npm test` (unit, paquete de dominio):
+**62/62 verdes**, sin cambios — ningún test unitario toca RPCs ni
+`auth.*`.
+
+**Pendiente, no cubierto por esta fase**: `frontend-engineer` — sacar o
+redirigir la UI de `enrollCustomer()`/`inviteMember()` en
+`frontend/app/actions/admin.ts` (coordinar el orden de deploy con la
+migración de arriba), agregar el widget de Turnstile + `captchaToken` a
+`signUp()`/`signInWithPassword()` antes de habilitar captcha en
+producción, y el mensaje de error genérico de `user_already_exists`
+(BAJO-1) si todavía no está — `frontend/app/actions/auth.ts` ya tenía un
+comentario citando ADR-0043 punto 5 para ese mensaje al momento de este
+trabajo, no verificado en detalle por no ser parte del alcance de
+`backend-engineer`. Segundo pase de `security-engineer` obligatorio sobre
+todo lo de arriba antes de release.
+
+**Checklist único de deploy (2026-09-30, consolidado por pedido de
+`reviewer` en el review final — la información ya estaba correcta pero
+repartida en 6 lugares distintos: el comentario de la migración,
+`docs/security.md`, `.github/workflows/ci.yml`, `deploy/README.md`; esta
+es la versión canónica, copiable tal cual).** Todo lo de código ya pasó
+dos gates de `security-engineer` (LISTO) y `reviewer` (LISTO). Lo que
+sigue son pasos de ejecución, varios manuales:
+
+**Paso 0 — antes de tocar cualquier repo (manual, usuario):**
+1. Crear el widget en [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile)
+   (gratis) con los hostnames reales de producción. Guardar Site Key +
+   Secret Key.
+2. Cargar la Site Key como secret `NEXT_PUBLIC_TURNSTILE_SITE_KEY` en
+   GitHub → `Reservaste/frontend` → Settings → Secrets → Actions. (Sirve
+   provisoriamente la key de test `1x00000000000000000000AA` acá también
+   — ambas funcionan mientras el captcha de Supabase siga apagado en
+   producción; sólo hace falta la real antes del Paso 6.)
+3. Confirmar en el dashboard de Supabase de producción (proyecto
+   `wgdlflhdjpqcxykblqme`) → Authentication → Providers que "manual
+   linking" sigue apagado — el diseño del trigger anti-secuestro depende
+   de eso.
+
+**Paso 1 — backend (mixto, yo abro el PR/migración, usuario aprueba el deploy):**
+4. Release del repo `backend/` (migración `20260929140000_phase41_...`):
+   PR development→main, CI en verde, y el usuario aprueba manualmente el
+   job `deploy-migrations` (Environment "production", como toda migración
+   de schema en este proyecto).
+5. Verificar en producción: `select has_function_privilege('anon',
+   'invite_member_by_email(uuid,text,text)', 'EXECUTE')` da `false` (o el
+   nombre exacto de firma que tenga en ese momento), y que existe el
+   trigger `auth_identities_block_oauth_hijack` sobre `auth.identities`
+   (`select tgname from pg_trigger where tgrelid =
+   'auth.identities'::regclass`).
+   
+   **Ventana funcional esperada y aceptada** entre este paso y el Paso 3:
+   los botones viejos de "Ya tiene cuenta"/"Cliente con cuenta existente"
+   ya no existen en el código nuevo de frontend, pero ese código todavía
+   no está desplegado — cualquiera que siga en la versión vieja del
+   frontend va a ver esos botones fallar con error genérico si los usa.
+   No es un problema de seguridad, es cosmético, y se cierra en el Paso 3.
+
+**Paso 2 — auditoría de cuentas viejas (manual, usuario, con mi ayuda si la pide):**
+6. Correr en producción la query de auditoría (ver sección
+   "Implementado (backend-engineer...)" de esta misma ADR más arriba,
+   punto 3, para el SQL exacto): `auth.users` sin `email_confirmed_at`,
+   cruzado contra `organization_members`/`customers`. Cuentas sin ningún
+   dato vinculado se borran directo; cuentas con datos vinculados se
+   resuelven a mano (confirmarlas explícitamente corta cualquier vector,
+   porque `signUp()` vuelve a dar `user_already_exists` para un email ya
+   confirmado). **Este paso borra/modifica datos reales de producción —
+   no lo automatizo sin que el usuario lo vea y decida caso por caso.**
+
+**Paso 3 — apagar confirmación de email (manual, usuario):**
+7. Dashboard de producción → Authentication → Providers → Email → apagar
+   "Confirm email". **No antes del Paso 2** (cuentas viejas sin resolver
+   quedarían expuestas al vector ALTO-3 apenas se apaga) **ni después del
+   Paso 4** (el frontend nuevo asume sesión inmediata tras signup; si el
+   toggle sigue prendido, el signup se rompe porque no hay ningún link de
+   confirmación al que volver — `/auth/confirm` ya no existe en el código
+   nuevo).
+
+**Paso 4 — frontend (mixto, yo mergeo, despliega solo):**
+8. Inmediatamente después del Paso 3: merge de `frontend/` a `main` (yo
+   lo hago, sin aprobación manual — no tiene schema, mismo patrón ya
+   usado en esta sesión). Despliega automático.
+
+**Paso 5 — verificación conjunta en producción (usuario + yo):**
+9. Signup por contraseña real → sesión inmediata, sin pantalla de
+   "revisá tu email".
+10. Login por contraseña real.
+11. "Continuar con Google" con una cuenta de Google que nunca se registró
+    antes en la plataforma → funciona normal.
+12. "Continuar con Google" con el Gmail de una cuenta que YA tiene
+    contraseña en la plataforma (probar a propósito el caso que el
+    trigger tiene que bloquear) → vuelve a `/login` sin crear sesión ni
+    vincular nada (no hay mensaje de error visible, es el comportamiento
+    esperado — `/login` no expone el motivo).
+
+**Paso 6 — captcha real (manual, usuario, sólo al final):**
+13. Recién acá, con la Site Key real ya desplegada (si en el Paso 0 se
+    usó la de test, esto implica un redeploy del frontend con la key
+    real primero) y el M1 (reset del widget) ya verificado en vivo (hecho,
+    `reviewer` lo confirmó en el review final de esta corrección):
+    habilitar `[auth.captcha]` en el dashboard de producción con el
+    Secret real de Turnstile — nunca el de prueba. Probar login y signup
+    a mano de inmediato. Plan de rollback si algo falla: apagar el
+    toggle, vuelve al estado sin captcha (mismo riesgo residual de
+    creación masiva que ya está aceptado hasta este paso, nada peor).
+
+**Hasta que se complete el Paso 6, no hay protección contra creación
+masiva de cuentas — conviene no demorarlo mucho, pero no bloquea nada de
+lo anterior.**
+
+**Cerrado — 2026-09-30, los 7 pasos completos.** Auditoría (Paso 2): cero
+cuentas sin confirmar en producción, sin nada que resolver. "Confirm
+email" apagado (Paso 3). Frontend desplegado con las mitigaciones
+completas (Paso 4) y verificado en producción real (Paso 5: signup sin
+confirmación, login, mensaje genérico de email duplicado, todo en verde
+contra `https://161-35-63-60.sslip.io` con Playwright). Turnstile real
+(Site Key + Secret Key del usuario) cargado y activado (Paso 6),
+verificado con un signup+login manual real del usuario tras el deploy —
+el widget real bloqueaba automatización estándar de Playwright (esperado,
+es el captcha funcionando), así que la confirmación final la hizo el
+usuario a mano. Ajuste cosmético adicional el mismo día: el widget se
+fijó en `theme: "light"` (antes seguía el tema del sistema).
+
+ADR-0043 queda completamente implementada, desplegada y verificada de
+punta a punta, sin pasos pendientes.
+
+---
+
+## ADR-0044 — Recursos exclusivos: anti-solapamiento a nivel de base de datos
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario ("necesito revisar toda la lógica que hay y
+cuánta es custom y cuánta no" — auditoría de qué tan genérico es el
+producto de cara a vender a una barbería), diseñada por `Plan` con tres
+rondas de investigación previa (modelo `ScheduleRule`/`SlotOccurrence`,
+modelo `Resource`, patrón de generación).
+
+**Problema:** una auditoría completa del sistema (ver resumen ejecutivo
+en la conversación, no repetido acá) encontró que el gap más riesgoso
+operativamente para un negocio de turno individual (ej. una barbería) es
+que **no existe ningún chequeo, a ningún nivel, que impida que el mismo
+`Resource` (ej. un barbero) quede reservado dos veces a la misma hora en
+servicios distintos**. El único `EXCLUDE USING gist` de todo el proyecto
+protege pagos (`daterange` de períodos), no reservas. `book_slot()` y
+`can_customer_book()` sólo validan capacidad de la ocurrencia puntual, y
+`generate_slot_occurrences_for_rule()` no consulta otras reglas del mismo
+recurso al generar.
+
+**Decisión — campo genérico en `Resource`, respaldado por un exclusion
+constraint en base de datos** (no sólo una validación en la RPC, porque
+el generador, el cron y los triggers insertan por su cuenta sin pasar por
+un único punto de entrada):
+
+- `resources.is_exclusive boolean not null default false` — "se ocupa de
+  a uno, no admite turnos superpuestos". Genérico, sin ninguna palabra de
+  rubro (sirve igual para un profesional, una camilla, una cancha de
+  1-a-1).
+- `slot_occurrences.resource_is_exclusive boolean not null default
+  false` — denormalizado desde `resources.is_exclusive` vía trigger
+  (`BEFORE INSERT OR UPDATE OF resource_id`, y un segundo trigger `AFTER
+  UPDATE OF is_exclusive` en `resources` que propaga sólo a ocurrencias
+  futuras `ACTIVE` — el pasado no se revalida). Necesario porque un
+  `EXCLUDE` no puede mirar otra tabla.
+- Constraint:
+  ```sql
+  alter table slot_occurrences add constraint slot_occurrences_exclusive_resource_no_overlap
+    exclude using gist (resource_id with =, tstzrange(start_at, end_at, '[)') with &&)
+    where (status = 'ACTIVE' and resource_is_exclusive);
+  ```
+  (`btree_gist` ya está instalado desde `phase7_payments.sql`). Con
+  `'[)'`, dos turnos pegados (10:00–10:30 y 10:30–11:00) no chocan.
+  `BLOCKED`/`CANCELLED` quedan afuera del constraint, así que cancelar
+  libera el hueco.
+- `generate_slot_occurrences_for_rule()` se recrea para envolver cada
+  insert en `begin ... exception when exclusion_violation then ... end`
+  y saltear esa ocurrencia puntual en vez de abortar toda la regeneración
+  del tenant (sin esto, un conflicto en una organización frenaría el
+  `pg_cron` diario para todas).
+- Nueva función `check_schedule_rule_conflicts(...)` que proyecta la
+  ventana de 90 días y devuelve los choques ANTES de crear/editar una
+  regla — el constraint es el respaldo final, esta función da un mensaje
+  útil (`RESOURCE_SCHEDULE_CONFLICT`) en vez de dejar que el usuario se
+  entere por un error de Postgres.
+- Activar el flag en un recurso que ya tiene solapamientos: el propio
+  constraint rechaza el `update` (`RESOURCE_HAS_OVERLAPS`), hay que
+  resolver los choques antes de marcarlo exclusivo.
+
+**Alternativas descartadas** (evaluadas explícitamente por el diseño):
+- **Inferir el conflicto sólo por solapamiento, sin campo nuevo**:
+  descartada — rompería datos hoy válidos (ej. un gimnasio con una sala
+  compartida entre dos clases a la misma hora pasaría a ser un error),
+  cambiando comportamiento en el deploy para tenants existentes. Además
+  deja el modelado ambiguo (la única forma de "compartir de verdad"
+  sería crear recursos fantasma).
+- **`concurrency_limit int` en vez de `boolean`**: descartada por ahora
+  — con N>1 el constraint deja de ser un `EXCLUDE` declarativo y pasa a
+  requerir un conteo con trigger y lock, más complejo y con riesgo de
+  carreras, para un caso de uso ("cancha que admite 2 servicios
+  simultáneos a la vez") que no tiene demanda real todavía. El boolean
+  migra a int sin romper nada si aparece la necesidad.
+
+**Impacto:** `backend-engineer` implementa la migración
+`phase42_exclusive_resources.sql`. `frontend-engineer` agrega el
+checkbox "Se ocupa de a uno" al formulario de recursos, y mapea
+`RESOURCE_SCHEDULE_CONFLICT`/`RESOURCE_HAS_OVERLAPS`. No requiere gate de
+`security-engineer` (no toca auth/RLS/fronteras de tenant, hereda la RLS
+existente de `resources`) — sí pasa por `reviewer`, con foco en el manejo
+de excepciones del generador y en que el trigger de propagación respete
+`organization_id`. Es la base de ADR-0045 (generador por franja) y deja
+lista la capacidad=1 implícita que ADR-0046 (cobrar turno) asume para
+recursos exclusivos.
+
+---
+
+## ADR-0045 — Generador de horarios por franja horaria
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario (auditoría de generalización), diseñada por
+`Plan`.
+
+**Problema:** cargar la agenda de un negocio de turno individual hoy
+significa crear una `ScheduleRule` por cada horario de inicio, uno a la
+vez — para una barbería con 2 profesionales, lunes a sábado de 10 a 20
+con turnos de 30 minutos, son unos 40 envíos de formulario. El formulario
+actual (`schedule-rule-form.tsx`) sólo acepta un único `localStartTime`
+por regla.
+
+**Decisión — extender el precedente ya existente de ADR-0022
+(`create_schedule_rule_group()`, que itera `weekdays[]`) al producto
+cartesiano `weekdays[] × local_start_times[]`**, sin cambiar el modelo de
+`ScheduleRule` (sigue siendo una fila por día+hora, nunca un rango):
+
+- Nueva RPC `create_schedule_rule_span(p_service_id, p_resource_id,
+  p_weekdays int[], p_range_start time, p_range_end time, p_step_minutes
+  int, p_duration_minutes int, p_capacity int) returns uuid` (el
+  `group_id`), mismo chequeo de permiso que `create_schedule_rule_group`
+  vigente.
+- Expansión de `local_start_time` en SQL con `generate_series(range_start,
+  range_end - duration, step)`, incluyendo sólo inicios donde `start +
+  duration <= range_end`.
+- Topes defensivos obligatorios: `step_minutes >= 5`, máximo 96 inicios
+  por día, máximo 7×96 reglas por llamada — sin esto, un solo request
+  podría generar decenas de miles de `SlotOccurrence` en la ventana de 90
+  días (vector de DoS de almacenamiento).
+- Si el recurso es exclusivo (ADR-0044) y `step_minutes < duration_minutes`
+  (turnos que se pisarían entre sí dentro de la misma franja), se
+  rechaza de entrada con `SPAN_SELF_OVERLAP_ON_EXCLUSIVE_RESOURCE`. Si es
+  exclusivo y `p_capacity > 1`, se rechaza con
+  `EXCLUSIVE_RESOURCE_CAPACITY_MUST_BE_ONE` (regla genérica: un recurso
+  exclusivo atiende de a uno).
+- Llama a `check_schedule_rule_conflicts()` (ADR-0044) una vez para todo
+  el lote; la operación es atómica (todo o nada).
+
+**Por qué no un `ScheduleRule` con rango propio** (alternativa
+descartada, mismo motivo que ADR-0022 ya documentó en
+`docs/decisions.md:1154-1161`): rompería `ScheduleException` (clave
+regla+fecha puntual), la cascada de `discontinue_schedule_rule`, y
+`RecurringBooking.schedule_rule_id` — los tres asumen una regla puntual,
+no un rango expandible.
+
+**Impacto:** `backend-engineer` implementa la migración
+`phase43_schedule_rule_spans.sql` (idealmente refactorizando
+`create_schedule_rule_group` para compartir la rutina interna de
+expansión+inserción). `frontend-engineer` agrega un toggle "Un
+horario / Franja" en `schedule-rule-form.tsx`, con vista previa de los N
+horarios resultantes (sólo informativa, calculada en cliente) y
+agrupación por `group_id` en el listado. No requiere gate de
+`security-engineer` — mismo perímetro de permisos que
+`create_schedule_rule_group`. `reviewer` debe confirmar los topes
+defensivos explícitamente. Depende de que ADR-0044 esté mergeada primero
+(sin el constraint, una franja sobre un recurso exclusivo puede generar
+dobles turnos silenciosamente) aunque el código puede escribirse en
+paralelo.
+
+---
+
+## ADR-0046 — `book_slot_paying()`: cobrar un turno suelto, versión sólo-mostrador
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario, diseñada por `Plan`, implementa el §2.8 de
+`docs/proposals/adr-0025-makeup-credits.md` (documento de diseño nunca
+implementado, escrito junto con ADR-0025 original).
+
+**Problema:** el modelo `DROP_IN` (turno suelto, un pago por ocurrencia
+puntual) ya existe completo en el schema desde ADR-0024/ADR-0022
+(`service_plan_kind`, `payments.slot_occurrence_id`, el trigger
+`PAYMENT_PLAN_KIND_REQUIRES_OCCURRENCE`, el índice anti-doble-cobro) —
+pero nunca se construyó la pieza que lo cobra. `RegisterPaymentForm`
+excluye `DROP_IN` a propósito ("eso se cobra desde el turno, no desde
+acá"), y esa pantalla del turno nunca se construyó. Consecuencia real: un
+servicio configurado con `DROP_IN` + `payment_required=true` queda con
+reservas bloqueadas sin ninguna salida — no es un bug de lógica de
+`evaluate_payment_coverage()` (que hace exactamente lo que tiene que
+hacer: un `DROP_IN` nunca cubre por período), es una pieza de UI/RPC que
+falta.
+
+**Decisión — implementar `quote_booking()`/`book_slot_paying()` tal como
+especifica §2.8 de la propuesta original, con dos precisiones nuevas**:
+
+1. **Por ahora, `book_slot_paying()` lo invoca sólo el staff** (mismo
+   permiso que `admin_book_for_customer`, ej. `MANAGE_BOOKINGS`) — sin
+   una pasarela de pago real conectada (ADR-0027, postergada, sin fecha),
+   dejar que el cliente se auto-marque como `PAID` sería autodeclararse
+   pagado sin ninguna verificación. La firma queda lista para engancharse
+   con `payment_intents` (§2.8.2) el día que ADR-0027 se implemente,
+   pero eso es explícitamente fuera de este alcance. **Confirmado con el
+   usuario**: cobro por mostrador (efectivo/tarjeta en el local,
+   registrado en el sistema) alcanza para la primera venta — no se
+   necesita pago online para vender.
+2. **Cubre también "ya anotado, falta cobrar"**: si la `Booking` ya
+   existe y la cobertura no está resuelta, sólo crea el `Payment`. Si ya
+   está cubierta, `ALREADY_COVERED` sin cobrar de nuevo — cubre el caso
+   de un negocio con `payment_required=false` que igual quiere dejar
+   registro de un cobro hecho en efectivo después del servicio.
+
+**Mecánica** (dos RPC nuevas, `phase44_drop_in_booking.sql`):
+- `quote_booking(p_slot_occurrence_id, p_customer_id)` — `stable`, sin
+  side-effects, devuelve `{can_book, reason, coverage_path, price,
+  currency, makeup_credit_id?, makeup_credit_expires_on?}`. Envuelve
+  `evaluate_payment_coverage()`/`evaluate_customer_booking()` ya
+  existentes. Invocable por staff con permiso, o por el propio cliente
+  consultando su propia cobertura (sólo lectura, sin riesgo).
+- `book_slot_paying(p_slot_occurrence_id, p_customer_id, p_amount?)` —
+  `security definer`, mismo orden de locks que `book_slot()`
+  (`FOR UPDATE` sobre la ocurrencia primero, para no generar deadlocks
+  con reservas concurrentes). Exige permiso de staff. Valida que
+  `customer_id` pertenece a la misma organización que la ocurrencia
+  (`CUSTOMER_NOT_IN_ORG` si no — es la frontera multi-tenant principal de
+  esta pieza). Re-evalúa cobertura antes de cobrar. Resuelve el `DROP_IN`
+  activo del servicio (`NO_DROP_IN_PLAN` si no hay uno); `amount =
+  coalesce(p_amount, plan.price)`, nunca negativo. El índice
+  `payments_one_paid_per_occurrence_idx` ya existente es la red contra
+  doble cobro concurrente (`unique_violation` → `ALREADY_PAID`). Si no
+  existe `Booking` todavía, la crea en la misma transacción (mismo camino
+  interno que `admin_book_for_customer`) — o quedan `Payment PAID` +
+  `Booking CONFIRMED` juntos, o no queda nada.
+- `agenda_occurrences()`/el detalle de asistentes se extienden
+  (patrón aditivo, `drop function` + `create function`) con
+  `drop_in_plan_id, drop_in_price, drop_in_currency` por ocurrencia y
+  `is_covered, paid_payment_id` por asistente.
+
+**Impacto**: `backend-engineer` implementa la migración.
+`frontend-engineer` agrega "Cobrar $X" (o badge "Pagado") junto a cada
+asistente en `occurrence-actions.tsx`, y "Anotar y cobrar" en la sección
+de anotar cliente; nueva server action en `app/actions/`. **Gate
+obligatorio de `security-engineer`** — toca pagos y fronteras
+multi-tenant: foco en (a) pertenencia de `customer_id`/ocurrencia a la
+misma organización, (b) que el cliente nunca pueda fijar `amount` ni
+plan y que la RPC no sea invocable sin el permiso de staff, (c) orden de
+locks bajo concurrencia (doble cobro, sobre-reserva), (d) que
+`quote_booking` no filtre precios/cobertura de otro cliente o otra
+organización. Independiente de ADR-0044/0045, pero se recomienda
+mergearla antes de ADR-0047 (ambas tocan `book_slot()`/el árbol de
+reserva y un merge en paralelo garantiza conflicto).
+
+**Corrección post-gate de seguridad (2026-09-30).** El gate encontró dos
+hallazgos ALTO reales, ya corregidos y verificados en vivo contra
+`reservaste-stg` (11/11 tests en verde, incluidos 3 tests de regresión
+nuevos):
+
+1. **Fuga cross-tenant en `resolve_active_drop_in_plan()`**: la función
+   no filtraba por `organization_id` — un plan `DROP_IN` con
+   `applies_to_all_services=true` de CUALQUIER organización matcheaba
+   todos los servicios de la plataforma (verificado en vivo: el precio
+   de un tenant ajeno aparecía en `agenda_occurrences`/`quote_booking` de
+   otro, y `book_slot_paying` abortaba — un DoS del cobro para todos los
+   tenants). Fix: `join services` + filtro explícito por
+   `sp.organization_id = s.organization_id`.
+2. **El permiso de esta ADR estaba mal** — no es `MANAGE_BOOKINGS` como
+   decía el punto 1 más arriba, es **`MANAGE_PAYMENTS`** (el mismo que ya
+   exige la policy `payments_insert_staff` de Fase 32 para insertar
+   cualquier pago). Con sólo `MANAGE_BOOKINGS`, un rol configurado a
+   propósito sin permiso de cobro (ADR-0033) podía registrar un
+   `Payment PAID` con `p_amount=0`, esquivando el `PAYMENT_REQUIRED` que
+   `admin_book_for_customer()` le devuelve al mismo rol — verificado en
+   vivo. `book_slot_paying()` ahora exige `MANAGE_PAYMENTS` siempre (por
+   escribir un `Payment`) y `MANAGE_BOOKINGS` adicionalmente sólo si hace
+   falta crear la `Booking` (mismo criterio de Fase 34: un cajero con
+   `MANAGE_PAYMENTS` puede cobrar un turno ya anotado, pero no anotar uno
+   nuevo).
+3. **MEDIO, también corregido**: `p_amount = 'NaN'::numeric` no es `< 0`
+   en Postgres y `numeric(12,2)` lo acepta — sin chequeo explícito
+   quedaba un `PAID` con `amount NaN`, envenenando cualquier `sum()` de
+   reportes. Fix: `v_amount is null or v_amount = 'NaN' or v_amount < 0`
+   → `INVALID_AMOUNT`.
+
+**Dos hallazgos menores, decisión del Orchestrator, ninguno bloqueante**:
+- **Pre-existente, no introducido por esta ADR**: `evaluate_payment_coverage()`
+  (Fase 22) usa un `exists` sobre `service_plans` sin filtro de
+  organización para decidir entre devolver `SERVICE_HAS_NO_PLAN` o
+  `PAYMENT_REQUIRED` — un plan global de otra organización puede cambiar
+  cuál de los dos `reason` ve un tenant ajeno. No filtra datos ni
+  habilita ninguna reserva/cobro indebido, sólo el texto del motivo
+  mostrado. **Aceptado como deuda técnica separada**, a resolver en una
+  fase propia (no forma parte del alcance de ADR-0046) — anotado en
+  `docs/security.md`.
+- **Edge case de negocio, severidad baja, aceptado**: un cliente con un
+  plan `UNLIMITED` vigente en un servicio **gratuito** (`payment_required
+  = false`) puede igual recibir un cobro `DROP_IN` si el staff invoca
+  `book_slot_paying` a propósito — el re-chequeo de cobertura está
+  gateado por `payment_required`, no por "¿tiene algún plan vigente?".
+  Es un doble cobro iniciado deliberadamente por el staff (no un bypass
+  de seguridad ni algo que un cliente pueda gatillar), y requeriría que
+  el negocio tenga simultáneamente un servicio gratuito Y un `DROP_IN`
+  activo sobre ese mismo servicio — configuración rara. Se acepta el
+  riesgo tal cual por ahora; si aparece en producción, se resuelve
+  extendiendo el re-chequeo de cobertura a mirar planes de período
+  incluso en servicios gratuitos.
+
+`docs/database.md`/`docs/security.md` actualizados con el detalle
+completo y las reglas de la Fase 44 corregida.
+
+---
+
+## ADR-0047 — Reserva abierta: alta de `Customer` en el momento de reservar, detrás de un flag
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario, diseñada por `Plan`. **Priorizada explícitamente
+para la primera semana de trabajo** (no la segunda, como recomendaba el
+plan original) — decisión del usuario tras confirmar que es el
+bloqueante comercial más visible (una auditoría previa ya lo había
+marcado como el punto #1: hoy ningún cliente nuevo puede reservar sin
+que el dueño lo dé de alta a mano primero, lo cual además contradice el
+FAQ de la propia landing page, que dice "sólo necesitan una cuenta
+simple").
+
+**Problema:** `can_customer_book()` devuelve `NOT_A_CUSTOMER` para
+cualquier cuenta autenticada que no sea ya `Customer` activo de esa
+organización — no existe ningún camino de autoservicio, ni ningún flag
+para relajarlo. Confirmado que esto es así por diseño desde ADR-0005/
+ADR-0022, no un bug.
+
+**Decisión — columna `organizations.open_booking_enabled boolean not
+null default false`**, mismo patrón ya establecido 3 veces en este
+proyecto (`makeup_credits_enabled`, `customer_activation_enabled`,
+`public_availability_display`): flag opt-in por organización, default
+que no cambia comportamiento existente, editable desde Configuración con
+el mismo mecanismo de checkbox+hidden-input+`formData.has()` que ya usa
+`settings-form.tsx`/`actions/settings.ts` — la policy
+`organizations_update_owner` ya alcanza como control de acceso, sin RPC
+nueva para el flag en sí.
+
+**El alta on-the-fly vive DENTRO de `book_slot()`, nunca dentro de
+`can_customer_book()`** — decisión de diseño explícita y no trivial: 
+`can_customer_book()`/`evaluate_customer_booking()` se invocan también
+desde `preview_recurring_booking()` y `can_customer_book_detail()` en
+contextos de **preview de solo lectura**, sin intención real de reservar.
+Si el alta viviera ahí, un preview inocente crearía `Customer`s reales
+como side-effect no deseado. `book_slot()` ya toma `FOR UPDATE` sobre la
+ocurrencia en el intento real de reserva — es el único lugar seguro.
+Mecánica exacta: después del lock de la ocurrencia y antes de invocar
+`can_customer_book()`, si no hay `Customer` activo para `(org,
+auth.uid())`, el flag está prendido y pasa el rate limit (ver abajo), se
+inserta `customers(organization_id, profile_id=auth.uid(),
+display_name=profiles.full_name, is_active=true, source='SELF_SERVICE')`
+dentro de la misma transacción que la reserva — si la reserva falla
+después (sin cupo, sin cobertura), el rollback revierte también el alta,
+así que nunca quedan `Customer`s huérfanos. Concurrencia (dos pestañas):
+maneja `unique_violation` sobre `(organization_id, profile_id)` con
+re-select. **Si existe un `Customer` inactivo para ese `profile_id`, NO
+se reactiva** — `NOT_A_CUSTOMER` igual; si el staff lo dio de baja, la
+reserva abierta no puede pasar por encima de esa decisión.
+
+`can_customer_book()` cambia sólo su código de retorno en este caso: con
+el flag prendido y sin `Customer`, devuelve un reason nuevo (ej.
+`OK_OPEN_BOOKING`) en vez de `NOT_A_CUSTOMER`, para que la UI pública
+muestre "Reservar" en vez del mensaje de "escribile al negocio". La
+cobertura de pago se evalúa como si fuera un `Customer` nuevo, sin
+planes ni créditos previos — si el servicio exige pago, el resultado es
+`PAYMENT_REQUIRED` normalmente.
+
+**Regla de seguridad citada explícitamente, por ser la más relevante de
+esta zona** (`docs/security.md`, regla ya establecida en el gate de
+ADR-0043): *"El email de `auth.users` es un factor de conocimiento,
+nunca de posesión."* El alta on-the-fly se basa exclusivamente en
+`auth.uid()` de la sesión ya autenticada (mismo patrón IDOR-proof de
+ADR-0005) — **nunca** busca ni vincula un `Customer` gestionado
+preexistente por email (ADR-0026). Si ya existe un `Customer` gestionado
+con el mismo email sin `profile_id`, se crea uno nuevo (duplicado a
+fusionar por el staff más adelante) en vez de vincular por email — un
+duplicado es preferible a un vínculo no verificado.
+
+**Riesgo heredado de ADR-0043, nombrado explícitamente y mitigado**:
+desde que el signup no tiene confirmación de email, "reservar" con este
+flag prendido baja a "pasar el captcha de Turnstile". Mitigaciones
+obligatorias en esta misma fase:
+1. Rate limit dentro de la RPC, mismo patrón que
+   `issue_customer_activation()` (`phase21:335-353`): tope de altas
+   on-the-fly por `auth.uid()` en 24h, y tope por organización por hora.
+2. El `Customer` creado lleva `source='SELF_SERVICE'` para que el staff
+   pueda filtrarlo/limpiarlo.
+3. El flag es opt-in — la organización acepta el riesgo residual al
+   prenderlo, con el texto de advertencia correspondiente en Settings.
+
+**Impacto**: `backend-engineer` implementa
+`phase45_open_booking.sql` (recrea `book_slot()` desde la versión
+vigente de `phase20`). `frontend-engineer` agrega el checkbox en
+Settings y ajusta el flujo público de reserva para tratar
+`OK_OPEN_BOOKING` como reservable. **Gate obligatorio de
+`security-engineer`, el más importante de todo este lote** — foco en:
+(a) que `organization_id` salga siempre de la ocurrencia, nunca de un
+input del caller; (b) el rate limit; (c) la no-reactivación de cuentas
+inactivas; (d) la ausencia total de vínculo por email; (e) un test
+explícito de que los caminos de preview NO crean `Customer`s con el flag
+prendido; (f) si hace falta un tope de reservas futuras activas por
+`Customer` `SELF_SERVICE` para acotar el abuso de cupo con cuentas
+descartables. Se recomienda mergear después de ADR-0046 (ambas tocan
+`book_slot()`) para evitar conflicto de merge garantizado si van en
+paralelo.
+
+---
+
+## ADR-0048 — Disponibilidad pública por recurso (opt-in)
+
+Fecha: 2026-09-30
+Estado: **Aceptada**
+Propuesta por: usuario, diseñada por `Plan`.
+
+**Problema:** `get_public_availability()` nunca devolvió `resource_id`
+ni el nombre del recurso — un cliente que reserva no puede elegir "con
+quién" (ej. qué barbero). El RPC equivalente de staff
+(`agenda_occurrences()`) sí lo expone; sólo falta en el camino público.
+
+**Decisión**: agregar al final del `returns table` (patrón aditivo ya
+usado 3 veces: fase 5, 16, 20) `resource_id uuid, resource_name text`.
+`resource_id` siempre se devuelve (es opaco, sirve para agrupar/filtrar
+sin revelar nada). `resource_name` **sólo se devuelve si
+`organizations.public_resource_names boolean not null default false`
+está prendido**; si no, `null`. Es una regla de disclosure nueva,
+análoga en espíritu a ADR-0008 pero sobre identidad en vez de cupo: si el
+recurso es una persona, su nombre es un dato que hoy nunca salió por
+`anon`, y no debería empezar a salir por default silenciosamente.
+
+**Impacto**: `backend-engineer` implementa
+`phase46_public_availability_resource.sql` (`drop function` + `create
+function`, grants re-emitidos a `anon, authenticated`).
+`frontend-engineer` mapea las columnas nuevas a mano en
+`app/actions/public.ts` (el paquete `@reservaste/domain` está fijado a
+un commit SHA, no a HEAD — mismo patrón ya usado 2 veces cuando esto
+pasa) y agrega un selector "Con quién" en la reserva pública cuando haya
+más de un recurso y el flag esté prendido, con "Cualquiera" como
+comportamiento por default. **Gate liviano de `security-engineer`** (es
+una RPC `anon`): confirmar que no se filtra nada más de `resources`
+(ej. `description`) y que el flag se lee de la organización correcta.
+Tiene más sentido después de ADR-0044 (recursos exclusivos) pero es
+técnicamente independiente — no bloqueante para la primera venta (con un
+servicio por profesional, ej. "Corte con Juan", se puede operar sin
+esto).
+
+---
+
+## Plan de generalización a turno individual — orden y alcance mínimo
+
+Fecha: 2026-09-30
+
+Registro de coordinación para ADR-0044 a ADR-0048 (más dos ajustes
+menores sin ADR propia, ver abajo) — no es una ADR nueva, es el mapa de
+secuenciación acordado con el usuario tras la auditoría de qué tan
+genérico es el sistema.
+
+**Orden acordado** (reordenado tras la decisión explícita del usuario de
+priorizar ADR-0047 — reserva abierta — en la primera semana, no la
+segunda como recomendaba el plan original, aceptando que el gate de
+seguridad puede estirar el tiempo):
+
+1. ADR-0044 (recursos exclusivos) — base de todo lo demás.
+2. ADR-0045 (generador por franja) — depende de 0044 mergeada.
+3. ADR-0046 (cobrar turno, sólo mostrador) — independiente, en paralelo
+   con 1-2.
+4. ADR-0047 (reserva abierta) — después de 0046 (ambas tocan
+   `book_slot()`).
+5. ADR-0048 (con quién) — no bloqueante, puede ir después o en paralelo
+   si sobra tiempo.
+
+**Dos ajustes menores, sin migración ni ADR propia, sólo `reviewer`**:
+- Ocultar la pestaña "Créditos" del portal del cliente
+  (`frontend/components/me-nav.tsx`) cuando `makeup_credits_enabled` esté
+  apagado para todas las organizaciones del usuario — el flag ya existe
+  en el backend, sólo falta que el frontend lo respete visualmente.
+  Revisar también el copy de "clase"/"liberar cupo" en `app/me/*`.
+- ~20 strings de copy con "clase"/"CrossFit"/"Iron Gym"/"socio" en
+  placeholders y empty states pasan a términos neutros.
+
+**Confirmado con el usuario**: cobro sólo por mostrador (sin pasarela de
+pago online) alcanza para la primera venta — ADR-0027 (integrar una
+pasarela real) sigue fuera de alcance y no se menciona a la barbería como
+disponible.
+
+**Alcance mínimo honesto para la primera semana**: recurso exclusivo por
+profesional, agenda armada por franja horaria en vez de 40 formularios,
+cobro registrado por mostrador, y reserva abierta para que un cliente
+nuevo pueda reservar por link sin alta manual previa — con el gate de
+seguridad de ADR-0047 corrido con el mismo rigor de siempre, sin
+recortar pasos aunque apriete el tiempo.
+
+---
+
+## ADR-0049 — `Organization.industry`: rubro declarado, puramente informativo
+
+Fecha: 2026-09-30
+Estado: **Propuesta** (documentada para revisión, no implementada —
+sesión en fase de revisión de plan, sin luz verde de implementación
+todavía)
+Propuesta por: usuario ("quiero entender el rubro de mi cliente, eso
+debe estar documentado").
+
+**Problema:** el usuario, como dueño del SaaS, quiere poder identificar
+el rubro de cada `Organization` que usa la plataforma (gimnasio,
+barbería, consultorio, cancha, etc.) — para su propio entendimiento de
+negocio, analytics, y poder filtrar/segmentar sus clientes. Hoy no existe
+ningún campo así.
+
+**Tensión con la regla no-negociable de `CLAUDE.md`** ("nunca introducir
+Gym/Member/Trainer/Class como modelo central"): esa regla prohíbe que el
+rubro determine COMPORTAMIENTO del sistema (ninguna rama de código del
+tipo "si es gimnasio, hacé X"), pero no prohíbe un campo puramente
+descriptivo que nunca participa de ninguna decisión de lógica de negocio
+— exactamente como `Organization.name` no es "modelo central" aunque
+contenga texto libre elegido por el negocio.
+
+**Decisión: `organizations.industry text` nullable, sin ningún CHECK que
+lo restrinja a una lista cerrada** (texto libre, con una lista de
+sugerencias en el frontend tipo autocomplete/datalist, no un enum de
+base de datos) — para que un rubro nuevo (ej. "estudio de tatuajes") no
+requiera una migración. Comentario explícito en la columna, citando
+`CLAUDE.md`, dejando por escrito que **ninguna función, policy, ni
+componente del frontend puede leer esta columna para cambiar
+comportamiento** — sólo se lee para mostrarla (en el panel de admin del
+propio negocio, y en cualquier vista interna/analítica que el usuario
+quiera armar a futuro, ej. un dashboard de "mis clientes por rubro").
+
+**Por qué texto libre y no enum**: un enum fijo (`GYM | BARBERSHOP |
+CLINIC | ...`) reintroduce exactamente la taxonomía de rubros que el
+proyecto evita a propósito — aunque sea sólo para mostrar, un enum que
+crece requiere tocar el schema cada vez que aparece un rubro nuevo, y
+empuja a alguien, en el futuro, a la tentación de hacer `if industry ===
+'GYM'`. Texto libre sin CHECK no tiene ese imán.
+
+**Impacto (cuando se implemente)**: `database-agent`/`backend-engineer`
+agrega la columna (migración chica, sin RPC nueva — un `select`/`update`
+directo alcanza, mismo criterio que otros campos simples de
+`Organization`). `frontend-engineer` agrega el campo al onboarding
+(opcional, no bloqueante) y a Configuración. No requiere gate de
+`security-engineer` (dato no sensible, mismo nivel que el nombre del
+negocio). Sin dependencias con ADR-0044 a ADR-0048.
+
+**Pendiente**: el usuario todavía no dio luz verde para implementar esto
+— queda documentado como próximo ítem del backlog de generalización,
+a la espera de que se confirme cuándo entra en la cola de trabajo.

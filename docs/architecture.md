@@ -328,6 +328,97 @@ leyendo esto en vez de adivinar de nuevo.
     fechas a la vez y la categorización de tres vías ahí sería ruido, no
     señal.
 
+## Pase de corrección post-Fase L (2026-09-22)
+
+Una auditoría de UX (`ux-ui-designer`, revisión estática, sin `next dev`) sobre
+las pantallas ya desplegadas encontró bugs reales, no solo pulido: dos server
+actions (`setSubscription`, `markAttendance`) ignoraban el `error` del
+`.rpc()` y fallaban en silencio, `SubscriptionControls` suspendía/reactivaba
+una organización sin confirmación ni feedback de error, y el roll-call de
+asistencia no revertía ni avisaba si `markAttendance` fallaba. Corregido con
+el mismo patrón `{ error: string | null }` que ya usa `services.ts`.
+
+Un detalle vale la pena dejar escrito porque puede repetirse: al arreglar el
+revert de `RollCall`, el primer intento cambió `useOptimistic` por
+`useState(initialAttendees)` para poder revertir a mano con un `previous`
+capturado. `security-engineer` y `qa-engineer`, en paralelo y sin verse,
+encontraron el mismo problema: sin `key` en el padre, `useState` nunca vuelve
+a leer la prop después del mount, así que la pantalla queda congelada frente
+a cualquier `revalidatePath` ajeno (otra cancelación, otro dispositivo
+marcando el mismo turno). La solución correcta no fue agregar un `key` ni un
+efecto de resync manual: fue **no abandonar `useOptimistic`** — se re-basa en
+la prop en cada render fuera de una transición, y al fallar cae solo al valor
+real sin revert manual ni riesgo de que una respuesta fuera de orden pise una
+marca posterior. El error se guarda aparte, en un `useState` propio que no
+participa del reducer optimista. Regla general: si una pantalla ya usa
+`useOptimistic` y hace falta agregar manejo de error, la respuesta casi nunca
+es reemplazarlo por `useState` — es sumarle un estado de error al lado.
+
+También se corrigió el copy de confirmación de suspender/reactivar una
+organización: decía que cortaba el panel y las reservas existentes, y
+`subscription_status` en realidad solo bloquea **crear** entidades nuevas
+(triggers `BEFORE INSERT`) — el panel y las reservas ya confirmadas siguen
+funcionando. Qué debería significar "suspender" de verdad queda como pregunta
+de producto abierta, no resuelta acá.
+
+Se agregaron `app/error.tsx`/`app/not-found.tsx` (no existían: cualquier
+fallo no controlado caía en la página default de Next, sin marca) y
+`loading.tsx` en las 9 rutas de mayor tráfico que no tenían ningún estado de
+carga — de ~60 pantallas, antes de este pase solo `plans/page.tsx` manejaba
+los 4 estados (loading/error/vacío/éxito) completos. Se terminó la migración
+a `DataList` que el punto 10 de arriba dejó incompleta (`me/page.tsx`,
+`me/servicios/page.tsx`, lista de organizaciones en `admin/page.tsx`), y se
+sumó densidad `touch` en `activation-panel.tsx` y la consola de plataforma —
+instancias nuevas de esa deuda, construidas después del barrido original.
+
+Sigue pendiente, sin cambios por este pase: verificación visual con
+`next dev`/sesión real (Fase M), y el resto de la densidad `touch` del panel
+admin (Clientes, Pagos, Servicios, Recursos, Equipo como listas).
+
+## Suite E2E de humo post-deploy (ADR-0039)
+
+`frontend/e2e/` (Playwright + `@axe-core/playwright`): corre después de cada
+deploy de `frontend`, contra el sitio real (`smoke-e2e` en
+`frontend/.github/workflows/ci.yml`, `needs: deploy`, sin gate hacia atrás —
+si falla, el deploy ya pasó y nada se bloquea, pero el workflow queda en
+rojo, visible). `frontend/e2e/playwright.config.ts` fija `baseURL` desde
+`PLAYWRIGHT_BASE_URL` (default la URL del droplet), un solo proyecto
+chromium, `workers: 1` sin paralelismo.
+
+Corre contra la organización `redentor`, permanente y compartida (no una
+organización descartable por corrida). `frontend/e2e/helpers.ts` documenta
+por qué y trae los helpers ya resueltos (login contra el server action real,
+lectura de "Anotados (N)" a prueba de `text-transform: uppercase`,
+find-or-create de fixtures, prorrateo de pagos). Dos reglas no negociables
+para cualquier spec nuevo acá:
+
+- **Buscar antes de crear.** Los recursos/servicios/planes/clientes de
+  `redentor` ya existen (creados a mano una vez); un spec nuevo los busca
+  por nombre y sólo crea si falta. Crearlos de nuevo en cada corrida es el
+  bug, no una corrida más segura.
+- **Limpiar lo que se ensucia, en el mismo test.** No hay `DELETE` para casi
+  nada de este dominio (ADR-0036/0037): "limpiar" es cancelar la reserva,
+  anular el pago, revocar la invitación — nunca borrar filas. Un cupo de
+  equipo sin revocar o una reserva sin cancelar rompe la corrida siguiente
+  por una razón que no tiene nada que ver con lo que ese spec prueba. Los
+  specs con estado propio limpian en `finally`/`try`-`catch` para que un
+  fallo de aserción no tape el cleanup.
+
+También documentado ahí, porque costó una trampa real operando la app a
+mano antes de escribir la suite: un turno cuyo horario ya pasó
+(`CalendarEvent.past`, `schedule-calendar.tsx`) se renderiza siempre en un
+tono neutro plano sin importar su ocupación — a propósito, no un bug — así
+que cualquier spec sobre color de ocupación tiene que ubicar la *próxima
+ocurrencia futura* del horario que le interesa (nunca una fecha
+hardcodeada).
+
+Sin capturas de referencia (ADR-0039, resolución 2): la "consistencia
+visual" se automatiza como axe-core (umbral `serious`/`critical`, no
+`moderate`/`minor` — documentado en `consistency.spec.ts`), ausencia de
+scroll horizontal a 390px, y presencia del patrón `EmptyState` real
+(`data-slot="empty-state"`, agregado a `components/ui/empty-state.tsx` para
+que un test pueda ubicarlo sin depender de un texto que puede cambiar).
+
 ## Próximos pasos
 
 Arrancar Phase 1 (`roadmap.md`): Auth + Organizations + Roles, con el
