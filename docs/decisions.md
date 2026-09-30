@@ -3874,6 +3874,63 @@ organización. Independiente de ADR-0044/0045, pero se recomienda
 mergearla antes de ADR-0047 (ambas tocan `book_slot()`/el árbol de
 reserva y un merge en paralelo garantiza conflicto).
 
+**Corrección post-gate de seguridad (2026-09-30).** El gate encontró dos
+hallazgos ALTO reales, ya corregidos y verificados en vivo contra
+`reservaste-stg` (11/11 tests en verde, incluidos 3 tests de regresión
+nuevos):
+
+1. **Fuga cross-tenant en `resolve_active_drop_in_plan()`**: la función
+   no filtraba por `organization_id` — un plan `DROP_IN` con
+   `applies_to_all_services=true` de CUALQUIER organización matcheaba
+   todos los servicios de la plataforma (verificado en vivo: el precio
+   de un tenant ajeno aparecía en `agenda_occurrences`/`quote_booking` de
+   otro, y `book_slot_paying` abortaba — un DoS del cobro para todos los
+   tenants). Fix: `join services` + filtro explícito por
+   `sp.organization_id = s.organization_id`.
+2. **El permiso de esta ADR estaba mal** — no es `MANAGE_BOOKINGS` como
+   decía el punto 1 más arriba, es **`MANAGE_PAYMENTS`** (el mismo que ya
+   exige la policy `payments_insert_staff` de Fase 32 para insertar
+   cualquier pago). Con sólo `MANAGE_BOOKINGS`, un rol configurado a
+   propósito sin permiso de cobro (ADR-0033) podía registrar un
+   `Payment PAID` con `p_amount=0`, esquivando el `PAYMENT_REQUIRED` que
+   `admin_book_for_customer()` le devuelve al mismo rol — verificado en
+   vivo. `book_slot_paying()` ahora exige `MANAGE_PAYMENTS` siempre (por
+   escribir un `Payment`) y `MANAGE_BOOKINGS` adicionalmente sólo si hace
+   falta crear la `Booking` (mismo criterio de Fase 34: un cajero con
+   `MANAGE_PAYMENTS` puede cobrar un turno ya anotado, pero no anotar uno
+   nuevo).
+3. **MEDIO, también corregido**: `p_amount = 'NaN'::numeric` no es `< 0`
+   en Postgres y `numeric(12,2)` lo acepta — sin chequeo explícito
+   quedaba un `PAID` con `amount NaN`, envenenando cualquier `sum()` de
+   reportes. Fix: `v_amount is null or v_amount = 'NaN' or v_amount < 0`
+   → `INVALID_AMOUNT`.
+
+**Dos hallazgos menores, decisión del Orchestrator, ninguno bloqueante**:
+- **Pre-existente, no introducido por esta ADR**: `evaluate_payment_coverage()`
+  (Fase 22) usa un `exists` sobre `service_plans` sin filtro de
+  organización para decidir entre devolver `SERVICE_HAS_NO_PLAN` o
+  `PAYMENT_REQUIRED` — un plan global de otra organización puede cambiar
+  cuál de los dos `reason` ve un tenant ajeno. No filtra datos ni
+  habilita ninguna reserva/cobro indebido, sólo el texto del motivo
+  mostrado. **Aceptado como deuda técnica separada**, a resolver en una
+  fase propia (no forma parte del alcance de ADR-0046) — anotado en
+  `docs/security.md`.
+- **Edge case de negocio, severidad baja, aceptado**: un cliente con un
+  plan `UNLIMITED` vigente en un servicio **gratuito** (`payment_required
+  = false`) puede igual recibir un cobro `DROP_IN` si el staff invoca
+  `book_slot_paying` a propósito — el re-chequeo de cobertura está
+  gateado por `payment_required`, no por "¿tiene algún plan vigente?".
+  Es un doble cobro iniciado deliberadamente por el staff (no un bypass
+  de seguridad ni algo que un cliente pueda gatillar), y requeriría que
+  el negocio tenga simultáneamente un servicio gratuito Y un `DROP_IN`
+  activo sobre ese mismo servicio — configuración rara. Se acepta el
+  riesgo tal cual por ahora; si aparece en producción, se resuelve
+  extendiendo el re-chequeo de cobertura a mirar planes de período
+  incluso en servicios gratuitos.
+
+`docs/database.md`/`docs/security.md` actualizados con el detalle
+completo y las reglas de la Fase 44 corregida.
+
 ---
 
 ## ADR-0047 — Reserva abierta: alta de `Customer` en el momento de reservar, detrás de un flag
@@ -4057,3 +4114,58 @@ cobro registrado por mostrador, y reserva abierta para que un cliente
 nuevo pueda reservar por link sin alta manual previa — con el gate de
 seguridad de ADR-0047 corrido con el mismo rigor de siempre, sin
 recortar pasos aunque apriete el tiempo.
+
+---
+
+## ADR-0049 — `Organization.industry`: rubro declarado, puramente informativo
+
+Fecha: 2026-09-30
+Estado: **Propuesta** (documentada para revisión, no implementada —
+sesión en fase de revisión de plan, sin luz verde de implementación
+todavía)
+Propuesta por: usuario ("quiero entender el rubro de mi cliente, eso
+debe estar documentado").
+
+**Problema:** el usuario, como dueño del SaaS, quiere poder identificar
+el rubro de cada `Organization` que usa la plataforma (gimnasio,
+barbería, consultorio, cancha, etc.) — para su propio entendimiento de
+negocio, analytics, y poder filtrar/segmentar sus clientes. Hoy no existe
+ningún campo así.
+
+**Tensión con la regla no-negociable de `CLAUDE.md`** ("nunca introducir
+Gym/Member/Trainer/Class como modelo central"): esa regla prohíbe que el
+rubro determine COMPORTAMIENTO del sistema (ninguna rama de código del
+tipo "si es gimnasio, hacé X"), pero no prohíbe un campo puramente
+descriptivo que nunca participa de ninguna decisión de lógica de negocio
+— exactamente como `Organization.name` no es "modelo central" aunque
+contenga texto libre elegido por el negocio.
+
+**Decisión: `organizations.industry text` nullable, sin ningún CHECK que
+lo restrinja a una lista cerrada** (texto libre, con una lista de
+sugerencias en el frontend tipo autocomplete/datalist, no un enum de
+base de datos) — para que un rubro nuevo (ej. "estudio de tatuajes") no
+requiera una migración. Comentario explícito en la columna, citando
+`CLAUDE.md`, dejando por escrito que **ninguna función, policy, ni
+componente del frontend puede leer esta columna para cambiar
+comportamiento** — sólo se lee para mostrarla (en el panel de admin del
+propio negocio, y en cualquier vista interna/analítica que el usuario
+quiera armar a futuro, ej. un dashboard de "mis clientes por rubro").
+
+**Por qué texto libre y no enum**: un enum fijo (`GYM | BARBERSHOP |
+CLINIC | ...`) reintroduce exactamente la taxonomía de rubros que el
+proyecto evita a propósito — aunque sea sólo para mostrar, un enum que
+crece requiere tocar el schema cada vez que aparece un rubro nuevo, y
+empuja a alguien, en el futuro, a la tentación de hacer `if industry ===
+'GYM'`. Texto libre sin CHECK no tiene ese imán.
+
+**Impacto (cuando se implemente)**: `database-agent`/`backend-engineer`
+agrega la columna (migración chica, sin RPC nueva — un `select`/`update`
+directo alcanza, mismo criterio que otros campos simples de
+`Organization`). `frontend-engineer` agrega el campo al onboarding
+(opcional, no bloqueante) y a Configuración. No requiere gate de
+`security-engineer` (dato no sensible, mismo nivel que el nombre del
+negocio). Sin dependencias con ADR-0044 a ADR-0048.
+
+**Pendiente**: el usuario todavía no dio luz verde para implementar esto
+— queda documentado como próximo ítem del backlog de generalización,
+a la espera de que se confirme cuándo entra en la cola de trabajo.

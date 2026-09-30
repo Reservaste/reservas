@@ -1473,7 +1473,7 @@ Ninguna cambió de firma.
 | Permiso | RPCs |
 |---|---|
 | `VIEW_PAYMENTS` | `organization_payment_summary()`, `customer_payment_detail()`, `organization_plan_change_requests()` |
-| `MANAGE_PAYMENTS` | `set_payment_status()`, `resolve_plan_change_request()` |
+| `MANAGE_PAYMENTS` | `set_payment_status()`, `resolve_plan_change_request()`, `book_slot_paying()` (Fase 44, ADR-0046 — además exige `MANAGE_BOOKINGS` si hace falta crear la `Booking`) |
 | `MANAGE_BOOKINGS` | `admin_book_for_customer()`, `admin_create_recurring_booking()`, `admin_preview_recurring_booking()`, `cancel_booking()` (rama de staff), `cancel_recurring_booking()` (rama de staff), `cancel_slot_occurrence()`, `retry_not_generated_booking()` (rama de staff) |
 | `MANAGE_CUSTOMERS` | `create_managed_customer()`, `enroll_customer_by_email()`, `issue_customer_activation()`, `revoke_customer_activation()` |
 | `MANAGE_ATTENDANCE` | `mark_attendance()` |
@@ -2839,3 +2839,378 @@ incorporados arriba y verificados con la suite de integración completa (`npx su
 db reset` + `npm run test:integration`, 9/9 tests de esta fase en verde). Falta que
 `security-engineer` vuelva a correr el gate sobre esta versión corregida antes de
 desplegar.
+
+## Fase 41 — corrección post-review de seguridad de ADR-0043 (migración `20260929140000_phase41_adr0043_post_review_hardening.sql`)
+
+Implementa los puntos 1 y 2 de la sección "Corrección post-review de seguridad" de
+ADR-0043 (`docs/decisions.md`): el gate de `security-engineer` sobre esa ADR encontró
+tres caminos reales hacia acceso de `OWNER` en un negocio ajeno, habilitados por
+`enable_confirmations = false` (ADR-0043 base). Esta fase cierra los caminos 1 y 2. El
+camino 3 (usuarios viejos sin confirmar) es una auditoría manual, documentada en la ADR
+para copiar/pegar antes de apagar el toggle en producción — no es una migración.
+
+### 1. `EXECUTE` revocado de `invite_member_by_email()` y `enroll_customer_by_email()`
+
+```sql
+revoke execute on function public.invite_member_by_email(
+  uuid, text, public.organization_member_role, uuid
+) from anon, authenticated, service_role;
+
+revoke execute on function public.enroll_customer_by_email(uuid, text)
+  from anon, authenticated, service_role;
+```
+
+Las dos funciones **no se borran** — siguen definidas en `20260914184943_phase8_admin_operations.sql` /
+`20260923230300_phase32_configurable_roles.sql`, sin cambios de cuerpo — sólo pierden
+todo camino de invocación. Investigado antes de decidir el alcance del revoke (incluir
+`service_role`, no sólo `anon`/`authenticated`): ningún caller de este repo (tests,
+`frontend/app/actions/admin.ts`) las invoca con el cliente `service_role`; todos usan la
+sesión del usuario autenticado. Y de hecho `service_role` **ya no tenía** `EXECUTE`
+sobre ninguna de las dos desde la Fase 19 (`20260922160000_phase19_security_fixes.sql:526-527`
+revocó el grant heredado del default de Supabase para `public`/`anon`, y ningún
+`create or replace`/`drop + create` posterior de las dos, en la Fase 32, le devolvió
+nada a `service_role`) — el `revoke` explícito de esta fase documenta ese estado y evita
+que una migración futura se lo devuelva por accidente (mismo patrón que
+`retry_not_generated_booking()`, Fase 19).
+
+Reemplazos ya existentes, sin depender de "el email prueba identidad":
+`invite_member_by_email()` → invitación de equipo por token (ADR-0034,
+`claim_team_invitation()`, `/equipo/[token]`); `enroll_customer_by_email()` →
+activación de cliente gestionado por link de WhatsApp (ADR-0026,
+`issue_customer_activation()` / `claim_customer_activation()`).
+
+**Cambio de contrato, coordinado con `frontend-engineer`**: `frontend/app/actions/admin.ts`
+(`enrollCustomer()`, `inviteMember()`) llama a las dos RPC con la sesión del usuario —
+después de esta migración ambas devuelven `42501 permission denied` en vez del
+comportamiento anterior. La UI que las invoca se saca o se redirige al flujo por token
+(trabajo de `frontend-engineer`, no cubierto por esta fase).
+
+Los ~8 tests de integración que antes ejercitaban estas dos RPC como fixture (crear un
+`Customer`/`STAFF` de prueba) pasaron a escribir directo en `customers`/
+`organization_members` con el cliente del `OWNER` (misma política
+`organization_members_write_owner` que ya usaba `test/phase32.configurable-roles.test.ts`)
+o con `admin` (`service_role`); los que probaban el comportamiento propio de las RPC
+(reactivación por email, chequeo `NOT_AUTHORIZED`/`PROFILE_NOT_FOUND` interno, soporte de
+3 vs. 4 argumentos) se reemplazaron por una aserción de `error.code === '42501'`, porque
+esa lógica interna quedó inalcanzable para cualquier caller.
+
+### 2. Trigger sobre `auth.identities` contra el secuestro vía Google OAuth
+
+El problema (verificado en vivo por `security-engineer`, ver ADR-0043): GoTrue sólo
+purga identidades sin confirmar al vincular una identidad OAuth nueva a un email ya
+registrado cuando la identidad existente está sin confirmar. Con
+`enable_confirmations = false` toda cuenta por contraseña queda confirmada al crearse,
+así que esa purga nunca se dispara — GoTrue en cambio hace su vinculación normal
+"por email ya verificado", atando la identidad Google nueva al mismo `user_id` que ya
+tenía la contraseña. Si esa cuenta la creó un atacante ocupando el Gmail de una futura
+dueña, la dueña real termina autenticada, vía "Continuar con Google", dentro de la
+cuenta del atacante.
+
+```sql
+create or replace function public.check_identity_link_not_oauth_hijack()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.provider <> 'email' and exists (
+    select 1 from auth.identities
+    where user_id = new.user_id and provider = 'email'
+  ) then
+    raise exception 'OAUTH_LINK_BLOCKED_EXISTING_PASSWORD_IDENTITY' using errcode = 'P0001', ...;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger auth_identities_block_oauth_hijack
+  before insert on auth.identities
+  for each row execute function public.check_identity_link_not_oauth_hijack();
+```
+
+Bloquea **todo** `insert` de una identidad no-`email` sobre un `user_id` que ya tiene una
+identidad `email`, sin distinguir el origen de la cuenta (signup público vs.
+invitación/activación administrada): este proyecto tiene `enable_manual_linking = false`
+(`supabase/config.toml`, `[auth]`) — sin manual linking no existe ningún flujo soportado
+por el que una persona ya autenticada por contraseña agregue Google a su propia cuenta de
+forma deliberada, así que el único origen posible de este `insert` es el camino
+automático y vulnerable de "vincular por email ya verificado" durante un
+`signInWithOAuth()` sin sesión previa. No hace falta (ni sería confiable) distinguir el
+origen de la cuenta, porque ninguna la prueba posesión de email al crearse.
+
+Efecto: se bloquea el `insert` (no se borra la identidad vieja ni se toca `auth.users`) —
+fail-closed deliberado, más seguro que replicar el comportamiento viejo de GoTrue
+(purgar y dejar crear cuenta nueva), que exigiría mutar `auth.users`/`auth.identities` a
+mano en medio de la propia transacción de GoTrue. El soporte resuelve a mano vía la
+auditoría del punto 3 de ADR-0043.
+
+Sin `comment on trigger ... on auth.identities`: exige ser dueño de la relación
+(`must be owner of relation identities`, confirmado en vivo — la dueña es
+`supabase_auth_admin`, el rol de migración `postgres` puede crear el trigger pero no es
+dueño de la tabla). La documentación vive en el comentario de la función.
+
+**Seguro triggerear sobre `auth.identities`**: mismo patrón que ya usa este repo desde la
+Fase 1 (`public.handle_new_user()`, `after insert on auth.users`) — ambas tablas viven en
+el mismo schema `auth` gestionado por Supabase, mismo dueño (`supabase_auth_admin`) y
+mismo rol de migración (`postgres`) con privilegio suficiente. Confirmado en vivo contra
+Supabase local (CLI 2.118.0): `npx supabase db reset` aplica la migración limpio, y un
+insert directo de una identidad `google` para un `user_id` con identidad `email`
+preexistente falla con `OAUTH_LINK_BLOCKED_EXISTING_PASSWORD_IDENTITY`; el mismo insert
+para un `user_id` recién creado (sin identidad `email` previa, el caso normal de "Google
+por primera vez") pasa sin error.
+
+### 3. Auditoría manual antes de producción (no es una migración)
+
+Documentada en `docs/decisions.md` ADR-0043, sección "Corrección post-review de
+seguridad" — lista para copiar/pegar en el SQL Editor del dashboard de producción antes
+de apagar `enable_confirmations`.
+
+### 5. Turnstile (`[auth.captcha]`, `supabase/config.toml`)
+
+Habilitado con `provider = "turnstile"` y el secreto de prueba público de Cloudflare
+("always passes", documentado y pensado para automatizar tests sin navegador —
+`https://developers.cloudflare.com/turnstile/troubleshooting/testing/`, no es un secreto
+real). **Producción necesita reemplazarlo** por un Site Key + Secret Key reales,
+generados gratis en <https://dash.cloudflare.com/?to=/:account/turnstile>, cargando el
+Secret Key en el dashboard de Supabase (Authentication → Attack Protection o la sección
+equivalente según la versión) — mismo patrón que este repo ya usa para toggles que sólo
+se pueden aplicar a mano en el proyecto administrado (ADR-0017, ADR-0041, ADR-0043 base).
+
+Confirmado en vivo que GoTrue exige `captcha_token` (`gotrue_meta_security.captcha_token`)
+tanto en `/signup` como en `/token?grant_type=password` — **no sólo en signup**. Con esto
+habilitado, `frontend/app/actions/auth.ts` (`signUp()`, `signInWithPassword()`) necesita
+mandar un token de Turnstile real (widget de Cloudflare en el formulario) o toda cuenta
+nueva y todo login por contraseña empieza a fallar con `captcha_failed` — **trabajo de
+`frontend-engineer`, no cubierto por esta fase**. `backend/test/helpers.ts`
+(`createSignedInUser()`) ya pasa un `captchaToken` fijo en `signInWithPassword()` porque
+la clave de prueba acepta cualquier token no vacío; eso alcanza para los tests de
+integración pero no reemplaza el widget real que necesita producción.
+
+## Fase 42 — recursos exclusivos: anti-solapamiento a nivel de base de datos (ADR-0044, migración `20260930100000_phase42_exclusive_resources.sql`)
+
+Cierra el gap encontrado en la auditoría de generalización (ver `docs/decisions.md`,
+sección posterior a ADR-0043): nada, a ningún nivel, impedía que el mismo `Resource`
+(ej. un profesional) quedara reservado dos veces a la misma hora en servicios distintos.
+
+- `resources.is_exclusive boolean not null default false` — "se ocupa de a uno, no admite
+  turnos superpuestos". Genérico, sin ningún término de rubro.
+- `slot_occurrences.resource_is_exclusive boolean not null default false`, denormalizado
+  desde `resources.is_exclusive` porque un `EXCLUDE` no puede mirar otra tabla:
+  - trigger `slot_occurrences_set_resource_is_exclusive` (`before insert or update of
+    resource_id`) lo copia al crear/mover una ocurrencia;
+  - trigger `resources_propagate_is_exclusive` (`after update of is_exclusive on
+    resources`) lo propaga sólo a ocurrencias futuras `status='ACTIVE'`
+    (`start_at >= now()`) — el pasado nunca se toca.
+- Constraint `slot_occurrences_exclusive_resource_no_overlap`:
+  `exclude using gist (resource_id with =, tstzrange(start_at, end_at, '[)') with &&)
+  where (status = 'ACTIVE' and resource_is_exclusive)` (`btree_gist`, ya instalado desde
+  Fase 7). Con `'[)'`, dos turnos pegados (10:00–10:30 y 10:30–11:00) no chocan.
+- `generate_slot_occurrences_for_rule()` (recreada desde la versión vigente de Fase 19)
+  envuelve el insert en `begin...exception when exclusion_violation then
+  v_new_occurrence_id := null; end;` — salta sólo la fecha en conflicto, nunca aborta el
+  resto de la regla ni de la organización. Crítico: sin esto, una colisión en un tenant
+  frenaría `generate_all_slot_occurrences()` (el cron diario) para todos.
+- `check_schedule_rule_conflicts(p_resource_id, p_weekday[], p_local_start_time[],
+  p_duration_minutes, p_exclude_rule_id default null)` — proyecta 90 días y devuelve los
+  choques contra ocurrencias `ACTIVE` del mismo recurso exclusivo. `create_schedule_rule_group()`
+  (recreada) la llama **antes** de insertar cualquier `ScheduleRule`, `raise exception
+  'RESOURCE_SCHEDULE_CONFLICT: ...'` si hay choque — atómico, nada queda a medias.
+- Activar `is_exclusive=true` sobre un recurso con solapamientos existentes: el propio
+  constraint rechaza el `UPDATE` (`exclusion_violation`, SQLSTATE `23P01`) — queda como
+  error crudo de Postgres a propósito; mapearlo a `RESOURCE_HAS_OVERLAPS` es tarea de
+  `frontend-engineer` (ver ADR-0044 "Impacto" en `docs/decisions.md`).
+
+**Tests** (`backend/test/phase42.exclusive-resources.test.ts`, 5 casos): solapamiento
+bloqueado / turnos pegados sin bloquear; el generador salta sólo la fecha en conflicto sin
+abortar el resto; `check_schedule_rule_conflicts` rechaza antes de insertar; activar
+`is_exclusive` con solapamientos falla y revierte; un recurso NO exclusivo sigue
+permitiendo solapamiento libre (comportamiento del gimnasio, sin cambios). **Verificado en
+vivo contra `reservaste-stg`**: 366/366 tests de la suite completa en verde, sin
+regresiones. No requirió gate de `security-engineer` (no toca auth/RLS/multi-tenant,
+hereda la RLS de `resources`) — sí pasó `reviewer`, LISTO.
+
+## Fase 43 — generador de horarios por franja horaria (ADR-0045, migración `20260930120000_phase43_schedule_rule_spans.sql`)
+
+Extiende `create_schedule_rule_group()` (ADR-0022, producto cartesiano `weekdays[] x UN
+local_start_time`) al producto cartesiano `weekdays[] x [range_start, range_end)` expandido
+por `step_minutes` — sin cambiar el modelo de `ScheduleRule` (sigue siendo una fila por
+día+hora, nunca un rango).
+
+- **`create_schedule_rules_batch(p_organization_id, p_service_id, p_resource_id,
+  p_weekdays int[], p_local_start_times time[], p_duration_minutes, p_capacity) returns
+  setof schedule_rules`** — rutina interna nueva, **no expuesta como RPC** (`revoke execute
+  ... from public, anon, authenticated`, sin `grant`). Llama `check_schedule_rule_conflicts()`
+  (ADR-0044) **una sola vez** para toda la grilla expandida antes de insertar cualquier fila
+  — atómico: si hay choque, no se inserta nada. Único punto compartido de
+  expansión+chequeo+inserción entre los dos RPC públicos de abajo.
+- **`create_schedule_rule_group()` recreada** con la misma firma y comportamiento observable
+  de Fase 16/ADR-0044 (tests de `phase16`/`phase34` sin cambios) — ahora delega en
+  `create_schedule_rules_batch()` en vez de duplicar el insert.
+- **`create_schedule_rule_span(p_service_id, p_resource_id, p_weekdays int[], p_range_start
+  time, p_range_end time, p_step_minutes int, p_duration_minutes int, p_capacity int)
+  returns uuid`** (RPC nueva, `grant ... to authenticated`) — mismo chequeo de permiso que
+  `create_schedule_rule_group` (`is_organization_member`, nada más granular). Devuelve sólo
+  el `group_id` compartido (no las filas). Expande `local_start_time` con
+  `generate_series(date '2000-01-01' + range_start, date '2000-01-01' + range_end -
+  duration_minutes, step_minutes)` (Postgres no tiene `generate_series` sobre `time` puro,
+  de ahí el ancla de fecha fija — es aritmética de hora del día, nunca una fecha real) y
+  llama a `create_schedule_rules_batch()` con el grid completo vía `array_agg(group_id)`
+  (nunca `limit 1` sobre una set-returning function, que cortaría la ejecución tras la
+  primera fila e insertaría sólo una regla del lote).
+- **Topes defensivos** (antes de tocar la base): `step_minutes >= 5` (si no,
+  `STEP_TOO_SHORT`); máximo 96 inicios por día (`TOO_MANY_START_TIMES`); máximo 7×96=672
+  reglas por llamada (`TOO_MANY_SCHEDULE_RULES`) — sin esto, un solo request podría generar
+  decenas de miles de `SlotOccurrence` en la ventana de 90 días.
+- **Recurso exclusivo (ADR-0044)**: `step_minutes < duration_minutes` (los turnos generados
+  se pisarían entre sí) rechaza con `SPAN_SELF_OVERLAP_ON_EXCLUSIVE_RESOURCE` antes de
+  insertar nada; `p_capacity > 1` rechaza con `EXCLUSIVE_RESOURCE_CAPACITY_MUST_BE_ONE`.
+  Ambos chequeos corren antes del chequeo de rango/weekdays, apenas resuelto el `Resource`.
+
+**Tests** (`backend/test/phase43.schedule-rule-spans.test.ts`, 7 casos): franja simple
+genera N reglas con `group_id` compartido; rechaza `step_minutes < 5`; rechaza al exceder el
+tope de reglas por llamada; recurso exclusivo + `step_minutes < duration_minutes` →
+`SPAN_SELF_OVERLAP_ON_EXCLUSIVE_RESOURCE` sin insertar nada; recurso exclusivo +
+`capacity > 1` → `EXCLUSIVE_RESOURCE_CAPACITY_MUST_BE_ONE`; conflicto real contra una regla
+existente en el mismo recurso exclusivo → `RESOURCE_SCHEDULE_CONFLICT`, atómico (nada
+insertado); caso feliz en recurso exclusivo sin conflictos con `step_minutes ==
+duration_minutes` (turnos pegados sin pisarse). **Pendiente de correr contra
+`reservaste-stg`** (requiere confirmación explícita del usuario antes de tocar la base
+compartida — no corrido todavía a la fecha de este resumen). No requiere gate de
+`security-engineer` (mismo perímetro de permisos que `create_schedule_rule_group`, hereda la
+RLS existente) — `reviewer` debe confirmar los topes defensivos explícitamente antes de
+mergear.
+
+## Fase 44 — cobrar un turno suelto desde el mostrador (ADR-0046, migración `20260930140000_phase44_drop_in_booking.sql`)
+
+Implementa `docs/proposals/adr-0025-makeup-credits.md` §2.8 (diseño original nunca
+construido) tal como lo cerró ADR-0046: dos RPC nuevas (`quote_booking()` /
+`book_slot_paying()`) más una extensión aditiva de `agenda_occurrences()` y
+`occurrence_bookings()`. Ninguna reimplementa `evaluate_payment_coverage()` /
+`evaluate_payment_coverage_with_credit()` / `payment_covers_slot()` (ADR-0018): las
+envuelve. **Pendiente de gate de `security-engineer`** (toca pagos y la frontera
+multi-tenant) antes de mergear.
+
+### `resolve_active_drop_in_plan(p_service_id)` — helper interno
+
+El plan `DROP_IN` activo de un servicio, resuelto vía `service_plan_services` /
+`applies_to_all_services` (ADR-0029 movió `service_plans.service_id` a esa tabla —
+`service_plans` ya no tiene esa columna). A lo sumo una fila, garantizado por el trigger
+`check_one_active_drop_in_per_service()` (`phase22`). `revoke` de todos los roles, mismo
+patrón que `resolve_covering_service_plan()`.
+
+### `quote_booking(p_slot_occurrence_id, p_customer_id)` — lectura, sin side-effects
+
+Devuelve una fila `{can_book, reason, coverage_path, price, currency, makeup_credit_id,
+makeup_credit_expires_on}`. `reason` es el `can_book_reason` de siempre (nunca un valor
+nuevo). `coverage_path` es un enum nuevo, **de lectura únicamente** (ADR-0025 §2.4.4):
+`FREE_SERVICE | DROP_IN_PAID | PLAN_UNLIMITED | PLAN_QUOTA | MAKEUP_CREDIT | NONE`.
+
+Autorización resuelta **antes** de tocar la fila de `customers`, para que la RPC no sirva
+para sondear si un `customer_id` ajeno existe en otra organización: `has_org_permission(
+org, 'MANAGE_BOOKINGS')` (staff), o un `exists` independiente contra `customers` que
+compara `profile_id = auth.uid()` directamente (el propio cliente consultando su propia
+cobertura). Sólo después de pasar ese gate se hace el `select * into v_customer` que
+puede devolver `NOT_A_CUSTOMER`.
+
+### `book_slot_paying(p_slot_occurrence_id, p_customer_id, p_amount default null)` — escritura atómica, sólo-mostrador
+
+`security definer`, exige **`MANAGE_PAYMENTS`** siempre (escribe un `Payment`, mismo
+permiso que la policy `payments_insert_staff` de Fase 32 ya exige para insertar
+cualquier pago) y **`MANAGE_BOOKINGS`** además, sólo si hace falta crear la `Booking`
+(Fase 34: un cajero con `MANAGE_PAYMENTS` puede cobrar un turno ya anotado, pero no
+anotar uno nuevo). **Corrección del gate de seguridad (2026-09-30)**: el diseño original
+exigía sólo `MANAGE_BOOKINGS` — con eso, un rol configurado a propósito sin permiso de
+cobro (ADR-0033) podía registrar un `Payment PAID` con `p_amount=0`, esquivando el
+`PAYMENT_REQUIRED` que `admin_book_for_customer()` le devuelve al mismo rol (verificado
+en vivo contra `reservaste-stg`). **El cliente no puede invocarla** (sin pasarela real,
+ADR-0027 sigue postergada; dejar que se autodeclare pagado sin verificación sería peor
+que no tener la RPC). Mismo orden de locks que `book_slot()` /
+`admin_book_for_customer()`: `select ... for update` sobre la ocurrencia primero.
+
+Estados posibles en `status`: `OCCURRENCE_NOT_AVAILABLE`, `CUSTOMER_NOT_IN_ORG` (la
+frontera multi-tenant principal: el `customer_id` tiene que pertenecer a la organización
+de la ocurrencia ya lockeada, que nunca sale de un input libre), `ALREADY_COVERED`,
+`SLOT_FULL`, `NO_DROP_IN_PLAN`, `INVALID_AMOUNT`, `ALREADY_PAID` (vía `unique_violation`
+sobre `payments_one_paid_per_occurrence_idx`, `phase17`), `OK` (con `booking` y
+`payment` serializados).
+
+**Decisión de implementación que no estaba escrita mecánicamente en ADR-0046, confirmada
+por `security-engineer` en el gate (2026-09-30) como la lectura correcta**: el re-chequeo de
+"¿ya está cubierto?" sólo corre cuando `services.payment_required = true`. Motivo: el
+paso 1 de `evaluate_payment_coverage()` devuelve `'OK'` para **todo** servicio con
+`payment_required = false`, sin haber mirado plan/pago/crédito — si esa vía contara como
+"ya cubierto", sería imposible cumplir el caso de negocio que la propia ADR-0046
+resolución 2 cita explícitamente ("un negocio con `payment_required=false` que igual
+quiere dejar registro de un cobro hecho en efectivo después del servicio"): la función
+jamás llegaría a cobrar nada, siempre devolvería `ALREADY_COVERED`. Con el chequeo
+condicionado a `payment_required`, un servicio gratuito con un `DROP_IN` configurado
+permite registrar el cobro igual, y la protección contra doble cobro en ese caso la da
+únicamente el índice único (`ALREADY_PAID`) — cubierto explícitamente por el test (d),
+que documenta por qué usa un servicio gratuito en vez de uno pago (con
+`payment_required=true` el mismo lock de la ocurrencia hace que el segundo llamador,
+tras esperar, vea el pago recién comprometido del primero y salga por `ALREADY_COVERED`
+en vez de `ALREADY_PAID` — el índice único casi nunca se ejercita en ese camino).
+
+"Ya anotado, falta cobrar" (resolución 2): si la `Booking` ya existe, la función sólo
+inserta el `Payment` — nunca vuelve a chequear cupo ni intenta reservar de nuevo. Si no
+existe, capacidad se chequea **antes** de intentar cobrar (si está llena, `SLOT_FULL` sin
+haber tocado `payments`); recién después se resuelve el `DROP_IN` activo y se cobra.
+Desde el insert del `Payment` en adelante, cualquier fallo (`BOOKING_RACE_LOST`, la
+carrera de `on conflict ... do nothing` sobre `bookings_customer_occurrence_confirmed_idx`)
+aborta con excepción, no con un status — mismo criterio ya documentado en la Fase 20 para
+`MAKEUP_CREDIT_RACE_LOST`: "cobrar y reservar son el mismo hecho" (ADR-0025 §2.8.1) exige
+que un fallo posterior al cobro deshaga también el cobro.
+
+El plan y el precio nunca son input del cliente: el plan sale de
+`resolve_active_drop_in_plan()`; `p_amount` sólo permite el descuento de mostrador que
+decide el staff con `MANAGE_PAYMENTS` que ya pasó el gate de autorización — nunca lo fija
+quien reserva. `p_amount = 'NaN'::numeric` no es `< 0` en Postgres y `numeric(12,2)` lo
+acepta sin queja; sin el chequeo explícito (`v_amount is null or v_amount = 'NaN' or
+v_amount < 0` → `INVALID_AMOUNT`) quedaba un `PAID` con `amount NaN`, envenenando
+cualquier `sum()` de reportes — hallazgo MEDIO del gate, también corregido.
+
+`resolve_active_drop_in_plan()` filtra explícitamente `sp.organization_id =
+s.organization_id` — **hallazgo ALTO del gate de seguridad, corregido**: la versión
+original no filtraba por organización, así que un plan `DROP_IN` con
+`applies_to_all_services=true` de CUALQUIER organización matcheaba todos los servicios de
+la plataforma (verificado en vivo: el precio de un tenant ajeno aparecía en
+`agenda_occurrences`/`quote_booking` de otro tenant, y `book_slot_paying` abortaba con un
+error de integridad — un DoS del cobro para todos los tenants). El `order by
+applies_to_all_services asc, created_at asc, id asc` desempata de forma determinista el
+caso (no cubierto por `check_one_active_drop_in_per_service()`) de un `DROP_IN` explícito
+y uno `applies_to_all` en la misma organización: gana el vínculo explícito.
+
+**Gate de `security-engineer`: LISTO** (segunda pasada, tras los tres fixes de arriba).
+Dos hallazgos menores quedaron como decisión del Orchestrator, documentados en ADR-0046
+("Corrección post-gate") y en `docs/security.md`: un `reason` (no dato) que puede
+filtrarse entre tenants en `evaluate_payment_coverage()` — pre-existente, deuda técnica
+separada — y un edge case de doble cobro deliberado del staff en un servicio gratuito con
+plan `UNLIMITED` vigente, aceptado por baja severidad.
+
+### `agenda_occurrences()` / `occurrence_bookings()` — extensión aditiva
+
+`agenda_occurrences()` (Fase 8) agrega `drop_in_plan_id, drop_in_price, drop_in_currency`
+al final (`null` si el servicio no tiene un `DROP_IN` activo), vía
+`left join lateral (select (resolve_active_drop_in_plan(so.service_id)).*) as dip on
+true` — la expansión de un valor compuesto posiblemente `NULL` produce siempre una fila
+(con columnas `NULL`), así que el `LEFT JOIN ... ON TRUE` nunca descarta la ocurrencia.
+`occurrence_bookings()` (Fase 8/16/21) agrega `is_covered` (reusa `payment_covers_slot()`,
+nunca reimplementado) y `paid_payment_id` por asistente. Las dos usan `drop function` +
+`create function` (cambia el `returns table`, `CREATE OR REPLACE` no alcanza) y
+re-emiten sus grants a `authenticated` — aprovechando el `drop`, también se les agregó un
+`revoke` explícito de `public`/`anon` que la versión original (Fase 8, anterior a
+ADR-0028) nunca tuvo — mismo endurecimiento sin cambio de comportamiento para un caller
+legítimo, a confirmar en el gate de seguridad.
+
+### Tests (`backend/test/phase44.drop-in-booking.test.ts`)
+
+Los ocho casos que pidió el Orchestrator: (a) alta atómica Payment+Booking para un
+cliente nuevo; (b) sólo Payment cuando la Booking ya existía (servicio gratis + `DROP_IN`
+opcional, el caso de negocio de la resolución 2); (c) `ALREADY_COVERED` sin cobrar de
+nuevo; (d) doble cobro concurrente → uno `OK`, uno `ALREADY_PAID` (con el comentario
+explicando por qué ese test necesita un servicio gratuito, ver arriba); (e)
+`CUSTOMER_NOT_IN_ORG` cross-tenant; (f) un cliente no puede invocar `book_slot_paying`;
+(g) `quote_booking` sí lo puede invocar el propio cliente, nunca para otro `customer_id`;
+(h) `NO_DROP_IN_PLAN`. **Verificado en vivo contra `reservaste-stg`**: los 8 casos pasan,
+incluidos en los 366/366 de la suite completa. Migración sin
+aplicar contra `reservaste-stg` todavía.
