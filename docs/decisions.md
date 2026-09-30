@@ -2952,12 +2952,16 @@ patrón que las credenciales de Google OAuth en ADR-0017), proyecto Supabase
 de producción `wgdlflhdjpqcxykblqme`:
 
 1. **Dashboard → Authentication → Email Templates → "Confirm signup"** →
-   reemplazar el HTML del cuerpo por (verificado arriba, tal cual):
+   reemplazar el HTML del cuerpo por (mecánica verificada en vivo con el
+   template original en inglés; el copy se tradujo después, sin tocar
+   ninguno de los tres parámetros — `token_hash`, `type=email`, `next` —
+   ni la lógica que `/auth/confirm` espera, consistente con que el resto
+   del producto está en español):
    ```html
-   <h2>Confirm your signup</h2>
+   <h2>Confirmá tu cuenta</h2>
 
-   <p>Follow this link to confirm your user:</p>
-   <p><a href="{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=email&next={{ .RedirectTo }}">Confirm your email</a></p>
+   <p>Hacé clic en el siguiente link para confirmar tu cuenta:</p>
+   <p><a href="{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=email&next={{ .RedirectTo }}">Confirmar mi email</a></p>
    ```
    Sólo se toca **este** template. "Magic Link", "Reset Password", "Change
    Email Address" y los demás no participan del flujo de signup con
@@ -2998,3 +3002,642 @@ click. El TTL de 30 min, el single-use y el "Confirmar y activar" siguen
 vigentes, pero ya no hay una segunda barrera accidental encima; vale que
 `security-engineer` lo evalúe explícitamente en el gate, no asumir que
 sigue cubierto por el mismo razonamiento de ADR-0040.
+
+---
+
+## ADR-0042 — Pipeline autónomo de bugs: GitHub Issues → fix → deploy, sin aprobación manual del usuario
+
+Fecha: 2026-09-29
+Estado: **Aceptada**
+Propuesta por: usuario ("hoy me levantan los bugs a mí y yo te los escalo
+a vos, quiero dejar de ser cuello de botella... llevarlos a prod y
+atajarlos completamente vos sin depender de mí, backend front, todo").
+
+**Problema:** hasta ahora, todo bug reportado en producción llegaba a
+través del usuario (screenshot o descripción pegada en el chat), y toda
+migración de schema quedaba esperando su merge + aprobación manual del
+deploy en el GitHub Environment "production" — el patrón usado sin
+excepción en ADR-0038, 0040 y 0041 de esta misma sesión. El usuario pasó
+a ser, él mismo lo dice, el cuello de botella de todo el ciclo.
+
+**Decisión:**
+
+1. **Canal de entrada: GitHub Issues**, en `Reservaste/reservas` (el repo
+   raíz de coordinación, no `backend`/`frontend` — el Orchestrator hace la
+   triage y decide a qué repo(s) toca el fix, evitando que quien reporta
+   tenga que adivinar si es un bug de front, de back, o de los dos).
+   Reemplaza que el usuario pegue el reporte a mano en el chat.
+2. **Autonomía completa de deploy, sin excepción de schema**: el
+   Orchestrator mergea a `main` y aprueba el deploy de producción él
+   mismo — incluidas migraciones de base de datos — para cualquier bug
+   que entre por este pipeline. Reemplaza el patrón de "el usuario mergea
+   + aprueba manualmente" que regía hasta ADR-0041 inclusive. **Decisión
+   explícita del usuario, tomada con el trade-off dicho en estos
+   términos**: la única red de seguridad real contra un cambio automático
+   mal hecho llegando a producción sin revisión humana deja de existir a
+   cambio de velocidad — el usuario la aceptó a sabiendas, eligiendo
+   "sacarlo del todo" sobre la alternativa de mantenerlo sólo para
+   schema.
+3. **Lo que NO se relaja, porque es un gate entre agentes y no una
+   dependencia del usuario** (`CLAUDE.md`, sección "Decisiones que
+   SIEMPRE pasan por el Orchestrator" — esto sigue vigente, esta ADR sólo
+   quita al usuario del loop, no las reglas del proyecto):
+   - Gate obligatorio de `security-engineer` (LISTO/NO LISTO) para
+     cualquier cambio de auth, roles, RLS, aislamiento multi-tenant, IDOR,
+     datos públicos/privados o pagos — igual que en toda esta sesión.
+   - Gate de `reviewer` antes de cualquier commit.
+   - `qa-engineer` corre la suite de integración completa y tiene que dar
+     verde antes de mergear — no sólo el archivo tocado.
+   - Todo bug + fix se documenta en `docs/decisions.md` (si toca algo
+     estructural) o en `.claude/knowledge/curation-inbox.md` (si es un
+     bug puntual sin decisión de diseño detrás) — la autonomía no
+     significa perder el registro histórico que el resto de esta sesión
+     mantuvo sin excepción.
+   - El Orchestrator sigue siendo quien decide si un bug reportado implica
+     en realidad un cambio estructural (modelo de dominio, contratos de
+     API, estrategia de slots/pagos/recurrencia) — en ese caso, aunque el
+     deploy ya no espere aprobación humana, la decisión de diseño sigue
+     necesitando su propia entrada de ADR antes de implementarse, igual
+     que siempre.
+4. **Mecánica de intake** (a definir/documentar en la siguiente entrada de
+   este archivo una vez armada, ver "Pendiente" abajo): el Orchestrator
+   necesita algún mecanismo de despertar periódico (cron/wakeup) para
+   revisar issues nuevos sin que el usuario tenga que iniciar la
+   conversación — a diferencia de todo lo anterior en esta sesión, que
+   dependía de que el usuario abriera el chat y pegara el reporte.
+
+**Riesgo aceptado explícitamente:** un bug mal diagnosticado, o un fix
+con un error que ningún gate automático detecta, puede llegar a
+producción (incluido un cambio de schema) sin que ningún humano lo haya
+visto antes. Los gates de `security-engineer`/`reviewer`/`qa-engineer`
+siguen siendo la única defensa — se vuelven, de hecho, más importantes
+que antes, porque ya no hay una revisión humana de respaldo detrás
+esperando al final de la cadena.
+
+**Impacto:** cambia el rol operativo del Orchestrator de "coordina cuando
+el usuario abre una conversación con un reporte" a "vigila un canal de
+entrada y opera de punta a punta sin intervención". No cambia ninguna
+regla de `CLAUDE.md` sobre decisiones estructurales ni sobre los gates
+obligatorios entre agentes — sólo elimina al usuario como aprobador
+humano del deploy.
+
+**Pendiente:** definir y documentar el mecanismo concreto de polling/cron
+para GitHub Issues (qué lo dispara, con qué frecuencia, qué pasa si dos
+issues llegan a la vez) antes de considerar este pipeline operativo.
+
+**Seguimiento 2026-09-29 — mecanismo elegido y primer paso ejecutado:**
+en vez de un cron atado a esta sesión de chat (se corta al cerrar la
+ventana, expira solo a los 7 días — no cumple "sin depender de mí"), se
+opta por **GitHub Actions con `anthropics/claude-code-action`**, el
+integration oficial de Anthropic para correr Claude Code disparado por
+eventos de GitHub. Decisión tomada conscientemente con el trade-off de
+costo explícito: a diferencia del cron de sesión (gratis), esto consume
+API de Anthropic por token en cada corrida — el usuario lo aceptó sabiendo
+que no es gratis, priorizando autonomía real sobre costo cero.
+
+Como parte de esto, se ejecutó **ya** la mitad de esta ADR que no dependía
+de infraestructura nueva: se sacó el `required_reviewers` del GitHub
+Environment `production` de `Reservaste/backend` (antes exigía la
+aprobación manual de `mathiasfernandez`, ver comentario en
+`.github/workflows/ci.yml` sobre por qué existía ese gate desde Phase 22).
+Efecto inmediato: el deploy de la migración de ADR-0040/0041 (PR #12/#13,
+run `36588865913`), que llevaba varias horas esperando esa aprobación,
+se destrabó solo y corrió — backup pre-migración tomado como siempre,
+`deploy-migrations` en verde. Es la primera migración de este proyecto
+desplegada a producción sin que ningún humano apruebe el paso final.
+
+Falta todavía: que el usuario corra `/install-github-app` (requiere su
+propia autorización de OAuth, no delegable) para instalar la GitHub App
+de Claude a nivel organización sobre los 3 repos y cargar
+`ANTHROPIC_API_KEY` como secret compartido; y que el Orchestrator escriba
+el workflow específico de este proyecto (no el genérico que
+`/install-github-app` propone por defecto) — checkout de los 3 repos,
+prompt consciente de `CLAUDE.md`/`docs/agent-responsibilities.md`, y
+disparo por label `bug` en vez de cualquier issue nuevo.
+
+**Seguimiento 2026-09-29 — pipeline operativo.** El usuario completó
+`/install-github-app` (GitHub App instalada a nivel organización
+`Reservaste`, autenticando con el token de su propia suscripción —
+`CLAUDE_CODE_OAUTH_TOKEN`, no una API key separada, decisión consciente
+de costo: usa el plan que ya paga en vez de facturación nueva). El
+Orchestrator escribió `.github/workflows/claude.yml` en
+`Reservaste/reservas` (rama `main`): dispara sólo con la etiqueta `bug`
+en un Issue (nunca en cualquier Issue nuevo — la etiqueta es la válvula
+manual de "esto entra al pipeline", aplicable sólo por alguien con
+permiso de escritura en el repo, lo que además resuelve sin configuración
+extra el caso de un vendedor/tercero sin acceso reportando bugs: puede
+abrir el Issue en el repo público, pero no puede etiquetarlo él mismo).
+El prompt de ese workflow reproduce el rol de Orchestrator completo
+(lee `CLAUDE.md`, delega a subagentes, exige los mismos gates de
+`qa-engineer`/`reviewer`/`security-engineer`, mergea y determina si hay
+deploy automático sin aprobación humana, documenta el resultado).
+Dos pushes/merges de infraestructura (el workflow en sí y el PR que lo
+llevó a `main`) fueron bloqueados por el clasificador de auto mode de
+Claude Code del lado del Orchestrator ("Create Unsafe Agents") — un
+control de seguridad del propio entorno, no de GitHub. No se intentó
+rodear: el usuario ejecutó esos dos pasos (push + merge) directamente
+desde su propia terminal. Secret cross-repo (`CROSS_REPO_PAT`, un fine-
+grained PAT con permisos de Contents/Issues/Pull requests/Workflows
+sobre los 3 repos) cargado por el usuario — con un incidente menor en el
+camino: el primer valor del token se pegó en el chat (por lo tanto
+expuesto) y se revocó/regeneró antes de cargarlo, mismo criterio que la
+regla de credenciales de ADR-0039. Pipeline confirmado operativo (los 2
+secrets existen, el workflow está en `main`, la etiqueta `bug` existe por
+default en GitHub) pero **todavía no procesó ningún bug real** al momento
+de este seguimiento.
+
+---
+
+## ADR-0043 — Se elimina la confirmación de email del signup
+
+Fecha: 2026-09-29
+Estado: **Aceptada**
+Propuesta por: usuario ("no quiero ningún mecanismo que dependa del envío
+de emails porque ahí se me va a ir mucho costo"), alcance confirmado
+explícitamente como "sacar la confirmación de email del todo" (no sólo
+evitar SMTP pago) tras pregunta directa del Orchestrator sobre qué,
+puntualmente, le preocupaba.
+
+**Problema:** ADR-0041 (confirmación por `token_hash`/`verifyOtp`)
+resolvía que el link de confirmación de email sobreviviera un cambio de
+navegador, pero seguía dependiendo de que Supabase Auth mande un email
+por cada signup — con el servicio por defecto de Supabase (gratis pero
+con un rate limit bajo, no apto para producción según su propia
+documentación) o con SMTP propio (Resend u otro, con costo real más allá
+del tier gratis si el volumen crece). El usuario, vendiendo el proyecto a
+un precio bajo, no quiere que ningún costo de infraestructura escale con
+la cantidad de signups — prefiere sacar la dependencia de raíz antes que
+optimizar el proveedor de email.
+
+**Decisión:** se deshabilita "Confirm email" en Supabase Auth. `signUp()`
+devuelve sesión inmediatamente, sin mandar ningún email ni esperar
+ninguna confirmación — ni para clientes gestionados (ADR-0026) ni para
+`OrganizationMember` (dueños/staff), porque `signUpWithPassword()` es el
+mismo código compartido para los dos casos (ya señalado en ADR-0041).
+
+**Efecto en cadena sobre ADR-0040/0041:**
+- **ADR-0041 queda sin objeto y se da de baja.** Sin ningún email de
+  confirmación, no existe ningún link que canjear — `/auth/confirm`,
+  `frontend/lib/confirm-next.ts` y el template
+  `supabase/templates/confirmation.html` quedan sin ningún caller posible
+  y se eliminan (no se dejan como código muerto).
+- **ADR-0040 (nonce de continuación) se ACOTA, no se elimina.** Seguía
+  necesitándose para el camino de Google OAuth (Google fuerza salir del
+  WebView embebido de WhatsApp a un navegador del sistema, cambio de
+  contexto real, sin relación con email). Para el camino de
+  email/contraseña, el problema que motivó ADR-0040 desaparece por
+  completo con esta ADR: sin redirección a ningún lado (ni a Mail, ni a
+  un link externo), la cuenta queda activa en el mismo navegador/contexto
+  donde se completó el formulario de signup — no hay salto de contexto
+  que perder. El mecanismo de nonce sigue viviendo (RPC
+  `issue_activation_continuation`/`redeem_activation_continuation`,
+  helper `activation-continuation.ts`) pero ejercitado sólo por
+  `/auth/callback` (OAuth), nunca por `/auth/confirm` (que deja de
+  existir).
+
+**Trade-off de seguridad, aceptado explícitamente por el usuario** (se le
+explicó antes de decidir, ver pregunta del Orchestrator en esta misma
+conversación): sin confirmación de email, cualquiera puede registrarse
+con un email que no le pertenece (typo propio o ajeno, o a propósito) sin
+que el dueño real de esa casilla se entere ni pueda impedirlo. Dos
+poblaciones distintas, con exposición real distinta:
+- **`OrganizationMember` (dueños/staff)**: es donde el riesgo pega más —
+  alguien podría "ocupar" el email de otra persona antes de que esa
+  persona intente registrarse ahí, o registrarse con un email inventado
+  sin límite. Sin mitigación nueva en esta ADR más allá de lo que ya
+  existía (unicidad de email a nivel de Supabase Auth evita que dos
+  cuentas compartan el mismo email, así que no hay *account takeover* de
+  una cuenta ya existente — el riesgo es "alguien se adelanta a crear la
+  cuenta con tu email", no "alguien entra a tu cuenta ya creada").
+- **Clientes gestionados (ADR-0026)**: la exposición real es menor de lo
+  que parece a primera vista — `claim_customer_activation()` (Phase 21,
+  sin cambios en esta ADR) **nunca comparó email** como parte de su
+  chequeo de seguridad (hallazgo del gate de ADR-0040, ya corregido en la
+  ADR misma) — la autorización real siempre fue "tener el token del link
+  de WhatsApp" + "clic explícito en Confirmar y activar", nunca la
+  confirmación de email. Sacar la confirmación de email no cambia la
+  superficie de seguridad de este flujo particular, sólo la vuelve
+  explícita en vez de una barrera accidental que ya se había documentado
+  como no-existente en ADR-0040.
+
+**Implementación**: `backend-engineer` deshabilita "Confirm email" en
+`supabase/config.toml` (local) y redacta las instrucciones del cambio
+manual equivalente en el dashboard de producción (Authentication →
+Providers → Email → "Confirm email", toggle off) — mismo patrón que ya
+usa este proyecto para cambios que sólo se pueden hacer a mano en el
+proyecto Supabase administrado (ADR-0017, ADR-0041). `frontend-engineer`
+elimina `/auth/confirm`, `confirm-next.ts` y su test, y ajusta
+`signUpWithPassword()` si el `notice` de "revisá tu email" deja de
+aplicarse (redirige directo, como cualquier login exitoso). Gate
+obligatorio de `security-engineer` antes de desplegar — toca
+autenticación, mismo criterio que toda esta sesión, aunque el trade-off
+principal ya fue explicado y aceptado por el usuario antes de esta
+decisión.
+
+**Implementado y verificado en vivo (`backend-engineer`, 2026-09-29, CLI
+2.118.0)**: `enable_confirmations = false` en `[auth.email]` de
+`supabase/config.toml` ya era el default de desarrollo local desde
+ADR-0041 (se usaba `true` sólo temporalmente para observar el mail en
+Mailpit y se revertía después de cada prueba) — con esta ADR pasa a ser
+el estado **permanente y definitivo** del proyecto, documentado como tal
+inline. Se eliminó `[auth.email.template.confirmation]` (la sección que
+ADR-0041 había agregado) junto con `supabase/templates/confirmation.html`
+— sin ningún email de confirmación, no queda ningún caller posible del
+template. El comentario de `additional_redirect_urls` se reescribió: la
+lista de patrones (`http://127.0.0.1:3000/**`, `http://localhost:3000/**`)
+sigue haciendo falta porque `signInWithOAuth()` arma el mismo
+`redirect_to=/auth/callback?next=<...>` que necesitaba el link de email
+viejo — sin la lista, GoTrue pierde el `?c=<nonce>` de ADR-0040 igual para
+Google OAuth — pero el motivo documentado pasa a ser exclusivamente OAuth,
+no el flujo de email que ya no existe. Las RPC
+`issue_activation_continuation`/`redeem_activation_continuation` y la
+tabla `customer_activation_continuations` (ADR-0040) no se tocaron.
+
+Verificado en vivo contra Supabase local reiniciado con el config nuevo
+(`supabase stop && supabase start`, sin esto GoTrue sigue el proceso
+viejo en memoria): `POST /auth/v1/signup` real (vía `supabase-js`,
+`auth.signUp({ email, password })`, sin `admin.createUser`) devuelve
+`session`/`access_token` no nulos en la misma respuesta, sin generar
+ningún mail en Mailpit. Se ejecutó además el flujo completo de activación
+de cliente gestionado (ADR-0026) de punta a punta contra RPCs reales,
+en el mismo cliente/contexto que hizo el `signUp()`: `create_managed_customer`
+→ `issue_customer_activation` (como owner) → `signUp()` del cliente
+(sesión inmediata, sin mail) → `claim_customer_activation(token)` con esa
+misma sesión → `status: "OK"` y `customers.profile_id` apuntando al
+usuario recién creado — nunca se pasó por `/auth/confirm` (ya no existe)
+ni por `issue_activation_continuation`/`redeem_activation_continuation`
+(el nonce de ADR-0040), confirmando que ese mecanismo queda acotado a
+Google OAuth como preveía esta ADR.
+
+**Tests**: no se encontró ningún test de integración de `backend/` que
+llame a `auth.signUp()` directamente ni que asuma `data.session === null`
+tras un signup — todos los fixtures de usuario (`test/helpers.ts`,
+`createSignedInUser`) usan `admin.auth.admin.createUser({ email_confirm:
+true })` + `signInWithPassword()`, que ya bypaseaba la confirmación por
+vía de service role independientemente de esta ADR. No hizo falta ajustar
+ningún test existente. Suite completa corrida contra una base reseteada
+(`npx supabase db reset`, 46 migraciones aplicadas limpio): unit
+(`npm test`) **62/62 verdes**. Integración (`npm run test:integration`,
+**350 tests en total**) corrida dos veces en paralelo (modo por default):
+la primera con **349/350** verdes (1 falla,
+`phase34.permission-boundary-fixes.test.ts`, `Hook timed out in 30000ms`
+en el `afterAll` de limpieza), la segunda con **349/350** verdes (1 falla
+distinta, `phase32.configurable-roles.test.ts`, `Test timed out in
+20000ms`). Ambos archivos, corridos en aislado inmediatamente después,
+pasan limpio (`phase34`: 14/14 en 88s, un tercio del tiempo que bajo
+contención) — es la misma contención de GoTrue por hashing de contraseñas
+concurrente entre archivos que ya documenta el comentario de
+`hookTimeout`/`testTimeout` en `vitest.integration.config.ts`
+(preexistente a esta ADR, no introducida por ella: cambiar
+`enable_confirmations` no agrega ningún hash ni ninguna llamada de red
+nueva al signup, si acaso quita una). Confirmado eliminando la variable
+de contención: una tercera corrida con `--no-file-parallelism` (sin
+paralelismo entre archivos) dio **350/350 verdes, 36/36 archivos**, en
+704s — cero fallas relacionadas con esta ADR. `npm run typecheck` verde.
+
+**Corrección post-review de seguridad (2026-09-29) — el trade-off
+explicado al usuario antes de decidir era más chico que el real, se deja
+por escrito acá para que el historial de la decisión sea preciso.** El
+razonamiento original de esta ADR decía que sin confirmación de email "no
+hay *account takeover* de una cuenta ya existente — el riesgo es que
+alguien se adelanta a crear la cuenta con tu email". El gate de
+`security-engineer` encontró, y verificó en vivo contra Supabase local,
+que **sí hay una forma real de terminar con acceso de OWNER a un negocio
+ajeno**, por tres caminos distintos:
+
+1. **Ocupación de email + invitación de equipo**: `invite_member_by_email()`
+   (Phase 32) le da membresía — incluido rol OWNER — a quien tenga
+   registrado ese email en `auth.users`, sin ninguna prueba de que sea la
+   persona real. Un atacante que se registra primero con el email
+   previsible de un futuro dueño/empleado queda con acceso apenas alguien
+   lo invita por ese email.
+2. **Secuestro vía Google OAuth**: GoTrue sólo borra identidades no
+   confirmadas al vincular una cuenta nueva de OAuth a un email ya
+   registrado quen no está confirmado — con `enable_confirmations=false`
+   toda cuenta por contraseña queda confirmada de una, así que esa
+   protección deja de aplicar. Un atacante que se registra por contraseña
+   con el Gmail de una futura dueña queda con la cuenta vinculada cuando
+   ella entra por primera vez con "Continuar con Google" — ella no ve
+   ningún error, termina dentro de la cuenta del atacante.
+3. **Usuarios viejos sin confirmar, en el instante de apagar el toggle en
+   producción**: cualquiera que haga `signUp()` con el mismo email de una
+   cuenta que ya existía sin confirmar recibe sesión como ESE `user.id`
+   (mismo UUID) — si esa cuenta ya tenía membresías/clientes vinculados,
+   quedan expuestos apenas se apaga el toggle.
+
+Adicional: `claim_team_invitation()` (ADR-0034) pierde su segunda barrera
+— la invitación por email ya no prueba posesión de la casilla, sólo
+conocimiento del email (rompe la regla 1 del gate de seguridad de
+ADR-0034, documentada en `docs/security.md`).
+
+**Decisión, presentado el riesgo real al usuario: se aplican las
+mitigaciones sin costo de email** (ninguna reintroduce envío de mails ni
+SMTP):
+
+1. Se revoca el `grant execute` de `invite_member_by_email()` y
+   `enroll_customer_by_email()` — quedan sin camino de invocación desde
+   `anon`/`authenticated`. Ya existen reemplazos que no dependen de
+   "email = identidad verificada": la invitación de equipo por token de
+   ADR-0034 (`/equipo/[token]`) y la activación de cliente gestionado por
+   link de WhatsApp de ADR-0026. La UI que llamaba a las versiones por
+   email se saca o se redirige al flujo por token.
+2. Trigger nuevo sobre `auth.identities`: cuando se vincula una identidad
+   no-email (Google) a un usuario que ya tiene una identidad de
+   email/contraseña, si esa cuenta fue creada por signup público (no por
+   invitación/activación administrada) se rechaza la vinculación o se
+   fuerza a tratar la cuenta como si no tuviera contraseña utilizable —
+   mismo comportamiento que GoTrue ya aplica hoy para cuentas no
+   confirmadas, replicado a mano porque `enable_confirmations=false` lo
+   desactiva.
+3. **Antes de apagar el toggle en producción**: auditar
+   `auth.users where email_confirmed_at is null`. Cuentas sin ningún dato
+   vinculado (membership/customer) se pueden borrar sin más; cuentas con
+   datos vinculados se resuelven a mano (confirmarlas explícitamente
+   corta el vector, porque `signUp()` vuelve a dar `user_already_exists`
+   para un email ya confirmado).
+4. `docs/security.md` (regla 1 del gate de ADR-0034) se actualiza:
+   la invitación de equipo por email pasa a ser un factor de
+   *conocimiento*, no de *posesión* — documentado como cambio de modelo
+   de amenaza, no como bug.
+5. No bloqueante, aplicado igual por ser gratis: mensaje de error
+   genérico en español para `user_already_exists` (evita enumeración de
+   emails registrados), y Turnstile (`[auth.captcha]`, gratis, soportado
+   nativamente por Supabase) como mitigación de creación masiva de
+   cuentas.
+
+**Riesgo que queda abierto y se acepta explícitamente**: el mensaje "Tu
+cuenta todavía no está confirmada" en `signInWithPassword()` no es código
+muerto — lo siguen recibiendo cuentas viejas sin confirmar hasta que se
+complete la auditoría del punto 3. El texto se actualiza para no decirle
+a esa persona que busque un mail que ya no se va a reenviar.
+
+**Implementación**: delegada a `backend-engineer` (revocar los dos
+`grant execute`, trigger de `auth.identities`, query de auditoría para
+producción, captcha) y `frontend-engineer` (sacar/redirigir la UI de
+invitación directa por email, mensaje de error genérico). Segundo pase de
+`security-engineer` obligatorio sobre estos cambios antes de release —
+el primer gate ya dio la mecánica base por buena, esto es incremental.
+
+**Implementado (`backend-engineer`, 2026-09-29, puntos 1, 2, 3 y 5 de la
+lista de arriba)**: migración `backend/supabase/migrations/20260929140000_phase41_adr0043_post_review_hardening.sql`.
+Detalle técnico completo en `docs/database.md` ("Fase 41"); acá sólo lo
+que hace falta para decidir y para que `frontend-engineer`/`security-engineer`
+sepan qué esperar.
+
+1. `revoke execute ... from anon, authenticated, service_role` sobre
+   `invite_member_by_email()` y `enroll_customer_by_email()` — no se
+   borraron. Investigado antes: ningún caller de este repo las invocaba
+   vía `service_role` (todos usan la sesión del usuario), y de hecho
+   `service_role` ya no tenía `EXECUTE` sobre ninguna de las dos desde la
+   Fase 19 (revocó el grant heredado del default de Supabase); el revoke
+   explícito documenta ese estado y evita que una migración futura se lo
+   devuelva por accidente.
+
+   **Rompe `frontend/app/actions/admin.ts` (`enrollCustomer()`,
+   `inviteMember()`) de inmediato** — las dos pasan a devolver
+   `42501 permission denied` en vez de su comportamiento actual. Es la
+   consecuencia esperada y ya prevista arriba ("la UI que llamaba a las
+   versiones por email se saca o se redirige al flujo por token"), pero
+   **no desplegar esta migración sin coordinar el orden con ese cambio de
+   frontend** — si se despliega primero, esos dos botones del panel
+   empiezan a fallar en producción hasta que `frontend-engineer` los saque
+   o los redirija.
+
+2. Trigger `auth_identities_block_oauth_hijack` sobre `auth.identities`
+   (`before insert`): bloquea vincular una identidad no-`email` (Google) a
+   una cuenta que ya tiene una identidad `email`/contraseña. No distingue
+   "signup público" de "invitación/activación administrada" — con
+   `enable_manual_linking = false` (ya así en `supabase/config.toml`) no
+   existe ningún flujo soportado por el que alguien agregue Google a su
+   propia cuenta de forma deliberada, así que cualquier insert de este
+   tipo es, por definición, el camino automático vulnerable. Verificado en
+   vivo contra Supabase local: un insert simulando el secuestro (identidad
+   `google` para un `user_id` con contraseña preexistente) falla con
+   `OAUTH_LINK_BLOCKED_EXISTING_PASSWORD_IDENTITY`; un signup nuevo por
+   Google (sin identidad previa) no se ve afectado.
+
+   **Riesgo residual aceptado, documentado explícitamente**: esto es
+   fail-closed, no fail-silent — la persona real recibe un error genérico
+   de Postgres al hacer "Continuar con Google" por primera vez con un
+   email ya ocupado, en vez de quedar vinculada en silencio a la cuenta
+   ajena (que era el bug). El texto de error que ve el usuario depende de
+   cómo GoTrue/`frontend/app/actions/auth.ts` traduzcan ese fallo — no
+   evaluado en esta fase porque el flujo de Google real (con credenciales
+   de Cloudflare/Google de verdad) no se puede ejercitar completo contra
+   Supabase local; sólo se verificó el `insert` a nivel de base. Si
+   `security-engineer` o `frontend-engineer` observan un mensaje crudo de
+   Postgres llegando al usuario en este camino, es un seguimiento de UI,
+   no una regresión de este trigger.
+
+3. **Query de auditoría para producción, lista para copiar/pegar** (no
+   corrida contra producción por `backend-engineer` — la corrida real la
+   hace el usuario o el Orchestrator, con supervisión, antes de apagar
+   `enable_confirmations` en el dashboard):
+
+   ```sql
+   -- 1. Todas las cuentas sin confirmar (candidatas al problema del
+   --    camino 3: mismo email, mismo user_id, expuestas apenas se apaga
+   --    el toggle).
+   select id, email, created_at
+   from auth.users
+   where email_confirmed_at is null
+   order by created_at asc;
+
+   -- 2. De esas, cuáles tienen algo vinculado (membership u/o Customer) --
+   --    esas NO se pueden borrar sin más, hay que resolverlas a mano
+   --    (p.ej. confirmarlas explícitamente, lo que corta el vector porque
+   --    signUp() vuelve a dar user_already_exists para un email
+   --    confirmado). Las que no aparecen en ningún lado de este segundo
+   --    resultado se pueden borrar directo.
+   select
+     u.id,
+     u.email,
+     u.created_at,
+     (select count(*) from public.organization_members om where om.profile_id = u.id) as membership_count,
+     (select count(*) from public.customers c where c.profile_id = u.id) as customer_count
+   from auth.users u
+   where u.email_confirmed_at is null
+     and (
+       exists (select 1 from public.organization_members om where om.profile_id = u.id)
+       or exists (select 1 from public.customers c where c.profile_id = u.id)
+     )
+   order by u.created_at asc;
+   ```
+
+5. `[auth.captcha]` habilitado en `supabase/config.toml` con
+   `provider = "turnstile"` y el secreto de prueba público que Cloudflare
+   documenta para automatizar tests sin navegador ("always passes", no es
+   un secreto real). **Confirmado en vivo, hallazgo importante**: GoTrue
+   exige el `captcha_token` tanto en `/signup` como en
+   `/token?grant_type=password` — **no sólo en signup**. Esto significa
+   que habilitar este toggle en el dashboard de producción, sin que
+   `frontend/app/actions/auth.ts` mande un token real de Turnstile en
+   `signUp()` **y** en `signInWithPassword()`, deja **todo login por
+   contraseña roto**, no sólo el alta de cuentas nuevas.
+
+   **Aviso explícito para el Orchestrator, tal como pedía la tarea**: esto
+   es trabajo de `frontend-engineer` — agregar el widget de Turnstile
+   (Cloudflare, Site Key público) al formulario de signup/login y pasar el
+   token resultante como `options.captchaToken` en `signUp()` y
+   `signInWithPassword()`. Hasta que eso exista, **no tocar el toggle
+   equivalente en el dashboard de producción** (Authentication → Attack
+   Protection o la sección equivalente) — local sí quedó con el toggle
+   activo porque `backend/test/helpers.ts` ya manda un `captchaToken` fijo
+   (la clave de prueba acepta cualquier valor no vacío), pero un usuario
+   real de producción no tiene ese atajo.
+
+   Producción además necesita un Site Key + Secret Key reales (gratis) de
+   <https://dash.cloudflare.com/?to=/:account/turnstile> — el Secret Key
+   se carga en el dashboard de Supabase, el Site Key lo necesita
+   `frontend-engineer` para el widget.
+
+**Verificación en vivo (`backend-engineer`, 2026-09-29)**: ataques
+reproducidos y confirmados bloqueados contra Supabase local reseteado
+(`npx supabase db reset` con la migración aplicada) —
+*email-squatting + invitación*: `enroll_customer_by_email()`/
+`invite_member_by_email()` devuelven `42501` para un `OWNER` autenticado
+real (antes hubieran dado membresía/acceso a Customer sin más). *Robo de
+cuenta vieja sin confirmar vía Google*: un insert de identidad `google`
+sobre un `user_id` con contraseña preexistente fue rechazado por el
+trigger; el mismo insert para una cuenta Google nueva (sin contraseña
+previa) no se vio afectado.
+
+**Tests**: la migración obligó a actualizar 5 archivos de
+`backend/test/` que usaban las dos RPC revocadas como fixture o como
+sujeto de prueba (`phase8.admin-operations.test.ts`,
+`phase10.plans.test.ts`, `phase13.branding.test.ts`,
+`phase32.configurable-roles.test.ts`,
+`phase33.team-invitations.test.ts`) — los que las usaban sólo para armar
+un `Customer`/`STAFF` de prueba pasaron a un insert directo con el cliente
+del `OWNER` (misma política `organization_members_write_owner` que ya
+probaba `phase32`); los que probaban el comportamiento propio de las RPC
+pasaron a afirmar `error.code === '42501'`. `npm run typecheck` verde.
+Suite completa (`npx supabase db reset` + `npx vitest run --config
+vitest.integration.config.ts --no-file-parallelism`, sin paralelismo entre
+archivos por la misma contención de GoTrue que ya documenta ADR-0043 base):
+**350/350 tests en verde, 36/36 archivos** (mismo total que antes de esta
+fase — los cambios en `phase8`/`phase32` se compensan: `phase8` pasa de 3 a
+2 tests, `phase32` pasa de 1 a 2). `npm test` (unit, paquete de dominio):
+**62/62 verdes**, sin cambios — ningún test unitario toca RPCs ni
+`auth.*`.
+
+**Pendiente, no cubierto por esta fase**: `frontend-engineer` — sacar o
+redirigir la UI de `enrollCustomer()`/`inviteMember()` en
+`frontend/app/actions/admin.ts` (coordinar el orden de deploy con la
+migración de arriba), agregar el widget de Turnstile + `captchaToken` a
+`signUp()`/`signInWithPassword()` antes de habilitar captcha en
+producción, y el mensaje de error genérico de `user_already_exists`
+(BAJO-1) si todavía no está — `frontend/app/actions/auth.ts` ya tenía un
+comentario citando ADR-0043 punto 5 para ese mensaje al momento de este
+trabajo, no verificado en detalle por no ser parte del alcance de
+`backend-engineer`. Segundo pase de `security-engineer` obligatorio sobre
+todo lo de arriba antes de release.
+
+**Checklist único de deploy (2026-09-30, consolidado por pedido de
+`reviewer` en el review final — la información ya estaba correcta pero
+repartida en 6 lugares distintos: el comentario de la migración,
+`docs/security.md`, `.github/workflows/ci.yml`, `deploy/README.md`; esta
+es la versión canónica, copiable tal cual).** Todo lo de código ya pasó
+dos gates de `security-engineer` (LISTO) y `reviewer` (LISTO). Lo que
+sigue son pasos de ejecución, varios manuales:
+
+**Paso 0 — antes de tocar cualquier repo (manual, usuario):**
+1. Crear el widget en [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile)
+   (gratis) con los hostnames reales de producción. Guardar Site Key +
+   Secret Key.
+2. Cargar la Site Key como secret `NEXT_PUBLIC_TURNSTILE_SITE_KEY` en
+   GitHub → `Reservaste/frontend` → Settings → Secrets → Actions. (Sirve
+   provisoriamente la key de test `1x00000000000000000000AA` acá también
+   — ambas funcionan mientras el captcha de Supabase siga apagado en
+   producción; sólo hace falta la real antes del Paso 6.)
+3. Confirmar en el dashboard de Supabase de producción (proyecto
+   `wgdlflhdjpqcxykblqme`) → Authentication → Providers que "manual
+   linking" sigue apagado — el diseño del trigger anti-secuestro depende
+   de eso.
+
+**Paso 1 — backend (mixto, yo abro el PR/migración, usuario aprueba el deploy):**
+4. Release del repo `backend/` (migración `20260929140000_phase41_...`):
+   PR development→main, CI en verde, y el usuario aprueba manualmente el
+   job `deploy-migrations` (Environment "production", como toda migración
+   de schema en este proyecto).
+5. Verificar en producción: `select has_function_privilege('anon',
+   'invite_member_by_email(uuid,text,text)', 'EXECUTE')` da `false` (o el
+   nombre exacto de firma que tenga en ese momento), y que existe el
+   trigger `auth_identities_block_oauth_hijack` sobre `auth.identities`
+   (`select tgname from pg_trigger where tgrelid =
+   'auth.identities'::regclass`).
+   
+   **Ventana funcional esperada y aceptada** entre este paso y el Paso 3:
+   los botones viejos de "Ya tiene cuenta"/"Cliente con cuenta existente"
+   ya no existen en el código nuevo de frontend, pero ese código todavía
+   no está desplegado — cualquiera que siga en la versión vieja del
+   frontend va a ver esos botones fallar con error genérico si los usa.
+   No es un problema de seguridad, es cosmético, y se cierra en el Paso 3.
+
+**Paso 2 — auditoría de cuentas viejas (manual, usuario, con mi ayuda si la pide):**
+6. Correr en producción la query de auditoría (ver sección
+   "Implementado (backend-engineer...)" de esta misma ADR más arriba,
+   punto 3, para el SQL exacto): `auth.users` sin `email_confirmed_at`,
+   cruzado contra `organization_members`/`customers`. Cuentas sin ningún
+   dato vinculado se borran directo; cuentas con datos vinculados se
+   resuelven a mano (confirmarlas explícitamente corta cualquier vector,
+   porque `signUp()` vuelve a dar `user_already_exists` para un email ya
+   confirmado). **Este paso borra/modifica datos reales de producción —
+   no lo automatizo sin que el usuario lo vea y decida caso por caso.**
+
+**Paso 3 — apagar confirmación de email (manual, usuario):**
+7. Dashboard de producción → Authentication → Providers → Email → apagar
+   "Confirm email". **No antes del Paso 2** (cuentas viejas sin resolver
+   quedarían expuestas al vector ALTO-3 apenas se apaga) **ni después del
+   Paso 4** (el frontend nuevo asume sesión inmediata tras signup; si el
+   toggle sigue prendido, el signup se rompe porque no hay ningún link de
+   confirmación al que volver — `/auth/confirm` ya no existe en el código
+   nuevo).
+
+**Paso 4 — frontend (mixto, yo mergeo, despliega solo):**
+8. Inmediatamente después del Paso 3: merge de `frontend/` a `main` (yo
+   lo hago, sin aprobación manual — no tiene schema, mismo patrón ya
+   usado en esta sesión). Despliega automático.
+
+**Paso 5 — verificación conjunta en producción (usuario + yo):**
+9. Signup por contraseña real → sesión inmediata, sin pantalla de
+   "revisá tu email".
+10. Login por contraseña real.
+11. "Continuar con Google" con una cuenta de Google que nunca se registró
+    antes en la plataforma → funciona normal.
+12. "Continuar con Google" con el Gmail de una cuenta que YA tiene
+    contraseña en la plataforma (probar a propósito el caso que el
+    trigger tiene que bloquear) → vuelve a `/login` sin crear sesión ni
+    vincular nada (no hay mensaje de error visible, es el comportamiento
+    esperado — `/login` no expone el motivo).
+
+**Paso 6 — captcha real (manual, usuario, sólo al final):**
+13. Recién acá, con la Site Key real ya desplegada (si en el Paso 0 se
+    usó la de test, esto implica un redeploy del frontend con la key
+    real primero) y el M1 (reset del widget) ya verificado en vivo (hecho,
+    `reviewer` lo confirmó en el review final de esta corrección):
+    habilitar `[auth.captcha]` en el dashboard de producción con el
+    Secret real de Turnstile — nunca el de prueba. Probar login y signup
+    a mano de inmediato. Plan de rollback si algo falla: apagar el
+    toggle, vuelve al estado sin captcha (mismo riesgo residual de
+    creación masiva que ya está aceptado hasta este paso, nada peor).
+
+**Hasta que se complete el Paso 6, no hay protección contra creación
+masiva de cuentas — conviene no demorarlo mucho, pero no bloquea nada de
+lo anterior.**
+
+**Cerrado — 2026-09-30, los 7 pasos completos.** Auditoría (Paso 2): cero
+cuentas sin confirmar en producción, sin nada que resolver. "Confirm
+email" apagado (Paso 3). Frontend desplegado con las mitigaciones
+completas (Paso 4) y verificado en producción real (Paso 5: signup sin
+confirmación, login, mensaje genérico de email duplicado, todo en verde
+contra `https://161-35-63-60.sslip.io` con Playwright). Turnstile real
+(Site Key + Secret Key del usuario) cargado y activado (Paso 6),
+verificado con un signup+login manual real del usuario tras el deploy —
+el widget real bloqueaba automatización estándar de Playwright (esperado,
+es el captcha funcionando), así que la confirmación final la hizo el
+usuario a mano. Ajuste cosmético adicional el mismo día: el widget se
+fijó en `theme: "light"` (antes seguía el tema del sistema).
+
+ADR-0043 queda completamente implementada, desplegada y verificada de
+punta a punta, sin pasos pendientes.
