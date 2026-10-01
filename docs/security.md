@@ -1326,6 +1326,26 @@ visible y arreglable, no un acceso silencioso al tenant equivocado.
 >    backend no lo filtra (`claim_team_invitation()` devuelve nombre y slug de
 >    la organización y nada más, y `organization_team_invitations()` es
 >    `OWNER`-only), así que el riesgo es enteramente de la UI que falta.
+>
+> **Conflicto abierto con ADR-0043 (gate `security-engineer`, 2026-09-29).**
+> ADR-0043 apaga "Confirm email" en forma permanente, lo que **deja sin efecto la
+> regla 1 de arriba**. Verificado en vivo contra Supabase local (GoTrue
+> v2.197.0, `GOTRUE_MAILER_AUTOCONFIRM=true`): `signUp()` público con el email
+> invitado devuelve sesión inmediata, y `claim_team_invitation(token)` responde
+> `OK` → el que tenga el link y sepa (o adivine) el email entra como miembro.
+> `INVITE_WRONG_EMAIL` deja de ser un factor de posesión y pasa a ser, como
+> mucho, un factor de *conocimiento* del email (lo único que queda en pie es la
+> regla 2). El mismo supuesto de "email = casilla verificada" también lo usan
+> `invite_member_by_email()`, `enroll_customer_by_email()` y el chequeo de email
+> de `create_organization_with_owner()`, y la vinculación automática de
+> identidades de Supabase con Google OAuth. Hasta que el Orchestrator decida
+> (mitigar o aceptar por escrito cada uno), **no asumir en ningún diseño nuevo
+> que el email de `auth.users` pertenece a quien tiene la sesión**.
+>
+> **Resuelto (ADR-0043, corrección post-review, Fase 41).** Ver la sección
+> "Fase 41 — ADR-0043 sin confirmación de email: reglas" al final de este
+> documento. La regla "el email de `auth.users` NO prueba posesión de la
+> casilla" pasa a ser permanente, no transitoria.
 
 **El token.** 256 bits de `extensions.gen_random_bytes()` (nunca `random()`),
 base64url sin padding, `sha256` en reposo, un solo uso bajo `for update` con un
@@ -2299,6 +2319,275 @@ no en el repo).
    sesión se planta en ese host; si difiere, p. ej. `www` vs. apex, la
    cookie queda en otro host que el del redirect). **Nunca `supabase config
    push`** contra producción: subiría `site_url`/redirects de local.
+
+## Fase 41 — ADR-0043 sin confirmación de email: reglas
+
+Gate de `security-engineer` (segundo pase, 2026-09-29), verificado en vivo
+contra Supabase local (GoTrue con `MAILER_AUTOCONFIRM=true`,
+`SECURITY_CAPTCHA_ENABLED=true`, `SECURITY_MANUAL_LINKING_ENABLED=false`).
+
+1. **El email de `auth.users` es un factor de *conocimiento*, nunca de
+   posesión.** Ninguna RPC, policy ni flujo nuevo puede otorgar membresía,
+   vínculo de `Customer` ni ningún acceso por "la sesión tiene el email X".
+   La autorización para sumar a alguien a un tenant es **tener un token de
+   un solo uso** emitido por el tenant (`claim_team_invitation()`,
+   `claim_customer_activation()`, código de `organization_invites`). Los
+   chequeos de email que quedan (`INVITE_WRONG_EMAIL` en
+   `claim_team_invitation()` y en `create_organization_with_owner()`) son
+   defensa en profundidad contra un link mal enviado, no una barrera: se
+   aceptan así porque el token/código sigue siendo el factor de posesión.
+2. **`invite_member_by_email()` y `enroll_customer_by_email()` sin
+   `EXECUTE` para nadie** salvo su dueño (`postgres`). Verificado:
+   `proacl = {postgres=X/postgres}`, sin `PUBLIC`. Ninguna función de la
+   base las invoca (el único match en `pg_proc.prosrc` es un comentario de
+   `claim_team_invitation()`), ni `cron.job`, ni `frontend/`. Reotorgarlas
+   requiere ADR.
+3. **Trigger `auth_identities_block_oauth_hijack`** (`before insert on
+   auth.identities`, `public.check_identity_link_not_oauth_hijack()`,
+   `security invoker`, `search_path = ''`): rechaza insertar una identidad
+   no-`email` para un `user_id` que ya tiene identidad `email`. Corre como
+   `supabase_auth_admin` (dueño de `auth.identities`) — verificado con
+   `set role supabase_auth_admin`: el insert de secuestro falla con
+   `OAUTH_LINK_BLOCKED_EXISTING_PASSWORD_IDENTITY`; alta Google nueva y el
+   `UPDATE` de identidad de logins Google posteriores pasan. No afecta a
+   cuentas Google-only preexistentes (sólo `INSERT`, y no tienen identidad
+   `email`). El sentido inverso ya lo cubre GoTrue: `signUp()` por
+   contraseña sobre un email de cuenta Google-only devuelve
+   `user_already_exists` (422) sin crear identidad ni contraseña
+   (verificado). **Precondición:** "manual linking" apagado en producción —
+   si alguna vez se habilita `linkIdentity()`, este trigger lo bloquea para
+   cuentas con contraseña y hay que rediseñarlo (ADR). Falta un test de
+   regresión en `backend/test/` que afirme el bloqueo.
+4. **Captcha (Turnstile) es enforcement de GoTrue, no del frontend.** El
+   widget y el chequeo de `captchaToken` vacío en `app/actions/auth.ts` son
+   UX; la barrera real es `[auth.captcha]`. GoTrue lo exige en `/signup` y
+   en `/token?grant_type=password` (verificado: `captcha_failed` en ambos
+   sin token). Reglas: (a) nunca cargar en producción el secreto de prueba
+   `1x0000000000000000000000000000000AA` — convierte el captcha en no-op;
+   (b) nunca habilitar captcha en Supabase de producción mientras el bundle
+   desplegado tenga la Site Key de prueba (`1x00000000000000000000AA`) — sus
+   tokens dummy no validan contra un secreto real y rompe todo login por
+   contraseña; (c) la Site Key real tiene que tener cargados en Cloudflare
+   todos los hostnames de producción, o el widget no emite token y el botón
+   queda deshabilitado; (d) un token de Turnstile es de un solo uso: el
+   widget tiene que resetearse después de cada submit fallido.
+5. **Sin captcha:** `/authorize` (Google OAuth) y `updateUser()`. El cambio
+   de email vía `updateUser({ email })` sigue exigiendo confirmación
+   (`new_email` queda pendiente, verificado) — no es un camino de ocupación
+   de email, pero sí manda mails: cualquier UI futura de cambio de email
+   entra en conflicto con ADR-0043 y requiere decisión.
+6. **Riesgo residual aceptado:** ocupación de email (DoS): quien se registra
+   primero con el email de otra persona la deja sin poder usar ese email
+   (ni por contraseña ni por Google — el trigger la bloquea). No hay flujo
+   de recuperación; se resuelve por soporte a mano (auditoría de ADR-0043
+   punto 3). El callback OAuth descarta el error de GoTrue y redirige a
+   `/login` sin mostrar texto crudo de Postgres (verificado en el código).
+
+## Fase 44 — cobrar un turno suelto (ADR-0046): reglas
+
+Gate de `security-engineer` sobre `quote_booking()` / `book_slot_paying()`
+(`backend/supabase/migrations/20260930140000_phase44_drop_in_booking.sql`).
+Tres hallazgos reproducidos contra `reservaste-stg` y corregidos en la
+migración (sin commitear al momento del gate; hay que re-aplicar las dos
+funciones en stg):
+
+1. **Resolver un plan siempre filtra por la organización del servicio.**
+   `resolve_active_drop_in_plan()` no filtraba `organization_id`: un DROP_IN
+   `applies_to_all_services=true` de *cualquier* tenant matcheaba todos los
+   servicios de la plataforma. Reproducido: el precio del plan de la org B
+   aparecía en `agenda_occurrences()`/`quote_booking()` de la org A, y
+   `book_slot_paying()` de la org A abortaba con `Payment organization_id
+   must match its ServicePlan` (DoS del cobro para todos los tenants,
+   disparable por cualquier org). **Regla:** todo helper que resuelva
+   `service_plans` por `applies_to_all_services` tiene que acotar
+   `sp.organization_id` al del servicio. El mismo defecto existe
+   *preexistente* en el `exists` de `SERVICE_HAS_NO_PLAN` de
+   `evaluate_payment_coverage()` (Fase 22) — abierto, ver abajo.
+2. **Una RPC `security definer` que escribe un `Payment` exige
+   `MANAGE_PAYMENTS`** — el mismo permiso que la policy
+   `payments_insert_staff` (Fase 32). `book_slot_paying()` sólo pedía
+   `MANAGE_BOOKINGS`: reproducido, un rol configurado sin permiso de cobro
+   registraba un `PAID` con `p_amount=0` y esquivaba el `PAYMENT_REQUIRED`
+   que `admin_book_for_customer()` le devuelve al mismo rol. Ahora:
+   `MANAGE_PAYMENTS` siempre, y además `MANAGE_BOOKINGS` sólo si la función
+   tiene que *crear* la `Booking` (regla de la Fase 34: el cajero cobra lo
+   ya anotado, no anota).
+3. **`amount` nunca es `NaN`.** `'NaN'::numeric < 0` es falso y
+   `numeric(12,2)` acepta `NaN`; reproducido un `PAID` con amount `NaN`.
+   `book_slot_paying()` devuelve `INVALID_AMOUNT` para `NaN`/negativos.
+
+Verificado sin cambios (con sondas reales contra stg): anon no ejecuta
+ninguna de las cuatro RPC (`permission denied`); el cliente no puede
+invocar `book_slot_paying()`; `quote_booking()` resuelve la autorización
+antes de leer la fila del `Customer` (un `customer_id` ajeno y uno
+inexistente dan la misma respuesta, sin oráculo); el staff de A contra una
+ocurrencia de B da `NOT_AUTHORIZED`, y con ocurrencia propia + cliente
+ajeno da `CUSTOMER_NOT_IN_ORG`; concurrencia: 8 cobros simultáneos del
+mismo cliente → 1 `OK` + 7 `ALREADY_PAID`, 6 clientes distintos sobre
+capacidad 1 → 1 `OK` + 5 `SLOT_FULL`, sin sobre-reserva ni doble cobro.
+
+**Doble cobro en servicio gratuito:** `book_slot_paying()` sólo re-evalúa
+cobertura si `payment_required=true`. En un servicio gratuito la defensa es
+triple, no sólo el índice: el `FOR UPDATE` de la ocurrencia serializa las
+llamadas concurrentes, `payments_one_paid_per_occurrence_idx` rechaza un
+segundo `PAID` (`ALREADY_PAID`) y `check_payment_no_duplicate()` rechaza
+cualquier otro pago no-`VOID` de la misma ocurrencia.
+
+**Abierto:** `evaluate_payment_coverage()` (Fase 22) decide
+`SERVICE_HAS_NO_PLAN` vs `PAYMENT_REQUIRED` con un `exists` sobre
+`service_plans` sin filtro de organización: un plan `applies_to_all_services`
+activo de otra org cambia el `reason` que ven los tenants sin planes. No
+filtra datos ni habilita reservas (ambos son "no"), pero es influencia
+cross-tenant sobre el motor de cobertura; requiere fix en la cadena
+ADR-0018 (decisión del Orchestrator).
+
+## Fase 45 — reserva abierta (ADR-0047): reglas
+
+Gate de `security-engineer` (2026-09-30) sobre
+`backend/supabase/migrations/20260930150000_phase45_open_booking.sql`,
+verificado en vivo contra `reservaste-stg` (fuente viva de `book_slot()` y
+`can_customer_book()` idéntica al archivo).
+
+1. **Crear identidad de negocio (`Customer`) sólo desde una RPC `VOLATILE`
+   de reserva real, nunca desde una función de lectura.** Hoy los únicos
+   escritores de `customers` en `pg_proc` son `enroll_customer_by_email()`,
+   `create_managed_customer()` y `book_slot()`. `can_customer_book()`,
+   `can_customer_book_detail()`, `evaluate_customer_booking()`,
+   `preview_recurring_booking()` y `quote_booking()` son `STABLE`
+   (Postgres rechaza un `INSERT` ahí) — verificado además en vivo: 0 filas
+   antes/después con el flag prendido. Convertir cualquiera de ellas en
+   `VOLATILE` requiere gate.
+2. **`organization_id` del alta sale de la ocurrencia ya lockeada**
+   (`v_occurrence.organization_id`), nunca de un parámetro. La identidad es
+   `auth.uid()`; **nunca** se busca ni se vincula un `Customer` por email
+   (regla 1 de la Fase 41).
+3. **Una baja del staff no se revierte por autoservicio.** Si existe
+   *cualquier* fila `(organization_id, profile_id)` —activa o inactiva— no
+   hay alta ni `OK_OPEN_BOOKING`: `NOT_A_CUSTOMER` como siempre.
+4. **Toda RPC que escribe y después puede devolver un status de rechazo
+   tiene que rechazar con excepción, no con `RETURN`.** Un `RETURN` no
+   deshace lo escrito antes en la misma transacción. Patrón:
+   `raise exception '<ABORT>' using detail = <status>` dentro de un bloque
+   `BEGIN … EXCEPTION WHEN OTHERS` que devuelve el status sólo si
+   `sqlerrm = '<ABORT>'` y re-lanza (`raise;`) todo lo demás
+   (`MAKEUP_CREDIT_RACE_LOST` incluido). Verificado: con el flag apagado o
+   un `Customer` preexistente, `book_slot()` devuelve exactamente lo mismo
+   que la versión de la Fase 20 en 19 escenarios (OK, crédito de recupero,
+   SLOT_FULL, ALREADY_BOOKED, PAYMENT_REQUIRED, ocurrencia
+   cancelada/bloqueada/pasada/inexistente, servicio inactivo, cliente
+   inactivo, sin cliente); `MAKEUP_CREDIT_RACE_LOST` forzado sale como
+   `P0001` igual que antes. Toda salida con status tras un alta deja 0
+   filas en `customers`.
+5. **Concurrencia del alta:** dos transacciones del mismo `auth.uid()` en
+   ocurrencias distintas → la segunda espera el `INSERT` de la primera y
+   reusa su fila (`unique_violation` + re-select); si la primera hace
+   rollback, la segunda crea la suya. Misma ocurrencia → serializa en el
+   `FOR UPDATE`, la segunda ve `ALREADY_BOOKED`. Verificado en vivo.
+
+6. **Tope de reservas `SELF_SERVICE`:** máximo 2 `Booking` `CONFIRMED` con
+   `start_at >= now()` mientras `customers.source = 'SELF_SERVICE'`,
+   contado *después* de lockear la fila del `Customer`.
+   `create_recurring_booking()` rechaza `SELF_SERVICE` de entrada
+   (`SELF_SERVICE_CANNOT_CREATE_RECURRING`). Sólo el staff con
+   `MANAGE_CUSTOMERS` puede pasar `source` a `STAFF` (el cliente no puede:
+   no existe policy de UPDATE propia, verificado 0 filas). Los caminos de
+   staff (`admin_book_for_customer`, `admin_create_recurring_booking`,
+   `book_slot_paying`) no aplican el tope: es una decisión del staff.
+7. **Orden y modo de locks en `book_slot()`:** ocurrencia (`FOR UPDATE`)
+   → advisory de organización → advisory de `auth.uid()` → fila del
+   `Customer`. El lock sobre `customers` es **`FOR NO KEY UPDATE`, nunca
+   `FOR UPDATE`**: `FOR UPDATE` choca con el `FOR KEY SHARE` que toma todo
+   FK check hacia `customers`, y `admin_create_recurring_booking()` toma
+   ese `KEY SHARE` (insert en `recurring_bookings`) *antes* de lockear
+   ocurrencias: orden inverso, deadlock reproducido en vivo (segundo pase
+   del gate, 2026-09-30). `NO KEY UPDATE` sigue chocando consigo mismo y
+   con el `UPDATE` de `source`, así que serializa lo mismo. Regla general:
+   un lock de fila nuevo sobre una tabla referenciada por FKs usa
+   `FOR NO KEY UPDATE` salvo que haga falta bloquear inserts de hijos.
+8. **Errores del alta:** `PLAN_LIMIT_REACHED*` / `SUBSCRIPTION_INACTIVE`
+   del trigger de planes se devuelven como
+   `ORGANIZATION_NOT_ACCEPTING_NEW_CUSTOMERS`, sin conteo (verificado por
+   pg y por PostgREST). Rate limits de alta, serializados con
+   `pg_advisory_xact_lock(int,int)`: 10/org/hora, 30/org/24h, 5 por
+   `auth.uid()`/24h (global). Verificado exacto bajo concurrencia real y
+   forzada.
+
+**Cerrado en el segundo pase del gate (2026-09-30)** — los tres puntos
+siguientes quedan como historial; ver reglas 6-8.
+
+- **Un `Customer` `SELF_SERVICE` no tiene tope de reservas.** Una sola
+  cuenta descartable (el alta de cuenta es sólo captcha, Fase 41) puede
+  reservar todas las ocurrencias futuras de un servicio sin pago, y además
+  llamar `create_recurring_booking()` sobre cada regla. Los rate limits
+  del alta no acotan esto. Recomendado: tope de `Booking`s `CONFIRMED`
+  futuras mientras `source = 'SELF_SERVICE'` (serializado con un lock por
+  cliente), y `create_recurring_booking()` vedado a `SELF_SERVICE`; el
+  staff "verifica" pasando `source` a `STAFF` (la policy
+  `customers_update_staff` ya lo permite).
+- **Las altas `SELF_SERVICE` consumen el `max_customers` del plan del
+  tenant** (`enforce_plan_limit`, starter = 50 = el tope horario): en una
+  hora se agota el cupo de clientes y el staff no puede dar de alta a
+  nadie. Además, llegado el límite `book_slot()` propaga crudo
+  `PLAN_LIMIT_REACHED: clientes (50/50)` a cualquier cuenta autenticada
+  (filtra el conteo del tenant); lo mismo `SUBSCRIPTION_INACTIVE`.
+- **Los rate limits no están serializados**: N llamadas concurrentes leen el
+  mismo conteo (verificado: 3 concurrentes con 4 previas → 7 filas contra
+  un tope de 5). Acotado por concurrencia; cerrar con
+  `pg_advisory_xact_lock` por `auth.uid()` y por organización antes de
+  contar.
+
+## Fase 49 — disponibilidad pública por recurso (ADR-0048): regla de disclosure
+
+Gate liviano de `security-engineer` (así lo pide la propia ADR-0048, por ser
+una RPC `anon`) sobre
+`backend/supabase/migrations/20260930190000_phase49_public_resource_availability.sql`.
+`get_public_availability()` (pública, sin login) agrega `resource_id`
+(siempre) y `resource_name` (sólo si `organizations.public_resource_names`,
+opt-in nuevo, `default false`).
+
+1. **No se filtra ninguna otra columna de `resources`.** El `select` final
+   sólo lee `r.name`, envuelto en
+   `case when v_org.public_resource_names then r.name else null end` —
+   nunca `r.*`, `description`, `is_exclusive` ni `capacity`.
+2. **El flag se lee del mismo `v_org` que ya filtra las filas**, resuelto
+   una sola vez arriba por `p_organization_slug` — no hay un segundo
+   lookup a `organizations` ni una organización compartida entre filas.
+   Por construcción (el `resource_id` de una `SlotOccurrence` siempre sale
+   de la `ScheduleRule` que la generó, y el trigger `schedule_rules_same_org`
+   de la Fase 3 + la validación de la Fase 48 garantizan que ese recurso es
+   de la misma organización), una organización con el flag en `false` nunca
+   puede terminar mostrando el nombre de un recurso de otra organización
+   con el flag en `true`.
+3. **El `join public.resources r on r.id = so.resource_id` es seguro**:
+   `slot_occurrences.resource_id` es `not null` con FK `on delete cascade`
+   (Fase 3) — el `inner join` no cambia el conteo de filas que la función
+   ya devolvía antes de este cambio, mismo patrón ya usado sin filtrar por
+   `resources.is_active` en `agenda_occurrences()` (Fase 8, el equivalente
+   de staff que la propia ADR cita como precedente).
+4. **Grants idénticos** a la versión anterior (`anon, authenticated`,
+   misma firma de 4 parámetros) — `drop` + `create`, nunca `create or
+   replace`, porque agregar columnas al `returns table` cambia los OUT
+   parameters (mismo patrón ya usado en Fases 5/16/20).
+
+Verificado con tests nuevos contra `reservaste-stg`
+(`test/phase49.public-resource-availability.test.ts`, 3 casos + 8 de
+`phase4.public-calendar.test.ts` sin regresión = 11/11): flag apagado
+(default) da `resource_name=null` siempre vía el cliente `anon` real; flag
+prendido da el nombre real; aislamiento cross-tenant confirmado (una
+organización con el flag apagado nunca filtra el nombre del recurso de
+otra organización con el flag prendido, en la misma ventana de tiempo).
+
+**Hallazgo BAJO, pre-existente, fuera de alcance de esta fase**:
+`resources.organization_id` se puede cambiar vía `UPDATE` directo sin que
+ningún trigger lo impida (la policy `resources_update_staff`, Fase 35, sólo
+valida membresía en `USING`/`WITH CHECK`, nunca inmutabilidad de la
+columna). Alguien miembro de dos organizaciones podría mover un recurso de
+B a A; si B tenía el flag prendido, su calendario público seguiría
+mostrando el nombre de un recurso que ya es de A. Exige ser miembro de
+ambas organizaciones — no explotable por un tercero ni por `anon`. Mismo
+hallazgo ya registrado en `docs/database.md` Fase 48 — pendiente de una
+fase propia con ADR (trigger de inmutabilidad de `organization_id` en
+`resources` y, por coherencia, en `services`).
 
 ## Pendiente de definir (Phase 1)
 

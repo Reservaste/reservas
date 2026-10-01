@@ -3618,3 +3618,63 @@ hallazgo cross-tenant ni explotable por un cliente):
   toma lock ni tiene un índice único parcial — dos llamadas concurrentes
   podrían pasar ambas el chequeo (pre-existente, no agravado por esta
   Fase). Cerrarlo es un cambio de schema y amerita una propuesta aparte.
+
+## Fase 49 — disponibilidad pública por recurso, opt-in (ADR-0048, migración `20260930190000_phase49_public_resource_availability.sql`)
+
+`get_public_availability()` (RPC pública, `anon`+`authenticated`, usada por
+el calendario sin login) nunca devolvía `resource_id` ni el nombre del
+recurso — un cliente que mira el calendario no podía saber "con quién" es
+cada turno (ej. qué barbero). El RPC equivalente de staff
+(`agenda_occurrences()`, Fase 8) ya lo expone; sólo faltaba en el camino
+público.
+
+- **`organizations.public_resource_names boolean not null default false`**
+  — opt-in del dueño, mismo patrón que `open_booking_enabled`/
+  `makeup_credits_enabled`.
+- **`get_public_availability()` recreada** (`drop function` + `create
+  function` — agregar columnas al `returns table` cambia los OUT
+  parameters, no alcanza con `create or replace`, mismo patrón ya usado en
+  Fases 5/16/20): agrega al final `resource_id uuid` (siempre, es opaco,
+  sirve para agrupar/filtrar sin revelar nada por sí solo) y
+  `resource_name text` (sólo si `public_resource_names=true` para esa
+  organización; si no, `null`). Nuevo `join public.resources r on r.id =
+  so.resource_id` — seguro porque `slot_occurrences.resource_id` es `not
+  null` con FK `on delete cascade` (Fase 3), no cambia el conteo de filas
+  que la función ya devolvía. Ninguna otra columna de `resources` se
+  expone (ni `description` ni nada más). Mismos `grant`/`revoke` que la
+  versión anterior.
+- **Regla de disclosure nueva** (análoga en espíritu a ADR-0008, pero
+  sobre identidad en vez de cupo): el nombre de un recurso es un dato que
+  hoy nunca salió por `anon`, y no debería empezar a salir por default
+  silenciosamente — por eso el flag nace en `false`. Detalle completo del
+  gate en `docs/security.md`, sección "Fase 49".
+
+**Tests** (`backend/test/phase49.public-resource-availability.test.ts`, 3
+casos, vía el cliente `anon` real): flag apagado (default) da
+`resource_id` siempre no-null y `resource_name` siempre `null`; flag
+prendido da el nombre real del recurso; aislamiento cross-tenant (una
+organización con el flag apagado nunca filtra el nombre del recurso de
+otra organización con el flag prendido). **Verificado en vivo contra
+`reservaste-stg` por el Orchestrator (2026-10-01)**: 11/11 (los 3 nuevos +
+los 8 de `test/phase4.public-calendar.test.ts`, sin regresión). Gate de
+`security-engineer`: **LISTO** (sin hallazgos ALTO/MEDIO; 1 hallazgo BAJO
+pre-existente, ver abajo). Gate de `reviewer`: **LISTO**.
+
+**Frontend** (`app/actions/public.ts`, `components/calendar/public-calendar.tsx`,
+`app/[organizationSlug]/page.tsx`): mapeo manual de `resource_id`/
+`resource_name` (mismo motivo que `recently_released` — el paquete
+`@reservaste/domain` está fijado a un commit SHA, no republicado todavía
+con estas columnas). Selector "Con quién" en el calendario público, chip
+por recurso nombrado + "Cualquiera", visible sólo con 2 o más recursos
+nombrados distintos (si el flag está apagado o hay un único recurso, no se
+renderiza nada — el componente no conoce el flag, sólo reacciona a si
+`resourceName` llegó `null`). Combina de forma independiente con el filtro
+de servicio ya existente (ninguno fuerza un AND sobre el otro). Toggle
+OWNER-only "Nombres de recursos públicos" en Configuración, mismo patrón
+1:1 que el de "Reserva abierta" (ADR-0047).
+
+**Deuda técnica identificada pero fuera de alcance de esta fase** (mismo
+hallazgo que Fase 48, no agravado por esta): `resources.organization_id`
+(y `services.organization_id`) se puede cambiar vía `UPDATE` directo sin
+que ningún trigger lo impida — sólo explotable por alguien miembro de dos
+organizaciones a la vez, nunca por un tercero ni por `anon`.
