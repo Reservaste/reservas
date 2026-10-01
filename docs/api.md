@@ -290,6 +290,14 @@ desde este teléfono").
 
 ### `auth.ts` — `signUpWithPassword()` pasa `emailRedirectTo`
 
+**[Obsoleto desde ADR-0043, 2026-09-29]** ADR-0043 deshabilitó la
+confirmación de email del todo — `signUp()` devuelve sesión inmediata,
+sin ningún mail que armar, así que `emailRedirectTo` ya no tiene efecto y
+se sacó del código (`frontend/app/actions/auth.ts`). El mecanismo
+descripto abajo (link de confirmación → `/auth/confirm` → nonce de
+continuación) tampoco existe más: `/auth/confirm` fue eliminado. Se deja
+esta sección como historial de por qué existió, no como estado vigente.
+
 `options.emailRedirectTo = ${siteUrl()}/auth/callback?next=<returnTo>`
 (misma forma que el `redirectTo` de Google, ya en el allowlist de Supabase
 Auth). Sin eso, con "Confirm email" prendido el link del mail caía en la
@@ -932,7 +940,17 @@ existe una cuenta con ese email. Si todavía no se registró..." — o sea, el
 dueño no puede dar de alta a un profesor hasta que el profesor se registre
 solo. Es exactamente el problema que ADR-0026 resolvió para clientes.
 
-**`inviteMember` no cambia.** Sigue siendo el camino rápido para quien ya tiene
+**[Obsoleto desde ADR-0043, 2026-09-29]** `inviteMember()` fue eliminado
+(junto con `InviteForm`/el botón "Ya tiene cuenta") — la RPC que
+invocaba, `invite_member_by_email()`, quedó con su `grant execute`
+revocado porque le daba membresía (incluido rol OWNER) a quien tuviera
+ese email registrado, sin probar que fuera la persona real. El único
+camino vigente para sumar equipo es la invitación por token de
+ADR-0034 (`TeamInvitationForm` → `/equipo/[token]`), que también cubre a
+alguien que ya tiene cuenta (el canje sólo exige que el email de la
+sesión coincida con el de la invitación).
+
+**`inviteMember` no cambia [ya no aplica, ver nota de arriba].** Sigue siendo el camino rápido para quien ya tiene
 cuenta (ADR-0034 resolución 1), elegido **explícitamente** por el dueño. No
 hacerlo automático es deliberado: elegir el camino según si el email ya tiene
 cuenta reintroduciría el oráculo de "¿tal email está registrado en la
@@ -1524,3 +1542,111 @@ sólo le permiten a un segundo contexto de navegador replantar la cookie
 y el shape de `ClaimActivationState` en `frontend/app/actions/activation.ts` quedan
 intactos — esta fase sólo agrega una forma nueva de que la cookie llegue a existir en
 el contexto correcto antes de que ese código, sin tocar, corra.
+
+## Fase 42/43/46 — recursos exclusivos, franja horaria y `ScheduleRuleGroup.items` (ADR-0044/0045/0050)
+
+Tres cambios de contrato en `frontend/app/actions/`, implementados juntos (detalle
+backend completo en `docs/database.md` Fases 42/43/46):
+
+**`resources.ts`** (ADR-0044): `ResourceWithExclusive extends Resource` agrega
+`isExclusive: boolean` (mapeado a mano desde `resources.is_exclusive` vía
+`mapResourceWithExclusive()` — el paquete `@reservaste/domain` no se republicó con
+este campo). `createResource`/`updateResource` leen `formData.get("isExclusive") ===
+"on"` y lo mandan como `is_exclusive`. `describeResourceSaveError()` traduce el
+código Postgres `23P01`/`exclusion_violation` (constraint `EXCLUDE USING gist` de
+ADR-0044) a un mensaje en español.
+
+**`schedule.ts` — `createScheduleRuleSpan()`** (ADR-0045): nueva server action junto
+a la ya existente `createScheduleRuleGroup()`. Llama al RPC `create_schedule_rule_span`
+con `p_range_start`/`p_range_end`/`p_step_minutes` en vez de un `p_local_start_time`
+único. `describeScheduleRuleSpanError()` traduce los códigos de error que puede
+devolver: `RESOURCE_SCHEDULE_CONFLICT` (delega a `describeScheduleConflict()`),
+`STEP_TOO_SHORT`, `TOO_MANY_START_TIMES`, `TOO_MANY_SCHEDULE_RULES`,
+`SPAN_SELF_OVERLAP_ON_EXCLUSIVE_RESOURCE`, `EXCLUSIVE_RESOURCE_CAPACITY_MUST_BE_ONE`,
+`RANGE_TOO_SHORT`, `INVALID_RANGE` — cualquier otro código (`RESOURCE_NOT_FOUND`,
+`NOT_AUTHORIZED`, `NO_RULES_CREATED`, `INVALID_WEEKDAY`, hoy inalcanzables desde la
+UI) cae al genérico "No se pudo crear el horario". `describeScheduleConflict()`
+normaliza el offset de 2 dígitos que devuelve Postgres (`"...+00"`) a formato ISO
+(`"...+00:00"`) antes de `new Date(...)` — V8 devuelve `Invalid Date` si no.
+
+**`schedule.ts` — `ScheduleRuleGroup` (CAMBIO DE CONTRATO, no aditivo)**: deja de
+tener `weekdays: number[]` / `ruleIds: string[]` / `localStartTime: string`
+(zippeados por índice, uno por `weekday`). Pasa a tener **`items:
+ScheduleRuleGroupItem[]`**, un elemento real `{ ruleId, weekday, localStartTime }`
+por cada fila de `schedule_rules` del grupo — necesario porque `create_schedule_rule_span()`
+puede generar un `group_id` con varios `localStartTime` para el mismo `weekday`, algo
+que el shape viejo (pensado para "un horario, varios días") no puede representar sin
+perder información. `durationMinutes`/`capacity`/`resourceId`/`resourceName` siguen
+colapsados (constantes garantizadas dentro de un `group_id`, ver ADR-0050 en
+`docs/decisions.md`). Único consumidor:
+`frontend/app/org/[slug]/services/[serviceId]/schedule/page.tsx`.
+
+## Fase 44 — cobrar un turno suelto desde el mostrador (ADR-0046)
+
+Cambios de contrato en `frontend/app/actions/admin.ts` (detalle backend completo en
+`docs/database.md` Fase 44):
+
+**`AgendaOccurrence`/`getAgenda()` (cambio aditivo)**: tres campos nuevos al final,
+`dropInPlanId: string | null`, `dropInPrice: number | null`, `dropInCurrency: string |
+null` — el precio del plan `DROP_IN` activo del servicio de esa ocurrencia, `null` si
+no tiene ninguno. `dropInPrice` se coerciona con `Number(...)` (igual que todo otro
+campo `numeric` que sale de un RPC en este repo — PostgREST puede serializarlo como
+string). `OccurrenceDetail`/`getOccurrence()` heredan los tres campos por spread, sin
+cambios propios.
+
+**`OccurrenceAttendee`/`getOccurrenceAttendees()` (cambio aditivo)**: dos campos
+nuevos, `isCovered: boolean` (¿tiene cobertura vigente para este turno — plan, pago
+`DROP_IN`, o crédito de recupero?) y `paidPaymentId: string | null` (el `Payment` PAID
+anclado a esta ocurrencia puntual para este cliente, si existe). Importante: para un
+servicio con `payment_required=false`, `isCovered` es **siempre** `true` (ADR-0018/
+ADR-0046: ningún servicio gratuito mira plan/pago/crédito), así que la UI que decide
+si mostrar el botón "Cobrar $X" usa `paidPaymentId === null`, nunca `!isCovered` — ese
+último sólo sirve para decidir si hace falta cobrar en servicios que exigen pago.
+
+**`chargeDropIn(organizationSlug, occurrenceId, prevState, formData)` (server action
+nueva)**: llama a `book_slot_paying(p_slot_occurrence_id, p_customer_id)` — nunca manda
+`p_amount` (el monto cobrado lo decide siempre el servidor, el `DROP_IN` activo del
+servicio). `formData` espera `customerId`. Mapea los status de la RPC
+(`OCCURRENCE_NOT_AVAILABLE`/`CUSTOMER_NOT_IN_ORG`/`ALREADY_COVERED`/`SLOT_FULL`/
+`NO_DROP_IN_PLAN`/`INVALID_AMOUNT`/`ALREADY_PAID`) a mensajes en español, y la
+excepción `BOOKING_RACE_LOST` a "probá de nuevo" — `NOT_AUTHORIZED` cae en
+`describeError()` ya existente. Consumida por `app/org/[slug]/agenda/
+occurrence-actions.tsx` (botón por asistente + sección "Cobrar turno suelto" para un
+cliente todavía no anotado), visible sólo con `canManagePayments`
+(`hasOrgPermission(permissions, "MANAGE_PAYMENTS")`, resuelto server-side en
+`app/org/[slug]/agenda/[occurrenceId]/page.tsx`) y con `dropInPlanId` no nulo.
+
+## Fase 45 — reserva abierta (ADR-0047)
+
+Cambios de contrato en `frontend/app/actions/customer.ts` y
+`frontend/app/actions/settings.ts` (detalle backend completo en `docs/database.md`
+Fase 45):
+
+**`CanBookResult` (cambio aditivo)**: nuevo valor `"OK_OPEN_BOOKING"` — tratado
+exactamente igual que `"OK"` en todo lugar que decide si mostrar el botón de
+confirmar reserva (único consumidor real hoy:
+`frontend/app/[organizationSlug]/reservar/confirmar/page.tsx`, `canBookNow = canBook
+=== "OK" || canBook === "OK_OPEN_BOOKING"`). Lo devuelve `can_customer_book()`/
+`can_customer_book_detail()` únicamente cuando la organización tiene
+`open_booking_enabled=true` y la persona autenticada no tiene absolutamente ninguna
+fila de `customers` (ni inactiva) para esa organización — nunca antes de resolver la
+sesión. La página de confirmación muestra, sólo en ese caso, un `Alert` informativo
+("vas a quedar registrado como cliente de X al confirmar"); el dato que usa
+(`organizationName`) ya era público en esa misma pantalla, no es información nueva.
+
+**`lib/booking-reasons.ts` (cambio aditivo)**: 4 entradas nuevas en `BOOKING_REASONS`
+para status que puede devolver `book_slot()` sólo en el camino self-service —
+`RATE_LIMITED_HOURLY`/`RATE_LIMITED_DAILY` (clasificados `"neutral"` en
+`bookingReasonTone()`, nada que la persona pueda arreglar, es timing),
+`ORGANIZATION_NOT_ACCEPTING_NEW_CUSTOMERS` (`"owner"` — mensaje deliberadamente
+genérico, tapa dos causas internas distintas que nunca se revelan a un visitante sin
+cuenta) y `SELF_SERVICE_BOOKING_LIMIT_REACHED` (sin clasificar, cae en el default
+`"customer"` — hay algo que la persona puede hacer, escribirle al negocio).
+
+**`updateOrganizationSettings()` (cambio aditivo)**: nuevo campo de formulario
+opcional `openBookingEnabled` (`formData.has(...)`, mismo patrón que
+`makeupCreditsEnabled` — si el formulario no lo manda, no toca la configuración
+existente), persiste `organizations.open_booking_enabled`. OWNER-only, mismo guard ya
+existente al principio de la función (cubre el formulario entero, no sólo este
+campo). Expuesto en `app/org/[slug]/settings/settings-form.tsx`, sección "Reserva
+abierta".
