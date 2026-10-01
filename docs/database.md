@@ -3073,12 +3073,11 @@ tope de reglas por llamada; recurso exclusivo + `step_minutes < duration_minutes
 `capacity > 1` → `EXCLUSIVE_RESOURCE_CAPACITY_MUST_BE_ONE`; conflicto real contra una regla
 existente en el mismo recurso exclusivo → `RESOURCE_SCHEDULE_CONFLICT`, atómico (nada
 insertado); caso feliz en recurso exclusivo sin conflictos con `step_minutes ==
-duration_minutes` (turnos pegados sin pisarse). **Pendiente de correr contra
-`reservaste-stg`** (requiere confirmación explícita del usuario antes de tocar la base
-compartida — no corrido todavía a la fecha de este resumen). No requiere gate de
+duration_minutes` (turnos pegados sin pisarse). **Verificado en vivo contra
+`reservaste-stg` por el Orchestrator** (2026-09-30): 385/385 tests de la suite completa en
+verde, incluidos estos 7 casos, sin regresiones. No requiere gate de
 `security-engineer` (mismo perímetro de permisos que `create_schedule_rule_group`, hereda la
-RLS existente) — `reviewer` debe confirmar los topes defensivos explícitamente antes de
-mergear.
+RLS existente) — `reviewer` confirmó los topes defensivos explícitamente, LISTO.
 
 ## Fase 44 — cobrar un turno suelto desde el mostrador (ADR-0046, migración `20260930140000_phase44_drop_in_booking.sql`)
 
@@ -3214,3 +3213,351 @@ explicando por qué ese test necesita un servicio gratuito, ver arriba); (e)
 (h) `NO_DROP_IN_PLAN`. **Verificado en vivo contra `reservaste-stg`**: los 8 casos pasan,
 incluidos en los 366/366 de la suite completa. Migración sin
 aplicar contra `reservaste-stg` todavía.
+
+## Fase 45 — reserva abierta: alta de `Customer` en el momento de reservar (ADR-0047, migración `20260930150000_phase45_open_booking.sql`)
+
+Implementa ADR-0047 tal como fue diseñada: un flag opt-in por organización
+(`organizations.open_booking_enabled`, default `false`, mismo patrón que
+`makeup_credits_enabled`/`customer_activation_enabled`/`public_availability_display`)
+que deja reservar a cualquier cuenta autenticada sin `Customer` previo,
+dando de alta ese `Customer` dentro de la misma transacción que la reserva.
+El primer gate de `security-engineer` encontró dos hallazgos ALTO y uno
+MEDIO, ya corregidos en el mismo archivo de migración — ver "Corrección
+post-gate de seguridad" más abajo. **Pendiente de un segundo gate corto de
+`security-engineer`**, acotado a los tres fixes, antes de dar luz verde
+para prender el flag en un negocio real. Migración sin aplicar contra
+`reservaste-stg` todavía (edición in-place: no está mergeada a `main`).
+
+### `customers.source` — `STAFF` | `SELF_SERVICE`
+
+Enum nuevo (`public.customer_source`), no un `text` + `check` suelto, mismo
+estilo que `customer_cancellation_reason`/`makeup_credit_origin`. Columna
+`not null default 'STAFF'`: preserva el significado de toda fila existente
+(la única vía de alta hasta esta fase era de mostrador — `enroll_customer_
+by_email`, `create_managed_customer`, o un insert directo del panel). Solo
+`book_slot()` escribe `SELF_SERVICE`, para que el staff pueda filtrar o
+depurar las altas auto-inscriptas.
+
+### `can_book_reason` gana `OK_OPEN_BOOKING`
+
+Vía `alter type ... add value if not exists` (mismo patrón ya usado en la
+Fase 17 para `OUTSIDE_PLAN_QUOTA`/`OVER_PLAN_QUOTA`/`SERVICE_HAS_NO_PLAN` —
+se puede usar el valor nuevo en la misma migración que lo agrega, confirmado
+por ese precedente ya en producción). Es un reason de **solo lectura**: la
+UI pública lo usa para decidir si ofrece "Reservar" en vez de "pedile al
+negocio que te habilite", pero nunca implica por sí solo que la reserva vaya
+a confirmarse (puede seguir fallando por cupo, cobertura, o el rate limit de
+`book_slot()`).
+
+### `can_customer_book()` — único cambio: qué devuelve sin `Customer` activo
+
+Su lógica de alta/reactivación **no se toca** (vive exclusivamente en
+`book_slot()`, ver abajo) — sigue siendo puramente de lectura, invocada
+también por `can_customer_book_detail()` y `quote_booking()` sin ningún
+side-effect nuevo. Único cambio: cuando no hay `Customer` activo para
+`(organization_id, auth.uid())`, en vez de devolver siempre `NOT_A_CUSTOMER`,
+ahora chequea si la organización tiene `open_booking_enabled` **y** si no
+existe absolutamente ninguna fila de `customers` para ese par — ni siquiera
+inactiva. Solo si ambas condiciones se cumplen devuelve `OK_OPEN_BOOKING`;
+en cualquier otro caso (flag apagado, o ya existe una fila aunque esté
+inactiva) sigue devolviendo `NOT_A_CUSTOMER` exactamente igual que antes de
+esta fase. Esta segunda condición es más estricta que el texto original de
+la ADR (que solo mencionaba el flag) y es deliberada: es lo que garantiza
+que una baja del staff nunca quede disfrazada de "podés reservar", sin
+depender de que cada llamador de `can_customer_book()` sepa distinguir ese
+caso por su cuenta.
+
+`preview_recurring_booking()` **no invoca `can_customer_book()`** — resuelve
+la identidad del cliente por su cuenta (`select id from customers where
+organization_id=... and profile_id=auth.uid() and is_active`) desde la Fase
+17, sin pasar por esta función. No se tocó en esta fase: sigue devolviendo
+`NOT_A_CUSTOMER` para una cuenta sin alta previa incluso con el flag
+prendido — la propiedad que importa (cero side-effects en un preview) ya
+estaba garantizada de por sí, porque ningún camino de lectura escribe en
+`customers`.
+
+### `book_slot()` — recreada: el alta on-the-fly, y por qué necesitó un `BEGIN/EXCEPTION`
+
+Recreada desde la versión vigente de la Fase 20
+(`20260922180000_phase20_makeup_credits.sql:726`). El `FOR UPDATE` sobre la
+ocurrencia sigue siendo lo primero (ADR-0004, sin cambios). Justo después,
+si no hay `Customer` activo para `(organization_id, auth.uid())` **y** no
+existe ninguna fila (ni inactiva) para ese par, y la organización tiene
+`open_booking_enabled`, y pasa el rate limit (ver abajo), inserta un
+`Customer` (`profile_id=auth.uid()`, `display_name` del `Profile`,
+`is_active=true`, `source='SELF_SERVICE'`) — **antes** de invocar
+`can_customer_book()`, para que esa llamada encuentre la fila recién creada
+y siga su camino normal (`OK`/`PAYMENT_REQUIRED`/`SLOT_FULL`/etc.) en vez de
+ver `OK_OPEN_BOOKING`, que `book_slot()` nunca debería devolver como su
+propio status final. Concurrencia de dos pestañas (mismo `auth.uid()`
+reservando ocurrencias *distintas* a la vez, donde el lock de la ocurrencia
+no alcanza a serializar porque cada transacción lockea una fila distinta):
+`unique_violation` sobre `unique(organization_id, profile_id)` (Fase 1),
+atrapado con un re-select de la fila ya comprometida por quien ganó la
+carrera.
+
+**La pieza no trivial, encontrada durante la implementación (no estaba en
+el texto original de la ADR):** un `RETURN` normal dentro de una función
+plpgsql **no deshace** lo que esa misma función ya escribió antes en la
+misma transacción — recién una excepción (atrapada o no) lo hace, vía el
+`SAVEPOINT` implícito que crea todo bloque `BEGIN/EXCEPTION`.
+`book_slot_paying()` (Fase 44/ADR-0046) ya había resuelto exactamente este
+problema para su `Payment` con el mismo mecanismo ("`raise exception`,
+nunca un status, desde el insert en adelante"). Acá hacía falta lo mismo
+para el `Customer`: si `book_slot()` simplemente hiciera `return jsonb_
+build_object('status', 'SLOT_FULL')` después de haber insertado el
+`Customer` on-the-fly, esa fila quedaría **committeada** igual (la
+transacción completa del RPC se cierra con éxito aunque el `status` interno
+diga que falló), dejando exactamente el `Customer` huérfano que ADR-0047
+prohíbe explícitamente. La solución: todo el flujo de reserva posterior al
+`FOR UPDATE` (incluido el camino que **no** crea ningún `Customer` nuevo —
+flag apagado, o `Customer` ya existente) vive dentro de un único bloque
+`BEGIN ... EXCEPTION WHEN OTHERS ... END`, para no mantener dos copias del
+mismo flujo. Cada salida que antes de esta fase era un `RETURN` directo
+(`NOT_A_CUSTOMER`, `PAYMENT_REQUIRED`, `SLOT_FULL`, `DUPLICATE`, etc.) pasó a
+ser `RAISE EXCEPTION 'BOOK_SLOT_ABORT' USING DETAIL = <status>`, atrapado
+por el `WHEN OTHERS`, que lo devuelve como el mismo `jsonb` de siempre
+(`GET STACKED DIAGNOSTICS ... = PG_EXCEPTION_DETAIL`). El efecto para
+cualquier llamador existente (flag apagado, o `Customer` preexistente) es
+**idéntico** al de antes de esta fase; el efecto nuevo es que, si la función
+sí creó un `Customer`, cualquier fallo posterior lo deshace junto con todo
+lo demás. `MAKEUP_CREDIT_RACE_LOST` (ADR-0025 Sec 2.4.5) se deja como
+excepción "cruda" (no pasa por `BOOK_SLOT_ABORT`) a propósito, para seguir
+viéndose como un error real del lado del cliente RPC igual que antes de
+esta fase — el `WHEN OTHERS` la re-lanza tal cual, pero el `ROLLBACK` al
+`SAVEPOINT` ya deshizo todo (`Booking` y `Customer`, si lo hubo) antes de
+que la excepción se re-propague.
+
+### Rate limit del alta on-the-fly
+
+Mismo patrón que `issue_customer_activation()` (Fase 21,
+`20260922190000_phase21_managed_customers.sql:335-353`), resuelto adentro
+de la RPC sin infraestructura nueva. Tres topes, en este orden (el primero
+en fallar corta):
+
+- **10 altas `SELF_SERVICE` por organización por hora** (`customers` con
+  `organization_id = <la de la ocurrencia>`, `source = 'SELF_SERVICE'`,
+  `created_at > now() - interval '1 hour'`): protege a un tenant puntual de
+  un pico de abuso, incluso repartido entre varias cuentas descartables.
+- **30 altas `SELF_SERVICE` por organización por día** (mismo criterio,
+  ventana de 24h) — tope nuevo, agregado en la corrección post-gate (ver
+  abajo).
+- **5 altas `SELF_SERVICE` por `auth.uid()` cada 24h** — deliberadamente
+  **global**, no por organización: la misma cuenta descartable podría
+  repartir el abuso entre varios tenants en vez de concentrarlo en uno
+  solo, y un tope por organización no lo vería venir.
+
+`RATE_LIMITED_HOURLY`/`RATE_LIMITED_DAILY` son status nuevos de
+`book_slot()` (nunca de `can_customer_book()`, que no conoce el rate limit
+— solo describe elegibilidad, no lo que la escritura real vaya a aceptar).
+`RATE_LIMITED_DAILY` lo devuelven tanto el tope diario por organización
+como el tope diario por `auth.uid()` — mismo status para los dos, la UI no
+necesita distinguirlos.
+
+### Corrección post-gate de seguridad (2026-09-30)
+
+El gate de `security-engineer` encontró dos hallazgos ALTO y uno MEDIO
+contra la versión original de esta fase (ver `docs/decisions.md`, ADR-0047
+"Corrección post-gate de seguridad"). Los tres se corrigieron en el mismo
+archivo de migración (todavía no mergeado a `main` cuando se implementaron,
+así que se editó in-place, sin migración nueva):
+
+1. **ALTO — sin tope de reservas para un `Customer` `SELF_SERVICE`.** Antes
+   de insertar la `Booking`, si el `Customer` resuelto tiene
+   `source='SELF_SERVICE'` (recién creado en esta misma llamada o de una
+   reserva anterior, da igual), `book_slot()` toma `FOR UPDATE` sobre esa
+   fila de `customers` y cuenta sus `Booking` `CONFIRMED` con
+   `slot_occurrences.start_at >= now()`; con 2 o más, rechaza con
+   `SELF_SERVICE_BOOKING_LIMIT_REACHED` antes de escribir nada. El `FOR
+   UPDATE` (no un advisory lock) es lo que serializa dos reservas en
+   paralelo del mismo `Customer` para que no lean las dos "todavía tengo 1"
+   y pasen juntas. `create_recurring_booking()` (la RPC self-service, no
+   `admin_create_recurring_booking()`) se recreó con el mismo veto de
+   entrada (`SELF_SERVICE_CANNOT_CREATE_RECURRING`), antes de cualquier
+   otro chequeo — sin esto, una serie recurrente hubiera vaciado la agenda
+   de una regla entera por otra puerta que nunca pasa por `book_slot()`. El
+   staff "verifica" a un cliente real con un `UPDATE` directo de
+   `customers.source` a `'STAFF'` — la policy `customers_update_staff` ya
+   alcanza, sin RPC nueva; desde ese momento ninguno de los dos topes le
+   aplica.
+2. **ALTO — límite de plan filtrado + tope de organización demasiado
+   alto.** El `INSERT INTO customers` del alta on-the-fly ahora atrapa
+   `PLAN_LIMIT_REACHED` (que trae el conteo crudo de clientes del tenant,
+   ej. `"PLAN_LIMIT_REACHED: clientes (50/50)"`) y `SUBSCRIPTION_INACTIVE`
+   — ambas excepciones del trigger `enforce_plan_limit()`/
+   `organization_can_operate()` (Fase 10) — y las traduce a un status
+   propio, `ORGANIZATION_NOT_ACCEPTING_NEW_CUSTOMERS`, sin filtrar el
+   detalle crudo a ningún caller autenticado. El tope horario de altas por
+   organización bajó de 50 a 10, y se agregó el tope diario de 30 que no
+   existía (ver arriba) — con 50/hora, una hora de abuso agotaba un plan
+   starter completo (`max_customers=50`) y bloqueaba al staff de dar de
+   alta clientes reales. El tope por `auth.uid()` (5/24h) se dejó igual: el
+   gate señaló que ya no es la defensa principal (crear una cuenta solo
+   cuesta pasar el captcha), la defensa real pasa a ser el tope de reservas
+   del punto 1.
+3. **MEDIO — rate limits no serializados.** El conteo+chequeo de cada tope
+   no estaba serializado entre llamadas concurrentes (el gate reprodujo 7
+   altas pasando contra un tope de 5). Los tres conteos (hourly/daily por
+   organización, daily por `auth.uid()`) ahora corren detrás de
+   `pg_advisory_xact_lock` con un namespace de dos claves propio
+   (`hashtext('book_slot_rate_limit_org'|'book_slot_rate_limit_user'),
+   hashtext(<id>::text)`) — deliberadamente distinto del keyspace de un
+   solo `bigint` que ya usa `check_payment_no_duplicate()` (Fase 25) para
+   otro propósito, para no competir por el mismo lock. Se libera solo al
+   terminar la transacción, igual que el resto de los advisory locks del
+   repo.
+
+Un segundo MEDIO (`can_customer_book()` devuelve `OK_OPEN_BOOKING` sin
+validar ocurrencia cancelada/pasada o servicio inactivo) se aceptó sin fix:
+no es explotable, porque `book_slot()` vuelve a validar todo desde cero
+antes de escribir nada — es un detalle de UI, no de seguridad.
+
+### Tests (`backend/test/phase45.open-booking.test.ts`)
+
+Los nueve casos originales — (a) flag apagado; (b) flag prendido; (c)
+`SLOT_FULL` después del alta sin `Customer` huérfano; (d) `Customer`
+inactivo no se reactiva; (e) concurrencia de dos pestañas en ocurrencias
+distintas; (f) rate limit diario por `auth.uid()`; (g) rate limit horario
+por organización (actualizado a 10, antes 50); (h) **crítico** —
+`preview_recurring_booking()` no crea ningún `Customer`; (i) un `Customer`
+`STAFF` ya activo reserva igual — más los casos nuevos de la corrección
+post-gate: (g2) rate limit diario por organización (30, nuevo); (j) tope de
+2 reservas `SELF_SERVICE`, incluida la verificación del staff destrabándolo;
+(k) `create_recurring_booking()` rechaza a un `Customer` `SELF_SERVICE` y lo
+permite después de que el staff lo verifica; (l)/(m) `PLAN_LIMIT_REACHED`/
+`SUBSCRIPTION_INACTIVE` nunca llegan crudos al caller; (n) concurrencia real
+(14 `Customer`s distintos reservando 14 ocurrencias distintas en paralelo
+contra el tope horario de 10) — a propósito con ocurrencias distintas, no
+una compartida, porque el `FOR UPDATE` de la ocurrencia por sí solo ya
+serializaría las llamadas y ocultaría el race que este test tiene que
+probar. No corridos todavía contra `reservaste-stg` — pendiente de
+autorización explícita antes de tocar la base remota (no hay entorno local
+con Docker en este proyecto).
+
+## Fase 46 — `schedule_rule_groups()` deja de colapsar horarios múltiples por grupo (ADR-0050, migración `20260930160000_phase46_schedule_rule_groups_multi_time.sql`)
+
+Bug real encontrado por `frontend-engineer` al construir la UI de ADR-0045
+(franja horaria): `schedule_rule_groups()` (Fase 16, ADR-0022) agrupa por
+`group_id` y colapsa `local_start_time`/`duration_minutes`/`capacity` con
+`min(...)` — correcto cuando `create_schedule_rule_group()` era el único
+productor de grupos (cada fila con `weekday` distinto, todas comparten el
+mismo `local_start_time`). `create_schedule_rule_span()` (Fase 43) puede
+generar un `group_id` con varias filas que comparten `weekday` y difieren
+en `local_start_time` (ej. un día, 4 horarios 09:00/09:30/10:00/10:30) —
+`min(local_start_time)` las colapsaba todas a "09:00", y el frontend
+zippeaba `weekdays[i]`/`ruleIds[i]` por posición asumiendo un `weekday`
+distinto por fila, perdiendo toda distinción entre las 4.
+
+- **`schedule_rule_groups(p_service_id)` recreada** (`drop function` +
+  `create function`, cambia el shape de retorno — no alcanza con `create or
+  replace`). Deja de devolver `local_start_time time`, `weekdays
+  smallint[]`, `rule_ids uuid[]`. Devuelve en su lugar **`items jsonb`**:
+  un array con un elemento `{ ruleId, weekday, localStartTime }` por cada
+  fila real de `schedule_rules` del grupo, ordenado por `(weekday,
+  localStartTime, ruleId)` — nunca colapsado, nunca zippeado por posición
+  contra un segundo array.
+- **`duration_minutes`, `capacity`, `resource_id`, `resource_name` siguen
+  colapsados** con `min()`/primer valor: son constantes garantizadas
+  dentro de un mismo `group_id` en todo camino de inserción existente —
+  `create_schedule_rules_batch()` (Fase 43) recibe un único
+  `p_duration_minutes`/`p_capacity`/`p_resource_id` por llamada y estampa
+  todo el lote bajo un `group_id` recién generado; el insert manual de una
+  sola regla (`createScheduleRule` en `frontend/app/actions/schedule.ts`)
+  nunca fija `group_id` explícito, así que siempre cae en un grupo propio
+  de una sola fila vía el default de columna. Ningún camino agrega una
+  fila a un `group_id` **existente** con recurso/duración/capacidad
+  distintos.
+- Mismo permiso que antes: `grant execute on function
+  public.schedule_rule_groups(uuid) to authenticated` (se re-otorga tras el
+  `drop`, que borra los grants existentes).
+
+**Cambio de contrato, no aditivo**: se quitan tres columnas del shape de
+retorno y se agrega una — el único consumidor
+(`frontend/app/actions/schedule.ts::listScheduleRuleGroups()` →
+`frontend/app/org/[slug]/services/[serviceId]/schedule/page.tsx`) necesita
+reescribirse para leer `items` en vez de los dos arrays viejos zippeados
+por índice. Ver ADR-0050 en `docs/decisions.md` para el detalle completo y
+el estado de aprobación.
+
+**Tests** (`backend/test/phase43.schedule-rule-spans.test.ts`, casos nuevos
+(h)/(i)): (h) crea una franja real de un día/4 horarios con
+`create_schedule_rule_span()` y confirma que `schedule_rule_groups()`
+devuelve las 4 combinaciones reales en `items` (4 `ruleId` distintos, cada
+uno con su propio `localStartTime`, cruzado contra `schedule_rules`
+directamente) en vez de una colapsada; (i) repite el caso original de
+ADR-0022 (weekdays distintos, mismo horario) y confirma el mismo resultado
+correcto con el shape nuevo — no regresión.
+`backend/test/phase16.groups-attendance-payments.test.ts` se actualizó
+(único assert que dependía del shape viejo) para leer `items`. **Migración
+aplicada y verificada en vivo contra `reservaste-stg` por el Orchestrator
+(2026-09-30)**: suite completa 391/393, los 2 fallos encontrados eran de
+`test/phase39.customer-standing-reservations.test.ts` y resultaron ser un
+bug no relacionado — ver Fase 47. No requirió gate de `security-engineer`
+(mismo perímetro de lectura ya existente, `is_organization_member`, sin
+cambios de RLS/permisos).
+
+## Fase 47 — reserva fija: "hoy" era la fecha UTC del servidor, no la fecha local de la organización (bugfix, migración `20260930170000_phase47_recurring_booking_local_today.sql`)
+
+Bug real y pre-existente (no introducido por las Fases 42-46), encontrado
+al investigar 2 fallos nuevos en
+`test/phase39.customer-standing-reservations.test.ts` tras aplicar la Fase
+46. `customer_service_plan_quotas()` (Fase 39) calcula "hoy" como la fecha
+**local** de la organización (`(now() at time zone v_org.timezone)::date`,
+igual que `customer_billing_horizon()`), pero
+`admin_create_recurring_booking()` (Fase 32) y `create_recurring_booking()`
+(Fase 45) usaban `current_date` del servidor (**UTC**) para tres cosas: el
+chequeo de serie duplicada (`customer_standing_series_on_rule`), el
+chequeo de cupo de plan (`assert_series_within_plan_quota`), y el
+`start_date` de la `RecurringBooking` (dependía del default de columna
+`current_date`, Fase 6).
+
+Para una organización en un timezone detrás de UTC (`America/Montevideo`,
+UTC-3 — el caso de uso real del producto), entre las 00:00 y las 03:00 UTC
+la fecha UTC ya es "mañana" mientras la fecha local todavía es "hoy". Una
+serie creada en esa ventana nacía con `start_date` = mañana (servidor),
+posterior a "hoy local", e invisible para `customer_service_plan_quotas()`
+(`assigned_count` volvía 0 en vez del valor real). Reproducido en vivo
+contra `reservaste-stg` el 2026-09-30 ~00:17 UTC (servidor en `2026-10-01`,
+Montevideo todavía en `2026-09-30`) y confirmado como la causa exacta de
+los 2 fallos de Fase 39 — no tiene relación con las Fases 42-46.
+
+- **`admin_create_recurring_booking(uuid, uuid)` y
+  `create_recurring_booking(uuid)` recreadas**: mismas firmas, mismos
+  `GRANT`/`REVOKE`, mismo comportamiento salvo que ahora resuelven `v_org`
+  desde `organizations` (vía `v_rule.organization_id`, ya validado contra
+  el recurso/permiso de la organización — ningún input directo del
+  caller) y calculan `v_today := (now() at time zone v_org.timezone)::date`
+  en vez de `current_date`, usado consistentemente en los tres puntos de
+  arriba. El veto `SELF_SERVICE_CANNOT_CREATE_RECURRING` de ADR-0047 queda
+  intacto, antes de cualquier otro chequeo.
+- **`admin_preview_recurring_booking()` recreada con el mismo fix**, por
+  consistencia: de solo lectura, pero en la misma ventana horaria podía
+  responder "ya existe serie" de forma distinta a lo que después hacía la
+  creación real ya corregida.
+- **Backfill de una sola vez** (mismo archivo): corrige con `created_at`
+  como fuente de verdad las filas de `recurring_bookings` que ya quedaron
+  con `start_date` adelantado por el bug viejo. Solo baja `start_date`
+  (nunca lo sube), así que no puede violar `recurring_bookings_valid_range`
+  (`end_date` siempre es `null` en la práctica — ninguna función del repo
+  lo escribe).
+
+**Verificado en vivo contra `reservaste-stg` por el Orchestrator
+(2026-09-30)**: los 2 tests de Fase 39 que fallaban pasan; re-corridos en
+aislamiento (para descartar contención del pooler gratuito, que causó 14
+fallos espurios por timeout en una corrida conjunta de 5 archivos) los
+suites completos de Fase 6, 11, 32, 38, 39 y 45 — 66/66 tests en verde,
+sin regresiones. Gate de `security-engineer`: **LISTO** (sin hallazgos
+ALTO/MEDIO; 2 hallazgos BAJO, ambos ya incorporados a esta misma
+migración — el backfill y el fix de `admin_preview_recurring_booking`).
+Gate de `reviewer`: **LISTO**.
+
+**Deuda técnica identificada pero fuera de alcance de este fix** (ningún
+hallazgo cross-tenant ni explotable por un cliente):
+- El `OWNER` puede cambiar `organizations.timezone` sin validar contra
+  `pg_timezone_names` (Fase 34) — un valor inválido rompería estas RPCs
+  solo para su propia organización; un cambio hacia atrás podría reabrir
+  brevemente la misma ventana de inconsistencia que este fix cierra.
+- El chequeo de serie duplicada (`customer_standing_series_on_rule`) no
+  toma lock ni tiene un índice único parcial — dos llamadas concurrentes
+  podrían pasar ambas el chequeo (pre-existente, no agravado por esta
+  Fase). Cerrarlo es un cambio de schema y amerita una propuesta aparte.
