@@ -3079,6 +3079,63 @@ verde, incluidos estos 7 casos, sin regresiones. No requiere gate de
 `security-engineer` (mismo perímetro de permisos que `create_schedule_rule_group`, hereda la
 RLS existente) — `reviewer` confirmó los topes defensivos explícitamente, LISTO.
 
+## Fase 48 — `resource_id` cross-tenant en las RPCs de horarios (bugfix de seguridad, migración `20260930180000_phase48_resource_organization_validation.sql`)
+
+Hallazgo real (🟡 no bloqueante) del gate de review sobre el frontend de ADR-0050:
+ninguna de las RPC que insertan `schedule_rules` recibiendo un `p_resource_id` validaba
+que el recurso perteneciera a la misma organización que el `Service` antes de usarlo —
+gap preexistente desde Fase 16/ADR-0022, heredado sin corregir por Fase 43/ADR-0045. No
+explotable desde la UI actual (`resourceId` siempre sale de una lista ya filtrada por
+organización), pero sí con un POST directo al server action con un `resource_id` real de
+otra organización.
+
+- **`create_schedule_rules_batch()`** (interna): no resolvía el recurso, insertaba
+  `p_resource_id` directo del caller. En la práctica nunca llegaba a confirmar una fila
+  cross-tenant (lo frenaban de rebote `check_schedule_rule_conflicts()` y el trigger de
+  tabla `schedule_rules_same_org`, Fase 3), pero no por validación propia. Ahora resuelve
+  `v_resource` y valida `v_resource.organization_id = p_organization_id`.
+- **`create_schedule_rule_group()`**: nunca resolvía el recurso, delegaba todo a la batch.
+  Ahora valida también, fail-fast, antes de cualquier otro trabajo (además de la validación
+  que queda en la batch — defensa en profundidad).
+- **`create_schedule_rule_span()`**: resolvía el recurso pero sólo chequeaba existencia
+  (`RESOURCE_NOT_FOUND`), nunca organización — y antes de correr ninguna autorización sobre
+  ese recurso. Un caller que conociera el UUID de un recurso ajeno podía inferir su
+  `is_exclusive`/capacidad según qué excepción de negocio volvía
+  (`SPAN_SELF_OVERLAP_ON_EXCLUSIVE_RESOURCE` vs. `EXCLUSIVE_RESOURCE_CAPACITY_MUST_BE_ONE`).
+  Ahora la validación de organización corre en el mismo punto donde ya estaba el chequeo de
+  existencia, antes de leer `is_exclusive`/capacidad.
+- **Código de error**: `RESOURCE_NOT_FOUND`, sin diferenciar "no existe" de "no es tuyo" —
+  mismo patrón que el resto del repo para no filtrar existencia cross-tenant. Mismas
+  firmas y mismos `GRANT`/`REVOKE` que las versiones que reemplaza (confirmado byte a byte
+  por `reviewer`).
+- El trigger `schedule_rules_same_org` (Fase 3) sigue siendo el backstop final a nivel
+  tabla para inserts/updates directos — esta validación es defensa adicional explícita en
+  la capa de aplicación, no lo reemplaza; `security-engineer` confirmó que ningún camino
+  del trigger deja pasar algo que la validación nueva bloquee, ni al revés.
+
+**Tests nuevos**: `backend/test/phase16.groups-attendance-payments.test.ts` y
+`backend/test/phase43.schedule-rule-spans.test.ts` (caso `(j)`) — un STAFF de la
+Organización A, con un `resource_id` real de la Organización B, rechazado con
+`RESOURCE_NOT_FOUND` y cero filas creadas (verificado desde ambos lados: ni en
+`schedule_rules` de A ni asociado al recurso de B). **Verificado en vivo contra
+`reservaste-stg`**: phase16 (12/12), phase43 (10/10), phase42 (5/5), sin regresiones. Gate
+de `security-engineer`: **LISTO**. Gate de `reviewer`: **LISTO**.
+
+**Deuda técnica encontrada pero fuera de alcance de este fix** (ningún hallazgo bloqueante
+para esta migración):
+- **MEDIO**: `resources.organization_id` (y probablemente `services.organization_id`) se
+  puede cambiar vía `UPDATE` directo — ningún trigger lo impide hoy. Un STAFF miembro de
+  dos organizaciones podría mover un recurso de A a B, lo que deja las `schedule_rules`/
+  `slot_occurrences` de A apuntando a un recurso ajeno y permite que B modifique
+  `is_exclusive` de un recurso que A sigue usando (propagado por
+  `resources_propagate_is_exclusive()`, Fase 42). Rompe una invariante de aislamiento
+  multi-tenant (CLAUDE.md) — necesita su propia fase con ADR (trigger `before update` que
+  rechace `new.organization_id is distinct from old.organization_id`).
+- **BAJO**: `check_schedule_rule_conflicts()` (Fase 42) distingue `RESOURCE_NOT_FOUND` de
+  `NOT_AUTHORIZED`, lo cual es un oráculo de existencia de UUIDs de recursos de cualquier
+  organización (sin revelar su forma, sólo su existencia). Impacto mínimo con UUID v4;
+  recomendado unificar a `RESOURCE_NOT_FOUND` en un fix menor futuro.
+
 ## Fase 44 — cobrar un turno suelto desde el mostrador (ADR-0046, migración `20260930140000_phase44_drop_in_booking.sql`)
 
 Implementa `docs/proposals/adr-0025-makeup-credits.md` §2.8 (diseño original nunca
