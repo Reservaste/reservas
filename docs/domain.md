@@ -83,9 +83,26 @@ La plataforma es genérica. **Nunca** modelar `Gym`, `Member`, `Trainer`,
 - **Resource** — lo que se ocupa al prestar el servicio: sala, profesional,
   cancha, equipo. Relación `Service`↔`Resource` es **N:M** (un `Service`
   puede requerir uno o más `Resource`, y un `Resource` puede prestarse a
-  varios `Service`). `ScheduleRule` referencia el/los `Resource`
-  concretos que ocupa esa regla — no asumir 1:1 entre `Service` y
-  `Resource` en el schema.
+  varios `Service`) — pero esa relación es "cualquiera de estos puede
+  prestarlo", nunca "los necesita simultáneamente": todo camino de reserva
+  (grilla o dinámico) ocupa exactamente un `Resource` por `Booking`.
+  `ScheduleRule` referencia el/los `Resource` concretos que ocupa esa
+  regla — no asumir 1:1 entre `Service` y `Resource` en el schema.
+  `isExclusive` (ADR-0044, default `false`): un `Resource` exclusivo no
+  puede tener dos `SlotOccurrence` `ACTIVE` que se solapen en el tiempo
+  (constraint `EXCLUDE` a nivel de base, independiente de qué `Service`
+  las originó). `dynamicAvailability` (ADR-0051, default `false`, sólo
+  válido si `isExclusive=true`): opt-in adicional — ese `Resource` deja de
+  usar una grilla de `ScheduleRule` pre-generada y calcula su
+  disponibilidad al momento de reservar, contra una `ResourceAvailabilityWindow`
+  propia (ver más abajo). Nunca puede tener `ScheduleRule` activas al
+  mismo tiempo (se valida en varias capas).
+- **ResourceAvailabilityWindow** (ADR-0051) — la "apertura general" de un
+  `Resource` con `dynamicAvailability=true` para un día de la semana (ej.
+  "lunes 9 a 17"), sin `Service` atado — a diferencia de `ScheduleRule`,
+  una sola fila cubre un rango horario completo, no un punto de inicio
+  fijo. `get_dynamic_availability()` calcula los horarios concretos
+  dentro de esta ventana al momento de reservar.
 - **ScheduleRule** — regla recurrente de horario para un `Service`/
   `Resource` (día de semana, hora, duración, capacidad, vigencia
   desde/hasta).
@@ -100,10 +117,22 @@ La plataforma es genérica. **Nunca** modelar `Gym`, `Member`, `Trainer`,
   originó. `startAt`/`endAt` son `timestamptz`, convertidos desde
   `weekday + localStartTime + Organization.timezone` en SQL al generar,
   nunca con un offset cacheado (ADR-0014 — así DST se resuelve solo).
-  Estados (ADR-0010): **`ACTIVE | BLOCKED | CANCELLED`** — `BLOCKED` es
-  administrativo y reversible (mantenimiento, sin reservas activas),
-  `CANCELLED` es terminal. `COMPLETED` **no se persiste**, es derivado de
-  `startAt < now()` en la capa de lectura.
+  `scheduleRuleId` es nullable desde ADR-0051: `null` únicamente para una
+  ocurrencia creada por `hold_dynamic_slot()` sobre un `Resource` dinámico
+  (nunca proviene de una `ScheduleRule`); toda ocurrencia generada por el
+  cron de grilla lo sigue teniendo poblado como siempre — es la forma en
+  que el resto del sistema distingue "viene de grilla" de "viene de
+  disponibilidad dinámica".
+  Estados (ADR-0010, `HELD` agregado en ADR-0051): **`ACTIVE | BLOCKED |
+  CANCELLED | HELD`** — `BLOCKED` es administrativo y reversible
+  (mantenimiento, sin reservas activas), `CANCELLED` es terminal.
+  `HELD` es una reserva temporal de 5 minutos (`heldUntil`/`heldBy`),
+  exclusiva de `hold_dynamic_slot()`/`book_dynamic_slot()`: ocupa el
+  `Resource` exclusivo igual que `ACTIVE` (mismo constraint `EXCLUDE`),
+  pero nunca tiene una `Booking` real todavía. Se promueve a `ACTIVE` al
+  confirmar, o vuelve a `CANCELLED` si vence sin confirmar o si la
+  confirmación falla — nunca queda huérfana. `COMPLETED` **no se
+  persiste**, es derivado de `startAt < now()` en la capa de lectura.
 - **Booking** — una reserva de un `Customer` sobre un `SlotOccurrence`.
   Independiente del medio de pago.
 - **RecurringBooking** — una serie de `Booking` generadas a partir de un

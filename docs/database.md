@@ -3678,3 +3678,127 @@ hallazgo que Fase 48, no agravado por esta): `resources.organization_id`
 (y `services.organization_id`) se puede cambiar vía `UPDATE` directo sin
 que ningún trigger lo impida — sólo explotable por alguien miembro de dos
 organizaciones a la vez, nunca por un tercero ni por `anon`.
+
+## Fase 50 — disponibilidad dinámica para recursos exclusivos, opt-in por Resource (ADR-0051, migraciones `20261002100000_phase50a_dynamic_availability_enum.sql`, `20261002100001_phase50b_dynamic_availability.sql`, `20261002110000_phase50c_dynamic_availability_security_fixes.sql`)
+
+Un `Resource` exclusivo (ADR-0044) que ofrece varios `Service` de distinta
+duración (ej. un barbero con "Corte" 30min y "Combo" 60min) arma hoy una
+grilla pre-generada independiente por servicio — cuando el generador choca
+con una ocurrencia ya existente de otro servicio en el mismo recurso, el
+`EXCLUDE` de ADR-0044 rechaza el insert y `generate_slot_occurrences_for_rule()`
+salta esa fecha **en silencio**, dejando huecos de disponibilidad
+inexplicables. Esta fase agrega un segundo opt-in,
+`resources.dynamic_availability` (default `false`, sólo válido si
+`is_exclusive=true`), que hace que ese recurso calcule su disponibilidad
+al momento de reservar en vez de depender de la grilla. Detalle de diseño
+completo en `docs/decisions.md`, ADR-0051.
+
+**Tres migraciones, en orden** (el split entre 50a y 50b es obligatorio:
+Postgres no deja usar un valor de enum recién agregado vía `ALTER TYPE
+... ADD VALUE` dentro de una restricción DDL —como un `EXCLUDE`— en la
+misma transacción en la que se agregó; el cuerpo de una función plpgsql
+no tiene ese problema porque se valida recién en su primera ejecución):
+
+- **50a**: `resources.dynamic_availability` + `CHECK
+  resources_dynamic_requires_exclusive`; trigger
+  `resources_guard_dynamic_toggle` (rechaza `RESOURCE_HAS_ACTIVE_SCHEDULE_RULES`
+  si se intenta prender el flag con `ScheduleRule` activas — nunca
+  cascadea una cancelación automática); `services.duration_minutes`
+  (nullable, sólo requerida cuando el servicio se ofrece desde un recurso
+  dinámico — los recursos de grilla siguen sacando la duración de
+  `schedule_rules.duration_minutes`); tabla `resource_availability_windows`
+  (RLS + trigger de pairing cross-tenant, mismo patrón que `schedule_rules`);
+  `create_resource_availability_window()`; `slot_occurrences.schedule_rule_id`
+  pasa a nullable; `slot_occurrence_status` gana `HELD` + columnas
+  `held_until`/`held_by`.
+- **50b**: `EXCLUDE slot_occurrences_exclusive_resource_no_overlap`
+  ampliado para cubrir también `HELD` (drop+add, un `EXCLUDE` no se puede
+  alterar in-place); **`get_dynamic_availability(p_organization_slug,
+  p_service_id, p_date, p_resource_id default null)`** (pública,
+  `anon`+`authenticated`, mismo perímetro/disclosure que
+  `get_public_availability()` de Fase 49 — `resource_id` siempre, `resource_name`
+  sólo si `organizations.public_resource_names`); horarios candidatos
+  generados cada **15 minutos fijos** dentro de cada ventana (sin
+  parámetro `step_minutes` todavía, a diferencia de ADR-0045); **`hold_dynamic_slot(p_resource_id,
+  p_service_id, p_start_at)`** (exige `auth.uid()`, tope de **3 holds
+  vivos simultáneos por perfil**, TTL de **5 minutos**); **`book_dynamic_slot(p_slot_occurrence_id,
+  p_use_makeup_credit)`** (wrapper delgado sobre `book_slot()`, no
+  duplica cobertura/pago/alta de `Customer`); **`release_dynamic_hold(p_slot_occurrence_id)`**;
+  `create_schedule_rules_batch()`/`create_schedule_rule_group()`/`create_schedule_rule_span()`
+  rechazan `RESOURCE_IS_DYNAMIC` sobre un recurso dinámico;
+  `generate_slot_occurrences_for_rule()` los saltea defensivamente;
+  `generate_all_slot_occurrences()` suma housekeeping diario de holds
+  vencidos (sin job nuevo).
+- **50c**: fixes del primer gate de `security-engineer` (NO LISTO →
+  fixes → LISTO) — ver `docs/security.md`, sección "Fase 50", para el
+  detalle completo de cada hallazgo. Resumen de los cambios de
+  comportamiento:
+  - Trigger nuevo `bookings_release_dynamic_slot`: al cancelar la última
+    `Booking` `CONFIRMED` de una ocurrencia dinámica, la ocurrencia pasa a
+    `CANCELLED` también — **sin esto, cancelar no liberaba el horario
+    nunca más** (invariante no negociable de CLAUDE.md roto).
+  - **`book_dynamic_slot()` cambia de contrato**: ya no distingue
+    `HOLD_EXPIRED` de `HOLD_NOT_FOUND` — **ambos casos, y también "el hold
+    es de otra persona" (`held_by <> auth.uid()`) y "es una ocurrencia de
+    grilla" (`schedule_rule_id is not null`), devuelven el mismo
+    `HOLD_NOT_FOUND`**, sin distinción observable (mismo criterio
+    no-oráculo que `release_dynamic_hold()`). `frontend-engineer`: no
+    hay ningún otro status de rechazo para este RPC más allá de `HOLD_NOT_FOUND`
+    y lo que `book_slot()` ya devuelve (rate limits, `SLOT_FULL`,
+    `PAYMENT_REQUIRED`, etc., sin cambios).
+  - Policy `slot_occurrences_toggle_active_blocked` ahora excluye también
+    `HELD` (antes sólo excluía `CANCELLED`) — un STAFF ya no puede tocar
+    directo por PostgREST una fila `HELD`, propia o ajena.
+  - Trigger nuevo en `schedule_rules` (`BEFORE INSERT OR UPDATE`) cierra
+    el insert/reactivación directo por Data API sobre un recurso
+    dinámico, que antes esquivaba `RESOURCE_IS_DYNAMIC`.
+  - `resource_availability_windows_write_staff` (era `FOR ALL`, incluía
+    `DELETE`) se separa en `INSERT`/`UPDATE`, sin `DELETE` (ADR-0036: dar
+    de baja una ventana es `is_active=false`).
+
+**Tests** (`backend/test/phase50.dynamic-availability.test.ts`, 15
+casos): cubren el flag y su guard, el alta de ventanas, `get_dynamic_availability()`
+respetando ventana/ocupación, el ciclo completo hold→confirmar con
+`Booking` real, los 5 fixes de seguridad de 50c (liberación al cancelar,
+`held_by` ajeno, STAFF vía PostgREST directo sobre `HELD`, `DELETE`
+directo sobre ventanas, insert directo a `schedule_rules`), aislamiento
+cross-tenant, y el rechazo `RESOURCE_IS_DYNAMIC` de las tres RPCs de
+horarios. **Verificado en vivo contra `reservaste-stg` por el Orchestrator
+(2026-10-02)**: 15/15, más regresión limpia en phase6/7/11/16/20/25/32/42/43/45/49
+(un único fallo en una corrida conjunta de 7 archivos resultó ser
+contención transitoria del pooler gratuito, confirmado no-regresión
+reproduciendo ese archivo solo). Gate de `security-engineer`: **LISTO**
+en la segunda vuelta (primera vuelta NO LISTO, con 2 hallazgos
+bloqueantes reales — ver `docs/security.md`). Gate de `reviewer`:
+**LISTO**.
+
+**Deuda técnica identificada, no bloqueante, diferida a propósito**:
+- Decisión 3 de ADR-0051 (bloquear un `Service` que exija más de un
+  `Resource` simultáneo si alguno es dinámico) — no implementada porque
+  el schema no tiene hoy ningún mecanismo real de "reserva simultánea de
+  N `Resource`" que bloquear (`service_resources` es "cualquiera de
+  estos puede prestarlo", no "los necesita a la vez"); queda como
+  precondición de la Fase 2 de la ADR cuando ese soporte N:M real se
+  construya.
+- Falta índice sobre `slot_occurrences (held_by) where status='HELD'`
+  (el conteo de holds vivos en `hold_dynamic_slot()` hace sequential
+  scan hoy — barato a esta escala, candidato de fast-follow).
+- `create_resource_availability_window()` no rechaza ni fusiona ventanas
+  superpuestas del mismo recurso/día — `get_dynamic_availability()`
+  devolvería horarios duplicados si el dueño da de alta dos ventanas que
+  se pisan; el frontend que la consuma debería tolerarlo (dedupear por
+  `start_at`) hasta que se cierre.
+- Tres hallazgos BAJO residuales del segundo gate de seguridad (orden de
+  lock del trigger de liberación, `created_by`/`cancelled_by` no fijados
+  en `resource_availability_windows_update_staff`, STAFF todavía puede
+  editar `schedule_rule_id`/`start_at`/`end_at` directo sobre una fila
+  `ACTIVE`/`BLOCKED` de su propia organización) — ver `docs/security.md`
+  para el detalle completo de cada uno.
+- `BAJO-3` de la ADR (alguien que nunca podría reservar en una
+  organización igual puede holdear horarios repetidamente) — decisión de
+  producto diferida explícitamente.
+
+**Frontend**: todavía no empezado (según la propia ADR-0051, corresponde
+recién después de este gate). Necesita: selector de servicio → día →
+horario (consumiendo `get_dynamic_availability()`) → hold → confirmar
+(login si falta, mismo patrón que ADR-0047) → `book_dynamic_slot()`.

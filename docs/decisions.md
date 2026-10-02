@@ -4568,3 +4568,51 @@ tests). Gate de `security-engineer` obligatorio antes de cerrar (toca el
 mismo perímetro crítico que ADR-0046/ADR-0047). `frontend-engineer`
 construye el flujo nuevo recién después de que el backend esté verificado
 en vivo contra `reservaste-stg` y gateado.
+
+### Addendum (2026-10-02) — Fase 1 implementada, gate de seguridad cerrado en dos vueltas
+
+Implementación completa en `backend/supabase/migrations/20261002100000_phase50a_...sql`
+/ `20261002100001_phase50b_...sql` / `20261002110000_phase50c_...sql` —
+detalle técnico completo en `docs/database.md`, sección "Fase 50".
+**Corrección sobre el texto original de este ADR, arriba**: el primer
+pase de `book_dynamic_slot()` devolvía `HOLD_NOT_FOUND`/`HOLD_EXPIRED`
+como dos resultados distintos; el gate de seguridad (ver
+`docs/security.md`, sección "Fase 50") encontró que esa distinción
+funcionaba como oráculo y que la función no validaba `held_by`,
+permitiendo robar/sabotear el hold de otra persona si se conseguía el
+`slot_occurrence_id` (filtrable por URL, igual que `/reservar/confirmar?slot=`).
+**El contrato real, ya implementado, unifica todo en un único
+`HOLD_NOT_FOUND`** (no existe, no es tuyo, venció, o es una ocurrencia de
+grilla) — `frontend-engineer` tiene que construir el flujo contra este
+contrato, no el que describe el cuerpo original del ADR arriba.
+
+El gate de `security-engineer` encontró, en su primer pase, dos
+hallazgos bloqueantes reales (no en el texto original de este ADR, que
+sólo anticipaba el rate limit y el límite técnico del `EXCLUDE`):
+
+1. **Cancelar una reserva dinámica nunca liberaba el horario** — rompía
+   el invariante no negociable de CLAUDE.md "cancelar libera el cupo
+   inmediatamente", permitiendo vaciar la agenda de un recurso dinámico
+   de forma permanente con una sola cuenta (hold → confirmar → cancelar,
+   repetido). Cerrado con un trigger nuevo sobre `bookings`.
+2. **`book_dynamic_slot()` no validaba `held_by`** (el robo/sabotaje
+   descrito arriba). Cerrado agregando esa validación, con la
+   unificación de contrato ya descripta.
+
+Más un hallazgo MEDIO (un STAFF podía escribir `HELD` directo vía
+PostgREST, afectando el tope global de holds de clientes de OTRAS
+organizaciones) y dos BAJO (inserts directos a `schedule_rules`
+esquivando `RESOURCE_IS_DYNAMIC`; `resource_availability_windows` con
+`DELETE` habilitado), todos cerrados en la misma pasada (migración 50c).
+Segunda vuelta del gate: **LISTO**, con 3 hallazgos BAJO residuales
+registrados como deuda técnica no bloqueante (ver `docs/database.md`
+"Fase 50" y `docs/security.md` "Fase 50" para el detalle completo).
+Gate de `reviewer`: **LISTO**.
+
+Verificado en vivo contra `reservaste-stg`: 15/15 en
+`test/phase50.dynamic-availability.test.ts`, regresión limpia en el
+resto de la suite afectada.
+
+**Próximo paso**: `frontend-engineer` construye el flujo nuevo (elegir
+servicio → día → horario → hold → confirmar), contra el contrato real
+ya cerrado arriba.

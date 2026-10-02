@@ -2589,6 +2589,97 @@ hallazgo ya registrado en `docs/database.md` Fase 48 — pendiente de una
 fase propia con ADR (trigger de inmutabilidad de `organization_id` en
 `resources` y, por coherencia, en `services`).
 
+## Fase 50 — disponibilidad dinámica para recursos exclusivos (ADR-0051): reglas
+
+Gate de `security-engineer` en dos vueltas sobre
+`backend/supabase/migrations/20261002100000_phase50a_...sql` /
+`20261002100001_phase50b_...sql` / `20261002110000_phase50c_...sql`
+(`hold_dynamic_slot()`/`book_dynamic_slot()`/`release_dynamic_hold()`/
+`get_dynamic_availability()`/`create_resource_availability_window()`),
+verificado en vivo contra `reservaste-stg`.
+
+**Primera vuelta: NO LISTO**, dos hallazgos bloqueantes reales (ninguno
+anticipado por el diseño original de ADR-0051):
+
+1. **ALTO — cancelar una reserva dinámica nunca liberaba el horario.**
+   `cancel_booking()` sólo pasa la `Booking` a `CANCELLED`; la
+   `SlotOccurrence` dinámica quedaba `ACTIVE` para siempre (capacidad 1,
+   sin reservas reales), contada como ocupada tanto por
+   `get_dynamic_availability()` como por el `EXCLUDE`. Rompía el
+   invariante no negociable de CLAUDE.md "cancelar libera el cupo
+   inmediatamente" — con una sola cuenta se podía vaciar la agenda de un
+   recurso dinámico de forma permanente (hold → confirmar → cancelar,
+   repetido; el tope de 2 reservas futuras de ADR-0047 no frena nada
+   porque cancelar libera el contador). **Regla**: toda `SlotOccurrence`
+   sin `scheduleRuleId` (marca de "viene de disponibilidad dinámica,
+   nunca de grilla") tiene que liberarse ella misma cuando su última
+   `Booking` `CONFIRMED` se cancela — implementado como trigger `AFTER
+   UPDATE OF status ON bookings`, no dentro de `cancel_booking()`, para
+   cubrir todos los caminos de cancelación existentes sin tener que
+   auditarlos ni mantenerlos sincronizados uno por uno.
+2. **MEDIO — `book_dynamic_slot()` no validaba `held_by`.** Cualquier
+   cuenta autenticada que consiguiera el `slot_occurrence_id` (filtrable
+   por URL/logs, mismo patrón que `/reservar/confirmar?slot=`) podía
+   confirmar el hold de OTRA persona a su propio nombre dentro de los 5
+   minutos, o hacerlo fallar a propósito para que la reversión cancelara
+   el hold de la víctima. Además funcionaba como oráculo de existencia
+   (`HOLD_EXPIRED` vs. `HOLD_NOT_FOUND` revelaban si el id existía).
+   **Regla**: un hold nunca es un token al portador — sólo `held_by =
+   auth.uid()` puede confirmarlo, y **todo rechazo (no existe, no está
+   `HELD`, venció, es de otra persona, o es una ocurrencia de grilla)
+   devuelve el mismo `HOLD_NOT_FOUND`**, sin distinción observable desde
+   afuera (mismo criterio no-oráculo que ya usaba `release_dynamic_hold()`).
+
+Más un hallazgo MEDIO y dos BAJO, cerrados en la misma pasada:
+
+3. **MEDIO — un STAFF podía escribir `HELD` directo vía PostgREST**,
+   afectando el tope GLOBAL de 3 holds/perfil de clientes de OTRAS
+   organizaciones (conociendo su `profile_id`, un STAFF de la
+   Organización A podía convertir ocurrencias de su propio recurso en
+   `HELD` con `held_by = <profile_id de la víctima>` y `held_until` muy
+   en el futuro, dejándola sin poder holdear en NINGUNA organización de
+   la plataforma). **Regla**: la policy que permite a un STAFF togglear
+   `ACTIVE ↔ BLOCKED` directo sobre `slot_occurrences` de su propia
+   organización tiene que excluir explícitamente `HELD` — ni leer-para-
+   escribir una fila ya `HELD`, ni poder producir `HELD` por ese camino
+   (eso es exclusivo de `hold_dynamic_slot()`, `security definer`).
+4. **BAJO — inserts directos a `schedule_rules` esquivaban
+   `RESOURCE_IS_DYNAMIC`** (el chequeo vive en `create_schedule_rules_batch()`,
+   no en la Data API). Impacto confirmado nulo (ninguna ocurrencia real
+   se genera para esas reglas), cerrado igual con un trigger `BEFORE
+   INSERT OR UPDATE` que además sirve de defensa contra la carrera
+   "¿prendo el flag o creo la regla primero?" (serializa con `FOR SHARE`
+   contra el trigger del guard del toggle).
+5. **BAJO — `resource_availability_windows` tenía `DELETE` habilitado**
+   por PostgREST (policy `FOR ALL`), contra el patrón ya establecido de
+   ADR-0036 (ninguna tabla de negocio tiene `DELETE` real — baja lógica
+   vía `is_active`/`cancelled_at`). Separado en `INSERT`/`UPDATE`, sin
+   `DELETE`; el `INSERT` ahora exige `created_by = auth.uid()` (antes se
+   podía falsificar).
+
+**Segunda vuelta: LISTO**, con 3 hallazgos BAJO residuales, ninguno
+bloqueante, documentados como deuda técnica en `docs/database.md` "Fase
+50": orden de lock del trigger de ALTO-1 (caso límite de deadlock sólo
+posible entre dos pestañas del mismo cliente sobre una ocurrencia de
+grilla, Postgres lo resuelve abortando una transacción limpiamente, sin
+riesgo de integridad); `resource_availability_windows_update_staff` no
+fija `created_by`/`cancelled_by` (sólo afecta trazabilidad dentro de la
+propia organización); un STAFF todavía puede editar
+`scheduleRuleId`/`startAt`/`endAt` directo sobre una fila `ACTIVE`/`BLOCKED`
+de su propia organización (superficie pre-existente, no agravada por
+esta fase, acotada al propio tenant).
+
+**Verificado y confirmado correcto** (sin cambios): rate limiting de
+holds con el mismo patrón `pg_advisory_xact_lock` + `count(*)` ya
+verificado bajo concurrencia real en ADR-0047; el `EXCLUDE` ampliado
+protege `ACTIVE`/`ACTIVE`, `ACTIVE`/`HELD` y `HELD`/`HELD` por igual;
+`book_dynamic_slot()` delega el 100% de cobertura/pago/alta de
+`Customer` en `book_slot()` sin duplicar lógica, y revierte la promoción
+a `CANCELLED` ante cualquier salida no-`OK` (incluidos todos los status
+de rate-limit/`ORGANIZATION_NOT_ACCEPTING_NEW_CUSTOMERS` de ADR-0047);
+aislamiento multi-tenant correcto en las 5 RPCs nuevas, ningún
+`organization_id` llega como parámetro libre.
+
 ## Pendiente de definir (Phase 1)
 
 - Proveedor de auth concreto: **Supabase Auth** (ADR-0002, cerrado).
