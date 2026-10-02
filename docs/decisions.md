@@ -2688,6 +2688,28 @@ antes de que el job corra por primera vez.
 
 **Implementación**: delegada a `qa-engineer`.
 
+### Addendum (2026-09-30) — Turnstile rompe la suite de humo en los flujos con login
+
+ADR-0043 (desactivar confirmación por email) activó el widget real de
+Cloudflare Turnstile en el login de producción. Un navegador operado por
+Playwright nunca pasa el challenge ("Checking your Browser…", cuelgue
+indefinido) — investigado a fondo, sin bypass legítimo disponible:
+
+- No existe whitelist de IP para un sitio que no está proxyado por
+  Cloudflare.
+- Servir una site key de test (vía header/detección de entorno) tampoco
+  funciona: Supabase Auth valida el captcha contra **una sola** secret key
+  a nivel de proyecto — un token de la test key nunca validaría contra
+  ella, y poner la secret key de test en producción dejaría a cualquiera
+  bypasear el captcha con el keypair público de test de Cloudflare.
+
+**Decisión**: la suite de humo de ADR-0039 **deja de cubrir flujos que
+requieren login**. Se mantiene automatizada solo para lo que ya es público
+sin autenticación (calendario, disponibilidad). Los flujos gateados por
+login (agenda interna, pagos, clientes, equipo) vuelven a verificación
+manual — el usuario acepta este límite como permanente, no como algo a
+resolver con Turnstile Enterprise u otra alternativa por ahora.
+
 ## ADR-0040 — Activación por WhatsApp sobrevive un cambio de contexto de navegador
 
 Fecha: 2026-09-28
@@ -3792,6 +3814,23 @@ defensivos explícitamente. Depende de que ADR-0044 esté mergeada primero
 dobles turnos silenciosamente) aunque el código puede escribirse en
 paralelo.
 
+**Review (2026-09-30): LISTO**, con dos precisiones no bloqueantes que
+`reviewer` encontró al refactorizar `create_schedule_rule_group()` para
+compartir rutina con la RPC nueva: (1) el orden entre `INVALID_WEEKDAY` y
+`RESOURCE_SCHEDULE_CONFLICT` cambió respecto a la versión anterior (antes
+el conflicto de recurso se evaluaba primero; ahora la validación de
+weekday va primero) — no rompe ningún invariante ni es alcanzable desde
+la UI actual (que ya restringe weekday a 0-6), sólo afecta el código de
+error exacto en una combinación de inputs inválidos simultáneos, sin
+test que lo cubra; (2) el comentario sobre por qué se usa `array_agg()`
+en vez de `select ... limit 1` sobreestimaba el riesgo — PL/pgSQL con
+`RETURN NEXT` siempre materializa el resultado completo antes de volver
+al llamador (a diferencia de funciones en C como `generate_series`), así
+que un `LIMIT 1` no habría cortado la inserción a mitad de camino en este
+caso puntual; `array_agg()` sigue siendo la forma más clara, sólo se
+corrigió la justificación en el comentario. Verificado en vivo contra
+`reservaste-stg` por el Orchestrator (385/385, suite completa).
+
 ---
 
 ## ADR-0046 — `book_slot_paying()`: cobrar un turno suelto, versión sólo-mostrador
@@ -4030,6 +4069,60 @@ descartables. Se recomienda mergear después de ADR-0046 (ambas tocan
 `book_slot()`) para evitar conflicto de merge garantizado si van en
 paralelo.
 
+**Corrección post-gate de seguridad (2026-09-30).** El gate confirmó que
+la reestructuración de `book_slot()` es correcta (verificada en vivo
+contra `reservaste-stg`, comparando 19 escenarios entre la versión vieja
+y la nueva, resultado idéntico salvo un caso no alcanzable desde la API),
+que el alta on-the-fly nunca se dispara desde ningún camino de sólo
+lectura, y que no reactiva cuentas inactivas. **Veredicto: LISTO para
+mergear y desplegar con el flag apagado (default `false`, cero cambio de
+comportamiento para el gimnasio actual) — NO LISTO para activar el flag
+en ningún negocio real todavía.** Dos hallazgos ALTO, confirmados en
+vivo, bloquean activarlo:
+
+1. **Sin tope de reservas para un `Customer` `SELF_SERVICE`.** Nada
+   impide que una cuenta descartable (sólo necesita pasar el captcha)
+   reserve todas las ocurrencias futuras de un servicio sin pago, e
+   incluso arme una reserva fija recurrente (`create_recurring_booking`)
+   que genera reservas para todas las ocurrencias futuras de una regla —
+   vaciando la agenda con una sola cuenta. **Fix decidido**: tope de 2
+   reservas confirmadas futuras mientras `customers.source =
+   'SELF_SERVICE'` (`FOR UPDATE` sobre la fila del cliente para que no se
+   pueda saltear en paralelo), y vedar `create_recurring_booking()` a
+   clientes `SELF_SERVICE`. El staff "verifica" a un cliente real
+   pasando `source` a `STAFF` (la policy `customers_update_staff` ya lo
+   permite, sin RPC nueva) — desde ahí el tope deja de aplicarle.
+2. **Las altas `SELF_SERVICE` consumen `max_customers` del plan del
+   tenant, y al agotarse filtran el conteo de clientes en un error
+   crudo** (`PLAN_LIMIT_REACHED: clientes (50/50)`) a cualquier usuario
+   autenticado — reproducido en vivo. Con el tope original de 50
+   altas/organización/hora, una hora agota el plan starter completo
+   (`max_customers=50`) y bloquea al staff de dar de alta clientes reales
+   hasta limpiar las cuentas basura a mano. **Fix decidido**: atrapar
+   `PLAN_LIMIT_REACHED`/`SUBSCRIPTION_INACTIVE` en el insert de
+   `book_slot()` y devolver un status propio sin filtrar el detalle
+   crudo; bajar el tope por organización de 50/hora a **10/hora y
+   30/día**; bajar el tope por `auth.uid()` de 5/24h a algo efectivo — el
+   gate señaló que 5 "no frena a nadie" porque crear cuentas sólo cuesta
+   el captcha, así que el tope real de contención pasa a ser el de
+   reservas por `Customer` (punto 1), no el de altas de cuenta.
+
+Un hallazgo MEDIO también se corrige en el mismo pase: los rate limits no
+estaban serializados (7 altas concurrentes pasaron contra un tope de 5,
+verificado en vivo) — fix: `pg_advisory_xact_lock` por `auth.uid()` y por
+organización antes de contar. Un segundo MEDIO (`can_customer_book`
+devuelve `OK_OPEN_BOOKING` sin validar ocurrencia cancelada/pasada o
+servicio inactivo) **se acepta sin fix**: no es explotable, porque
+`book_slot()` vuelve a validar todo desde cero antes de escribir nada —
+es un detalle de UI (la pantalla pública podría mostrar "Reservar" en un
+caso que después rebota), no de seguridad.
+
+**Implementación de los fixes**: delegada de nuevo a `backend-engineer`,
+mismo archivo (`phase45_open_booking.sql`, sin migración nueva —
+se edita antes de mergear, todavía no está en `main`). Requiere un
+segundo pase corto de `security-engineer` confirmando específicamente
+los dos ALTO antes de dar LISTO definitivo para activar el flag.
+
 ---
 
 ## ADR-0048 — Disponibilidad pública por recurso (opt-in)
@@ -4169,3 +4262,309 @@ negocio). Sin dependencias con ADR-0044 a ADR-0048.
 **Pendiente**: el usuario todavía no dio luz verde para implementar esto
 — queda documentado como próximo ítem del backlog de generalización,
 a la espera de que se confirme cuándo entra en la cola de trabajo.
+
+---
+
+## ADR-0050 — `schedule_rule_groups()` expone múltiples horarios por grupo
+
+Fecha: 2026-09-30
+Estado: **Aceptada** (2026-09-30, Orchestrator) — cambio de contrato
+necesario, no había forma aditiva de corregir el bug sin dejar el shape
+viejo silenciosamente incorrecto para franjas; pendiente coordinar el
+deploy con el rework de `frontend-engineer` en la misma ventana.
+Propuesta por: `frontend-engineer` (bug real encontrado implementando la
+UI de ADR-0045), fix diseñado e implementado por `backend-engineer`.
+
+**Problema:** `schedule_rule_groups()` (Phase 16, ADR-0022) agrupa
+`schedule_rules` por `group_id` y colapsa las columnas no-agrupadas con
+`min(sr.local_start_time)`, `min(sr.duration_minutes)`, `min(sr.capacity)`
+— válido en su momento porque `create_schedule_rule_group()` sólo podía
+producir grupos donde cada fila tiene un `weekday` distinto y **todas**
+comparten el mismo `local_start_time`. `create_schedule_rule_span()`
+(Phase 43, ADR-0045) rompe esa invariante a propósito: un mismo
+`group_id` puede tener varias filas con el **mismo** `weekday` y
+`local_start_time` **distinto** (ej. una franja 09:00–11:00 cada 30 min,
+duración 30, en un solo día, genera 4 `ScheduleRule` 09:00/09:30/10:00/
+10:30 bajo un único grupo). `min(local_start_time)` colapsaba las 4 a
+"09:00", y el frontend (`frontend/app/org/[slug]/services/[serviceId]/
+schedule/page.tsx`) asumía además que `group.weekdays[i]` correspondía
+1:1 con `group.ruleIds[i]` — válido sólo cuando cada fila tenía un
+`weekday` distinto, no cuando varias filas comparten `weekday` y sólo se
+distinguen por hora. Resultado real: las 4 filas de `StandingReservations`
+de esa franja se etiquetaban todas "09:00", perdiendo toda distinción
+entre ellas.
+
+**Decisión:** `schedule_rule_groups(p_service_id)` deja de devolver
+`local_start_time`, `weekdays[]` y `rule_ids[]` colapsados/zippeados, y
+devuelve en su lugar un array `items jsonb` con un elemento por fila real
+de `schedule_rules`: `{ ruleId, weekday, localStartTime }`, ordenado por
+`(weekday, localStartTime, ruleId)`. `duration_minutes`, `capacity`,
+`resource_id` y `resource_name` **siguen colapsados** con
+`min()`/primer valor — esos sí son constantes garantizadas dentro de un
+mismo `group_id` en todo camino de inserción existente:
+`create_schedule_rules_batch()` (rutina interna compartida desde Phase
+43) recibe un único `p_duration_minutes`/`p_capacity`/`p_resource_id` por
+llamada y estampa todas las filas del lote bajo un `group_id` recién
+generado; el insert manual de una sola regla
+(`frontend/app/actions/schedule.ts::createScheduleRule`) nunca fija
+`group_id` explícito, así que siempre recibe un grupo propio de una sola
+fila vía el default de columna. Ningún camino agrega una fila a un
+`group_id` **existente** con un recurso/duración/capacidad distintos —
+sólo `weekday` y `local_start_time` varían dentro de un grupo, que es
+exactamente lo que `items` expresa por fila en vez de colapsar.
+
+**Es un cambio de contrato, no aditivo**: se quitan tres columnas del
+shape de retorno de la RPC (`local_start_time`, `weekdays`, `rule_ids`) y
+se agrega `items`; el único consumidor hoy
+(`frontend/app/actions/schedule.ts::listScheduleRuleGroups()` →
+`frontend/app/org/[slug]/services/[serviceId]/schedule/page.tsx`) necesita
+reescribirse para leer `items` en vez de zippear los dos arrays viejos —
+no había forma de mantener el shape viejo utilizable de forma aditiva
+sin dejarlo silenciosamente incorrecto para el caso de franja.
+
+**Migración:** `backend/supabase/migrations/
+20260930160000_phase46_schedule_rule_groups_multi_time.sql` — `drop
+function` + `create function` (cambia el tipo de retorno, no alcanza con
+`create or replace`), mismo permiso (`grant execute ... to authenticated`)
+que la versión anterior. Sin cambios de RLS ni de permisos — hereda el
+mismo perímetro (`is_organization_member`) que ya tenía.
+
+**Tests:** `backend/test/phase43.schedule-rule-spans.test.ts` — caso
+nuevo (h) crea una franja real de un día/4 horas con
+`create_schedule_rule_span()` y confirma que `schedule_rule_groups()`
+devuelve las 4 combinaciones reales (`items` con 4 `ruleId` distintos,
+cada uno con su propio `localStartTime`, verificado contra
+`schedule_rules` directamente) en vez de una colapsada; caso nuevo (i)
+repite el caso original de ADR-0022 (un grupo de weekdays distintos,
+mismo horario) y confirma que sigue devolviendo el mismo resultado
+correcto con el shape nuevo (no regresión). `backend/test/
+phase16.groups-attendance-payments.test.ts` se actualizó para leer
+`items` en el único assert que dependía del shape viejo
+(`weekdays`/`rule_ids`) — no se agregó lógica nueva ahí, sólo se adaptó
+al contrato nuevo.
+
+**Impacto:** `frontend-engineer` reescribe
+`ScheduleRuleGroup`/`listScheduleRuleGroups()` en
+`frontend/app/actions/schedule.ts` para consumir `items`, y
+`schedule/page.tsx` para derivar de `items` tanto los badges de día
+(weekdays únicos presentes) como la etiqueta real de cada fila de
+`StandingReservations` (ya no puede asumir que hay una sola hora por
+grupo). No requiere gate de `security-engineer` (mismo perímetro de
+lectura ya existente, ninguna fuga cross-tenant nueva). Pendiente:
+Orchestrator confirma esta ADR como Aceptada y coordina con
+`frontend-engineer` el rework del consumidor antes de desplegar contra
+`reservaste-stg` (la migración en sí es segura de aplicar sola: sólo
+afecta lectura, pero el frontend actual dejaría de compilar/funcionar
+contra el shape viejo hasta que se actualice).
+
+---
+
+## ADR-0051 — Disponibilidad dinámica para recursos exclusivos (opt-in por `Resource`)
+
+Fecha: 2026-10-02
+Estado: **Aceptada**
+Propuesta por: usuario (caso real: una barbería con un recurso exclusivo
+que ofrece varios servicios de distinta duración), diseñada por `Plan`
+en dos vueltas (diseño base + mecanismo de hold agregado a pedido
+explícito del usuario), decisiones estructurales confirmadas por el
+usuario en el chat antes de registrar esta ADR.
+
+**Problema:** `ScheduleRule` ata siempre un `Service` a una duración fija
+y genera una grilla de `SlotOccurrence` pre-generada (ADR-0009/ADR-0045).
+Un `Resource` exclusivo (ADR-0044) que ofrece varios servicios de
+distinta duración (ej. un barbero con "Corte" de 30 min y "Combo" de 60
+min) arma una grilla independiente por servicio — cuando el generador
+choca con una ocurrencia ya existente de otro servicio en el mismo
+recurso, la restricción `EXCLUDE` de ADR-0044 rechaza el insert
+(`exclusion_violation`) y `generate_slot_occurrences_for_rule()` salta
+esa fecha **en silencio**. No hay riesgo de doble-reserva (el `EXCLUDE`
+ya lo impide), pero el servicio de mayor duración termina con huecos de
+disponibilidad inexplicables, sin aviso al dueño ni al cliente.
+
+**Decisión:** segundo flag opt-in a nivel `Resource`,
+**`dynamicAvailability: boolean`** (default `false`, sólo válido si
+`isExclusive = true` — `CHECK (not dynamic_availability or is_exclusive)`
+a nivel de base, no una convención de aplicación). Con el flag apagado
+(todo dato existente, hoy, sin excepción), cero cambio de comportamiento
+en ningún camino — el modelo de gimnasio (`isExclusive = false`, cupo
+compartido, `ScheduleRule` de duración fija) queda exactamente igual. Con
+el flag prendido en un recurso exclusivo, ese recurso deja de usar la
+grilla pre-generada: la disponibilidad se calcula al momento de reservar,
+contra los huecos reales del recurso (de cualquier servicio que atienda).
+
+### Modelo nuevo
+
+- **`resource_availability_windows`** (nueva, no reusa `ScheduleRule`):
+  `id, organization_id, resource_id, weekday, local_start_time,
+  local_end_time, valid_from, valid_until, is_active, created_at/by,
+  cancelled_at/by`. Es la "apertura general" de un recurso dinámico (ej.
+  "atiende lunes a viernes 9 a 17"), desacoplada de cualquier `Service` —
+  a diferencia de `ScheduleRule`, una sola fila cubre un rango horario
+  completo, no un punto de inicio. Elegida en vez de reusar
+  `schedule_rules.service_id` como nullable porque: (a) es puramente
+  aditiva, cero auditoría de los muchos consumidores existentes que
+  asumen `service_id not null`; (b) un recurso dinámico no tiene
+  **ninguna** fila en `schedule_rules`, así que `RecurringBooking`
+  (atada a `schedule_rule_id`) no puede referenciarlo por construcción —
+  la incompatibilidad con reservas fijas semanales se resuelve sola, sin
+  validación nueva.
+- **`resource_availability_exceptions`** (Fase 2, no bloqueante para el
+  mínimo viable): feriados/bloqueos puntuales, keyed a
+  `(resource_availability_window_id, exception_date)` — mismo rol que
+  `ScheduleException` pero por recurso, no por regla.
+- **`get_dynamic_availability(p_organization_slug, p_service_id, p_date,
+  p_resource_id default null)`**: `stable`, `security definer`, grant a
+  `anon, authenticated` (mismo perímetro que `get_public_availability()`,
+  mismas reglas de disclosure de ADR-0008/ADR-0048). Calcula los
+  horarios de inicio donde `[start, start+service.duration)` entra en
+  alguna ventana abierta, sin excepción que la bloquee, y sin solapar
+  ninguna `SlotOccurrence` `ACTIVE` **o `HELD` no vencida** del recurso —
+  de cualquier servicio.
+- **`SlotOccurrence` no cambia de rol**: sigue siendo la ocurrencia
+  reservable real, con el mismo `Booking`, `attendance_status`,
+  `agenda_occurrences()`, `book_slot_paying()` (ADR-0046). Lo único que
+  cambia es *cuándo* se inserta la fila: el cron de 90 días (modelo de
+  hoy) vs. una RPC de reserva en el instante (sólo para recursos con el
+  flag).
+
+### Mecanismo de hold (decisión explícita del usuario, no el default
+### recomendado por `Plan` — ver razonamiento)
+
+El usuario pidió explícitamente que, mientras alguien completa la
+reserva, ese horario deje de verse disponible para otra persona — no
+sólo que el doble-booking real sea imposible (eso ya lo garantiza el
+`EXCLUDE` de ADR-0044 con o sin hold).
+
+- **`slot_occurrence_status` gana el valor `'HELD'`** (hoy `ACTIVE |
+  BLOCKED | CANCELLED`), con columnas nuevas `held_until timestamptz`,
+  `held_by uuid references profiles(id)`. Es la misma fila/tabla, no una
+  tabla de holds aparte, para que el `EXCLUDE` de ADR-0044 proteja
+  también al hold con el mismo mecanismo (una tabla separada necesitaría
+  su propio `EXCLUDE` duplicado).
+- **El `EXCLUDE` de `slot_occurrences_exclusive_resource_no_overlap` se
+  amplía** de `where (status = 'ACTIVE' and resource_is_exclusive)` a
+  `where (status in ('ACTIVE', 'HELD') and resource_is_exclusive)` — no
+  rompe nada existente: ningún recurso no-dinámico escribe jamás
+  `status='HELD'`.
+- **TTL: 5 minutos.** Vencimiento resuelto en dos lugares distintos (el
+  predicado de un `EXCLUDE`/índice parcial no puede evaluar `now()`, así
+  que el constraint no puede saber solo si un `HELD` venció):
+  - **Lectura** (`get_dynamic_availability()`): un `HELD` vencido no
+    cuenta como ocupado (`status='ACTIVE' or (status='HELD' and
+    held_until > now())`) — sin side-effects, sigue `stable`.
+  - **Escritura** (`hold_dynamic_slot()`, antes de su propio insert):
+    limpia (`CANCELLED`) los `HELD` vencidos de **ese recurso** —
+    acotado, indexado, sin job nuevo. Mismo patrón de limpieza perezosa
+    ya usado por `customer_activations` (ADR-0026): sin cron de
+    limpieza, cada escritor resuelve lo vencido antes de escribir lo
+    propio. El cron diario existente (ADR-0009) suma una sola sentencia
+    extra de housekeeping (holds de más de un día) — no es un job
+    nuevo, es higiene de almacenamiento, no de corrección.
+- **`hold_dynamic_slot(p_resource_id, p_service_id, p_start_at)`**:
+  valida ventana/excepción, limpia holds vencidos del recurso, inserta
+  `status='HELD'`. **Exige `auth.uid()` no nulo** — desviación deliberada
+  del patrón público actual (`/reservar/confirmar` resuelve login después
+  de elegir, porque elegir hoy es sólo lectura sobre una fila que ya
+  existe). Holdear es un `insert` real sobre un recurso escaso,
+  invocable directo por PostgREST con la `anon key` sin pasar por
+  ningún formulario — sin `auth.uid()` no hay con qué limitar cuántos
+  horarios puede trabar la misma persona. Rate limit: máximo **3 holds
+  vivos simultáneos por perfil** (mismo mecanismo
+  `pg_advisory_xact_lock` + `count(*)` que ya usa `book_slot()` para
+  altas `SELF_SERVICE`, ADR-0047), rechazo `TOO_MANY_ACTIVE_HOLDS`.
+  **No requiere ser `Customer` activo de la organización** — sólo una
+  cuenta real de la plataforma (`auth.uid()`), igual que la reserva
+  abierta de ADR-0047 da de alta el `Customer` on-the-fly recién al
+  confirmar.
+- **`book_dynamic_slot(p_slot_occurrence_id, p_use_makeup_credit default
+  true)`**: wrapper delgado, no reimplementa nada. Toma `for update`
+  sobre la fila (re-entrante dentro de la misma transacción, ADR-0004),
+  rechaza con `HOLD_NOT_FOUND`/`HOLD_EXPIRED` si no está `HELD` y
+  vigente, promueve a `ACTIVE`, y delega el 100% de cobertura/pago/alta
+  de `Customer`/creación de `Booking` a `book_slot()` ya existente — sin
+  duplicar una sola línea de esa lógica ya revisada. Si `book_slot()` no
+  devuelve `OK`, revierte explícitamente la promoción a `CANCELLED` (sin
+  este paso quedaría una `SlotOccurrence` `ACTIVE` fantasma, sin
+  `Booking`, ocupando el horario para siempre).
+- **`release_dynamic_hold(p_slot_occurrence_id)`** (opcional, Fase 1 si
+  el tiempo alcanza): cancela el propio hold antes de que venza, para
+  cuando el cliente cambia de horario sin esperar los 5 minutos.
+
+### Decisiones estructurales confirmadas (no delegadas a ningún subagente)
+
+1. **Entidad nueva `resource_availability_windows`**, no reusar
+   `ScheduleRule` con `service_id` nullable — confirmado.
+2. **Hold en la primera fase**, no diferido — confirmado explícitamente
+   por el usuario, en contra de la recomendación inicial de `Plan` de
+   dejarlo para después; el usuario entendió y aceptó el costo (login
+   requerido para holdear, antes de lo que el flujo público de hoy
+   pide) a cambio de que un horario no se vea disponible mientras otra
+   persona lo está completando.
+3. **Un `Service` que requiera más de un `Resource` simultáneo queda
+   bloqueado** (error explícito) cuando alguno de ellos es dinámico — el
+   caso real del usuario es "cada profesional es un recurso exclusivo
+   independiente, con su propia agenda y sus propios servicios" (ej. 2
+   barberos = 2 recursos, nunca un servicio que cruce ambos a la vez),
+   confirmado explícitamente. Revisitar sólo si aparece demanda real de
+   un servicio que combine dos recursos a la vez.
+
+### Riesgos identificados
+
+- **"Hold squatting"**: mitigado por el tope de 3 holds vivos/perfil +
+  requerir `auth.uid()` — sin esto sería el riesgo más serio del
+  mecanismo.
+- **RLS existente** (`slot_occurrences_toggle_active_blocked`, Fase 3):
+  su `with check` sólo excluye `status <> 'CANCELLED'`, así que un STAFF
+  con escritura directa podría tocar una fila `HELD` por ese camino en
+  vez de por las RPCs nuevas — riesgo bajo (requiere ser staff de la
+  propia organización), a confirmar explícitamente en el gate de
+  seguridad obligatorio de esta fase.
+- **Límite técnico del `EXCLUDE`**: su predicado tiene que ser una
+  expresión inmutable, no puede evaluar `held_until > now()` — por eso
+  la limpieza de vencidos es un `UPDATE` físico en el camino de
+  escritura (`hold_dynamic_slot()`), nunca "algo que el constraint
+  resuelve solo". Documentar esto en la migración para que nadie intente
+  "simplificarlo" moviendo la condición de vencimiento al `where` del
+  constraint.
+- **Gate de seguridad obligatorio**: `hold_dynamic_slot()`/
+  `book_dynamic_slot()` tocan el mismo perímetro crítico que
+  `book_slot()` (multi-tenant, cobertura, pago, alta de `Customer`) —
+  mismo rigor que tuvo ADR-0046/ADR-0047, con foco extra en el rate
+  limit de holds y en que la revalidación de ventana/excepción ocurra
+  dentro de la misma transacción que el insert.
+
+### Fases
+
+**Fase 1 (mínimo viable, incluye el hold por decisión del usuario):**
+`resources.dynamic_availability` + `CHECK`; `resource_availability_windows`
++ RPC de alta simple (una fila por día, sin constructor de franjas
+sofisticado); filtro de una línea en el generador para saltear recursos
+dinámicos; `slot_occurrence_status` gana `HELD` + columnas +
+`EXCLUDE` ampliado; `hold_dynamic_slot()`/`book_dynamic_slot()`/
+`release_dynamic_hold()` (opcional); `get_dynamic_availability()` a
+granularidad de un día, sin excepciones todavía; bloqueo explícito de
+`RecurringBooking`/`create_schedule_rule_*` sobre un recurso dinámico
+(mensaje de error claro, aunque ya cae solo por construcción); acción
+explícita de discontinuar `ScheduleRule` viejas al prender el flag sobre
+un recurso que ya tenía grilla (reusa la cascada existente de ADR-0010,
+`discontinue_schedule_rule`, que cancela `Booking`/`RecurringBooking`
+afectadas); contrato de API para que `frontend-engineer` construya el
+flujo "elegí servicio → elegí día → elegí horario de la lista →
+(login si falta) → confirmá".
+
+**Fase 2 (fast follow, no bloqueante):**
+`resource_availability_exceptions` (feriados/bloqueos puntuales); mejora
+de `agenda_occurrences()` para mostrar ventanas abiertas sin reservas;
+constructor de franjas para `resource_availability_windows` (reusar la
+UX de ADR-0045); extraer una rutina interna compartida entre
+`book_slot()`/`book_dynamic_slot()` si la duplicación resulta real en la
+práctica (mismo criterio ya aplicado en ADR-0045 para
+`create_schedule_rules_batch`); soporte N:M si aparece demanda real;
+`pg_advisory_xact_lock` adicional para mejorar UX bajo alta contención
+(la corrección ya está garantizada sin esto).
+
+**Impacto:** `backend-engineer` implementa Fase 1 completa (migración +
+tests). Gate de `security-engineer` obligatorio antes de cerrar (toca el
+mismo perímetro crítico que ADR-0046/ADR-0047). `frontend-engineer`
+construye el flujo nuevo recién después de que el backend esté verificado
+en vivo contra `reservaste-stg` y gateado.
