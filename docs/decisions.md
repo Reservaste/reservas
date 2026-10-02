@@ -4213,9 +4213,7 @@ recortar pasos aunque apriete el tiempo.
 ## ADR-0049 — `Organization.industry`: rubro declarado, puramente informativo
 
 Fecha: 2026-09-30
-Estado: **Propuesta** (documentada para revisión, no implementada —
-sesión en fase de revisión de plan, sin luz verde de implementación
-todavía)
+Estado: **Aceptada** (2026-10-02, usuario — "dale")
 Propuesta por: usuario ("quiero entender el rubro de mi cliente, eso
 debe estar documentado").
 
@@ -4259,9 +4257,9 @@ directo alcanza, mismo criterio que otros campos simples de
 `security-engineer` (dato no sensible, mismo nivel que el nombre del
 negocio). Sin dependencias con ADR-0044 a ADR-0048.
 
-**Pendiente**: el usuario todavía no dio luz verde para implementar esto
-— queda documentado como próximo ítem del backlog de generalización,
-a la espera de que se confirme cuándo entra en la cola de trabajo.
+**Implementación**: delegada a `backend-engineer` (migración chica) y
+`frontend-engineer` (campo en Configuración, mismo patrón que otros
+campos simples de `Organization`).
 
 ---
 

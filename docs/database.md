@@ -3869,3 +3869,52 @@ la validación antes del redirect en los dos archivos. `holdDynamicSlot()`
 sí aplica `safeReturnTo()` al `returnTo` que recibe (fix aplicado tras
 el gate — defensa en profundidad, `/login` ya lo validaba de todas
 formas).
+
+## Fase 52 — `Organization.industry`: rubro declarado, puramente informativo (ADR-0049, migración `20261002130000_phase52_organization_industry.sql`)
+
+`organizations.industry text` nullable, **sin `CHECK`** que lo restrinja
+a una lista cerrada — texto libre a propósito. Detalle completo del
+razonamiento en `docs/decisions.md`, ADR-0049 (tensión con la regla
+no-negociable de CLAUDE.md ya resuelta ahí: un campo puramente
+descriptivo que nadie lee para decidir comportamiento no viola "nunca
+Gym/Member/Trainer/Class como modelo central", igual que
+`Organization.name` no la viola).
+
+- **Sin RPC nueva** — `select`/`update` directo, mismo criterio que
+  `name`/`timezone`. La policy `organizations_update_owner` (ADR-0013,
+  Fase 1) ya cubre la columna sin tocarla (`for update using
+  (is_organization_owner(id))`, sin restricción de columnas); el
+  trigger `check_organization_subscription_platform_only` (Fase 34)
+  sólo cierra `subscription_status`/`plan_code`/`trial_ends_at`/
+  `current_period_end` — `industry` no es ninguna de esas, un `OWNER`
+  ya podía escribirla sin ningún cambio adicional.
+- **No se agregó a `organizations_public`** — es dato interno del dueño
+  del SaaS (analytics propio, nunca para mostrar a clientes anónimos).
+  Confirmado en vivo: el test de Fase 13 que verifica el shape exacto de
+  esa vista pública (`["brand_color", "id", "logo_path", "name", "slug",
+  "timezone"]`) sigue pasando sin `industry` en la lista.
+- No requiere gate de `security-engineer` (dato no sensible, mismo nivel
+  que el nombre del negocio) — así lo anticipaba la propia ADR-0049.
+
+**Frontend** (`app/actions/settings.ts`, `app/org/[slug]/settings/page.tsx`,
+`settings-form.tsx`): campo de texto libre (`<Input>`, nunca un
+`<Select>`/lista cerrada) junto a Nombre/Zona horaria/Moneda en
+Configuración, OWNER-only (triple capa: `disabled={!canEdit}` en el
+form, el guard de rol ya existente en `updateOrganizationSettings()`
+antes de leer `industry`, y la policy de RLS). String vacío persiste
+como `null`, nunca `""`. Ninguna lógica condicional basada en el valor
+en ningún lugar del frontend — confirmado por grep en todo el repo.
+
+**Tests**: 2 casos nuevos en `backend/test/phase13.branding.test.ts`
+(OWNER setea/actualiza texto libre arbitrario sin lista predefinida;
+STAFF no puede). **Verificado en vivo contra `reservaste-stg`**: 11/11
+(9 existentes + 2 nuevos), sin regresión. Gate de `reviewer`: **LISTO**
+en backend y frontend (dos pases separados).
+
+**Deferido, no bloqueante**: el texto original de la ADR mencionaba un
+`<datalist>`/autocomplete de sugerencias en el frontend — no se
+implementó (la sección "Impacto" de la propia ADR no lo repite como
+obligatorio); sólo hay ejemplos en el texto de ayuda del campo. Agregar
+el datalist queda como mejora de UX, no como deuda de arquitectura.
+Tampoco se agregó al onboarding (fuera de alcance de este cierre,
+mencionado como posible en la ADR).

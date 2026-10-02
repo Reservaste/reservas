@@ -15,6 +15,12 @@ La plataforma es genérica. **Nunca** modelar `Gym`, `Member`, `Trainer`,
 
 - **Organization** — el tenant. Cualquier rubro (gimnasio, consultorio,
   cancha, salón). Todo dato de negocio cuelga de un `organizationId`.
+  `industry` (ADR-0049, nullable, texto libre, **sin enum**): el rubro
+  declarado por el propio dueño del negocio, puramente informativo para
+  su uso interno (analytics, filtrar sus clientes) — nunca participa de
+  ninguna decisión de comportamiento del sistema, ni en backend ni en
+  frontend. Un enum fijo de rubros violaría la regla no-negociable de
+  arriba; por eso es texto libre sin `CHECK`.
 - **OrganizationMember** — vínculo entre un `Profile` y una `Organization`
   con un rol (`OWNER`, `STAFF`; ver `security.md`). No confundir con
   `Customer`. Desde ADR-0033 lleva además `roleId`, el `OrganizationRole`
