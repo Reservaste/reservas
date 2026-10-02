@@ -3918,3 +3918,69 @@ obligatorio); sólo hay ejemplos en el texto de ayuda del campo. Agregar
 el datalist queda como mejora de UX, no como deuda de arquitectura.
 Tampoco se agregó al onboarding (fuera de alcance de este cierre,
 mencionado como posible en la ADR).
+
+## Fase 53 — `organization_id` inmutable en `resources`/`services` (ADR-0052, migración `20261002140000_phase53_organization_id_immutable.sql`)
+
+Cierra deuda técnica de aislamiento multi-tenant señalada de forma
+independiente en tres gates anteriores (Fase 48, 49, 50): `resources.organization_id`/
+`services.organization_id` se podían cambiar vía `UPDATE` directo —
+sólo explotable por alguien miembro de dos organizaciones a la vez
+(nunca por `anon` ni por un tercero), pero con efectos en cascada
+reales (ver ADR-0052 para el detalle completo).
+
+- **`guard_organization_id_immutable()`** — función genérica (sin
+  `security definer`, no necesita leer ninguna otra tabla — sólo
+  compara `NEW`/`OLD`, opción de menor privilegio) reusada por dos
+  triggers nuevos: `resources_guard_organization_id_immutable` y
+  `services_guard_organization_id_immutable`, ambos `BEFORE UPDATE ...
+  WHEN (new.organization_id IS DISTINCT FROM old.organization_id)`,
+  `raise exception 'ORGANIZATION_ID_IS_IMMUTABLE'`. **Sin excepción de
+  rol** — ni `OWNER`, ni `platform_admin`, **ni `service_role`** (un
+  trigger no es una policy, no se salta el bypass de RLS que
+  `service_role` normalmente tiene). Si alguna vez hiciera falta mover
+  un recurso entre tenants por soporte manual, no alcanza con la
+  `service_role` key — hay que deshabilitar el trigger como
+  superusuario.
+- **`check_schedule_rule_conflicts()` (ADR-0044) recreada** — único
+  cambio real respecto a la versión de Fase 42 (confirmado por diff
+  línea por línea): unifica `NOT_AUTHORIZED` → `RESOURCE_NOT_FOUND`
+  cuando el caller no es miembro de la organización del recurso,
+  cerrando un oráculo menor de existencia cross-tenant (mismo criterio
+  no-oráculo ya aplicado por `create_schedule_rules_batch()` desde la
+  Fase 48). La rama vieja ya era inalcanzable desde los tres llamadores
+  internos (`create_schedule_rule_group`/`create_schedule_rule_span`
+  ya validan organización antes de llegar acá) — sólo quedaba expuesta
+  vía RPC directa. Mismos `grant`/`revoke` que antes.
+- **Índice nuevo**: `slot_occurrences_held_by_idx on slot_occurrences
+  (held_by) where status='HELD'` — `hold_dynamic_slot()` (Fase 50b)
+  contaba holds vivos con sequential scan de toda la tabla; puramente
+  de performance, no cambia ningún comportamiento de autorización.
+
+**Confirmado antes de aplicar** (no asumido): ningún RPC, trigger, ni
+server action de frontend hace `UPDATE` sobre `organization_id` de
+`resources`/`services` ya creados — el fix es estrictamente más
+restrictivo, no bloquea ningún camino legítimo existente.
+`discontinue_schedule_rule()` y el archivado de `Resource`/`Service`
+desde el frontend sólo tocan `is_active`/`cancelled_*`, nunca
+`organization_id`.
+
+**Tests** (`backend/test/phase53.organization-id-immutable.test.ts`, 4
+casos): mover un `Resource`/`Service` entre organizaciones rechazado
+aun para alguien miembro de ambas (2 casos); un `UPDATE` que no toca
+`organization_id` sigue funcionando sin interferencia (contraprueba);
+`check_schedule_rule_conflicts()` da `RESOURCE_NOT_FOUND` para un
+recurso de otra organización. **Verificado en vivo contra
+`reservaste-stg`**: 55/55 (4 nuevos + regresión completa en
+phase2/16/42/43/50, sin fallos). Gate de `security-engineer`:
+**LISTO**. Gate de `reviewer`: **LISTO** (confirmado por diff real que
+`check_schedule_rule_conflicts()` es idéntica a Fase 42 salvo el único
+cambio de código de error).
+
+**Deuda técnica nueva, identificada por el gate de seguridad, fuera de
+alcance de esta fase**: el mismo patrón probablemente existe en otras
+tablas de negocio con policies `is_organization_member(organization_id)`
+similares — `schedule_rules`, `service_plans`, `customers` son
+candidatas sin auditar todavía. Extender la función genérica ya escrita
+a esas tablas sería trivial si se confirma — mismo perfil de riesgo
+bajo (sólo explotable por alguien miembro de dos organizaciones a la
+vez).

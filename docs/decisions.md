@@ -4614,3 +4614,124 @@ resto de la suite afectada.
 **Próximo paso**: `frontend-engineer` construye el flujo nuevo (elegir
 servicio → día → horario → hold → confirmar), contra el contrato real
 ya cerrado arriba.
+
+---
+
+## ADR-0052 — `organization_id` inmutable en `resources`/`services`
+
+Fecha: 2026-10-02
+Estado: **Aceptada**
+Propuesta por: `security-engineer`, señalado de forma independiente en
+tres gates distintos (Fase 48 — cross-tenant `resource_id`, Fase 49 —
+disponibilidad pública por recurso, Fase 50 — disponibilidad dinámica),
+cada vez como hallazgo BAJO/informativo "fuera de alcance, necesita su
+propia fase con ADR". El usuario pidió avanzar la deuda técnica
+pendiente — este es el ítem de mayor severidad registrado.
+
+**Problema:** `resources.organization_id` y `services.organization_id`
+se pueden cambiar vía `UPDATE` directo — las policies de escritura
+existentes (`resources_update_staff`, Fase 35; el equivalente de
+`services`) validan `is_organization_member(organization_id)` tanto en
+`USING` como en `WITH CHECK`, pero eso sólo exige ser miembro de la
+organización ORIGEN y de la organización DESTINO por separado — no
+impide el cambio en sí. Ningún trigger cierra la columna.
+
+**Impacto concreto** (confirmado por `security-engineer` en los tres
+gates, nunca explotable por un tercero ni por `anon` — exige ser
+miembro de dos organizaciones a la vez): alguien con membresía en las
+Organizaciones A y B puede mover un `Resource`/`Service` de A a B.
+Efectos en cascada ya documentados:
+- `schedule_rules`/`slot_occurrences` viejas de A quedan apuntando a un
+  recurso que ahora es de B.
+- Cualquier STAFF de B (sin ser miembro de A) puede entonces modificar
+  `is_exclusive`/`dynamic_availability` de un recurso que A sigue
+  usando activamente — ese cambio se propaga en cascada (`resources_propagate_is_exclusive()`,
+  ADR-0044) sobre `slot_occurrences` futuras de A.
+- El recurso desaparece de la UI de A por RLS, sin aviso.
+- `services_public.has_dynamic_resource` (ADR-0051) y `get_public_availability()`
+  (resource_name, ADR-0048) podrían reflejar momentáneamente un estado
+  cruzado durante la ventana entre el cambio y que A note la desaparición.
+
+**Decisión:** un trigger `BEFORE UPDATE ON resources` y otro `BEFORE
+UPDATE ON services` que rechacen (`raise exception
+'ORGANIZATION_ID_IS_IMMUTABLE'`) cualquier intento de `UPDATE` donde
+`new.organization_id is distinct from old.organization_id` — sin
+excepción, ni siquiera para un `OWNER`/`platform_admin`. Mover un
+recurso o servicio de una organización a otra nunca es una operación
+legítima del producto (es multi-tenant por diseño, ADR-0001); si
+alguna vez hiciera falta en la práctica (migrar datos entre tenants),
+es una operación de soporte manual vía `service_role`, nunca algo que
+ningún rol de la aplicación debería poder hacer por accidente o abuso.
+
+**Por qué trigger y no sólo policy:** una policy de RLS no puede
+comparar `OLD` contra `NEW` de forma nativa en `WITH CHECK` sin
+duplicar el valor viejo en la condición (frágil, fácil de romper sin
+querer en un refactor futuro) — un trigger `BEFORE UPDATE` es el
+mecanismo ya usado en el repo para este tipo de invariante (mismo
+patrón que `resources_guard_dynamic_toggle`, ADR-0051).
+
+**Impacto:** `backend-engineer` implementa los dos triggers + tests
+(un miembro de dos organizaciones intenta mover un recurso/servicio de
+una a otra, rechazado). Gate liviano de `security-engineer` (confirma
+que el trigger no bloquea ningún camino legítimo existente — crear un
+recurso nuevo, que siempre inserta con `organization_id` ya fijo, no
+dispara `UPDATE OF organization_id`). Sin cambios de frontend (ningún
+flujo del producto intenta cambiar `organization_id` hoy — es
+puramente cerrar un hueco, no un cambio de comportamiento observable
+para nadie que use el producto normalmente).
+
+**Deuda técnica relacionada, agrupada en la misma fase por ser del
+mismo tamaño/naturaleza** (no amerita cada una su propia ADR):
+- `check_schedule_rule_conflicts()` (ADR-0044) distingue
+  `RESOURCE_NOT_FOUND` de `NOT_AUTHORIZED`, un oráculo menor de
+  existencia de recursos de otra organización (impacto mínimo, UUID
+  v4) — se unifica a `RESOURCE_NOT_FOUND`, mismo criterio no-oráculo
+  que el resto del repo.
+- Falta un índice sobre `slot_occurrences (held_by) where status='HELD'`
+  (ADR-0051) — el conteo de holds vivos en `hold_dynamic_slot()` hace
+  sequential scan hoy.
+
+### Addendum (2026-10-02) — implementada, ambos gates LISTO
+
+Implementación completa en `backend/supabase/migrations/20261002140000_phase53_organization_id_immutable.sql`
+(detalle técnico en `docs/database.md`, sección "Fase 53"). Confirmado
+en vivo contra `reservaste-stg` que ningún camino legítimo (ninguna
+RPC, ningún trigger, ninguna server action de frontend) actualizaba
+`organization_id` de un `resources`/`services` ya creado — el fix es
+puramente restrictivo, no bloquea nada existente.
+
+Gate de `security-engineer`: **LISTO**. Confirma de forma independiente
+(no sólo releyendo lo que dijo `backend-engineer`) los cinco puntos del
+encargo: sin caminos legítimos afectados, sin interferencia con
+`discontinue_schedule_rule()`/cascadas, sin consumidor roto por la
+unificación de `check_schedule_rule_conflicts()` a `RESOURCE_NOT_FOUND`
+(la rama `NOT_AUTHORIZED` ya era inalcanzable desde los tres llamadores
+internos — sólo cerraba un oráculo de existencia vía RPC directa), el
+índice es puramente de performance, y `guard_organization_id_immutable()`
+sin `security definer` es la opción de menor privilegio correcta (no
+lee ninguna otra tabla). Encontró y agregó una precisión importante:
+**el trigger tampoco tiene excepción para `service_role`** — "ninguna
+excepción de rol" incluye el bypass que `service_role` normalmente
+tiene sobre RLS (un trigger no es una policy, no se salta). Si alguna
+vez hiciera falta mover un recurso entre tenants por soporte, no
+alcanza con la `service_role` key: hay que deshabilitar el trigger como
+superusuario. Dejado como nota operativa, no como hallazgo.
+
+Gate de `reviewer`: **LISTO** — confirmado por diff real línea por
+línea (no sólo lectura) que `check_schedule_rule_conflicts()` es
+idéntica a la versión de Fase 42 salvo el único cambio de código de
+error, y que los `grant`/`revoke` quedan byte a byte iguales.
+
+Verificado en vivo contra `reservaste-stg`: 55/55 (4 tests nuevos +
+regresión completa en phase2/16/42/43/50, sin fallos).
+
+**Deuda técnica nueva, identificada por el propio gate de seguridad,
+fuera de alcance de esta fase**: el mismo patrón (`organization_id`
+mutable sin trigger) probablemente existe en otras tablas de negocio
+con policies `is_organization_member(organization_id)` similares —
+`schedule_rules`, `service_plans`, `customers` son candidatas
+mencionadas explícitamente, sin auditar todavía. Si se confirma,
+extender `guard_organization_id_immutable()` (ya genérica) a esas
+tablas es trivial — queda como ítem de backlog, no urgente (mismo
+perfil de riesgo bajo: sólo explotable por alguien miembro de dos
+organizaciones a la vez).

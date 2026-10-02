@@ -2680,6 +2680,63 @@ de rate-limit/`ORGANIZATION_NOT_ACCEPTING_NEW_CUSTOMERS` de ADR-0047);
 aislamiento multi-tenant correcto en las 5 RPCs nuevas, ningún
 `organization_id` llega como parámetro libre.
 
+## Fase 53 — `organization_id` inmutable en `resources`/`services` (ADR-0052): regla
+
+Gate de `security-engineer` sobre
+`backend/supabase/migrations/20261002140000_phase53_organization_id_immutable.sql`,
+verificado en vivo contra `reservaste-stg`.
+
+**Regla**: `resources.organization_id` y `services.organization_id` son
+**inmutables tras el `INSERT`** — dos triggers `BEFORE UPDATE`
+(`resources_guard_organization_id_immutable`/
+`services_guard_organization_id_immutable`, vía la función genérica
+`guard_organization_id_immutable()`) rechazan con
+`ORGANIZATION_ID_IS_IMMUTABLE` cualquier intento de cambiarlos, **sin
+excepción de rol** — incluido `service_role`: un trigger no es una
+policy de RLS, así que el bypass que `service_role` normalmente tiene
+no aplica acá. Mover un recurso/servicio entre tenants por soporte
+manual, si alguna vez hiciera falta, requiere deshabilitar el trigger
+como superusuario — nunca un `UPDATE` directo con ninguna key de la
+aplicación.
+
+**Por qué hacía falta**: las policies de escritura existentes
+(`resources_update_staff`/`services_update_staff`, Fase 35) validan
+`is_organization_member(organization_id)` en `USING` y `WITH CHECK`,
+pero eso sólo exige ser miembro de la organización origen y de la
+destino por separado — no impedía el cambio en sí. Alguien con
+membresía en dos organizaciones a la vez podía mover un
+`Resource`/`Service` de una a otra (nunca explotable por `anon` ni por
+un tercero sin esa doble membresía), con efectos en cascada reales ya
+documentados en ADR-0045 (`resources_propagate_is_exclusive()`) y en
+los gates de Fase 48/49/50 que señalaron este hueco de forma
+independiente cada vez.
+
+**Confirmado, no asumido** (verificación propia del gate, releyendo el
+código real en vez de confiar en lo que reportó `backend-engineer`):
+ningún RPC, trigger, ni server action de frontend hace `UPDATE` sobre
+estas dos columnas en una fila ya creada — el único `UPDATE public.services`
+que existe en todo el repo (Fase 14, backfill ya corrido) toca sólo
+`billing_type`/`billing_cycle`/`payment_required`; no existe ningún
+`UPDATE public.resources`. `discontinue_schedule_rule()` y el archivado
+de `Resource`/`Service` desde el frontend sólo tocan
+`is_active`/`cancelled_*`. El fix es estrictamente más restrictivo, no
+bloquea ningún camino legítimo.
+
+**Cambio acompañante, mismo gate**: `check_schedule_rule_conflicts()`
+(ADR-0044) unifica `NOT_AUTHORIZED`/`RESOURCE_NOT_FOUND` en un único
+`RESOURCE_NOT_FOUND` — cerraba un oráculo menor de existencia de
+recursos de otra organización (impacto mínimo con UUID v4, pero la rama
+`NOT_AUTHORIZED` ya era inalcanzable desde los tres llamadores internos
+que ya validan organización antes, así que sólo quedaba expuesta vía
+RPC directa).
+
+**Hallazgo nuevo del gate, deuda técnica no bloqueante**: el mismo
+patrón de `organization_id` mutable probablemente existe en otras
+tablas con policies `is_organization_member(organization_id)`
+similares — `schedule_rules`, `service_plans`, `customers` son
+candidatas, sin auditar todavía. La función genérica ya escrita hace
+trivial extender el mismo trigger a esas tablas si se confirma.
+
 ## Pendiente de definir (Phase 1)
 
 - Proveedor de auth concreto: **Supabase Auth** (ADR-0002, cerrado).
