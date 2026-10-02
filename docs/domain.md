@@ -49,7 +49,13 @@ La plataforma es genérica. **Nunca** modelar `Gym`, `Member`, `Trainer`,
   de su rol en cualquier organización.
 - **Customer** — un `Profile` en tanto cliente de una `Organization`
   específica. Un mismo `Profile` puede ser `Customer` de varias
-  organizaciones.
+  organizaciones. `source` (ADR-0047) distingue el origen del alta:
+  `STAFF` (mostrador — `enrollCustomerByEmail`, `createManagedCustomer`, alta
+  directa del panel; default, cubre toda fila anterior a esta ADR) o
+  `SELF_SERVICE` (auto-inscripto por `bookSlot()` cuando la `Organization`
+  tiene `openBookingEnabled` prendido y la cuenta autenticada no tenía
+  ninguna fila de `Customer`, ni siquiera inactiva, para esa organización).
+  Una baja del staff (`isActive=false`) **nunca** se reactiva por esta vía.
 - **Service** — lo que una `Organization` ofrece y se puede reservar (una
   clase, un turno de cancha, una sesión, una consulta). No depende de
   gimnasio: es genérico.
@@ -346,6 +352,22 @@ puntual), serie existente, y **serie prospectiva** — esta última porque el
 preview de una reserva fija corre antes de que la serie exista, y sin ella el
 preview le diría "fuera de tu frecuencia" en todas las fechas justo al cliente
 que tiene el plan que la permite.
+
+**Reserva abierta (ADR-0047).** Cuando no hay `Customer` activo,
+`canCustomerBook()` devuelve `NOT_A_CUSTOMER` salvo que la `Organization`
+tenga `openBookingEnabled` prendido (opt-in, default apagado) **y** no exista
+absolutamente ninguna fila de `Customer` para ese par (organización, perfil) —
+ni siquiera inactiva; en ese único caso devuelve `OK_OPEN_BOOKING` en vez de
+`NOT_A_CUSTOMER`, para que la UI pública ofrezca "Reservar" en lugar de "pedile
+al negocio que te habilite". `canCustomerBook()` nunca crea nada — es
+puramente de lectura, invocada también por `previewRecurringBooking()` y
+`canCustomerBookDetail()`, que no pueden tener el side-effect de dar de alta un
+`Customer` real solo por mostrar una vista previa. El alta real vive
+exclusivamente dentro de `bookSlot()`: si corresponde, inserta el `Customer`
+(`source='SELF_SERVICE'`) **en la misma transacción** que la reserva, detrás de
+un rate limit (altas por perfil en 24h, altas por organización por hora); si la
+reserva falla después (sin cupo, sin cobertura), el rollback deshace también el
+alta — nunca queda un `Customer` huérfano sin `Booking`.
 
 ## Auditoría por entidad (ADR-0010)
 
