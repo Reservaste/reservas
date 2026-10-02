@@ -3798,7 +3798,74 @@ bloqueantes reales — ver `docs/security.md`). Gate de `reviewer`:
   organización igual puede holdear horarios repetidamente) — decisión de
   producto diferida explícitamente.
 
-**Frontend**: todavía no empezado (según la propia ADR-0051, corresponde
-recién después de este gate). Necesita: selector de servicio → día →
-horario (consumiendo `get_dynamic_availability()`) → hold → confirmar
-(login si falta, mismo patrón que ADR-0047) → `book_dynamic_slot()`.
+**Frontend**: implementado (ver "Fase 51" abajo para el frontend y el
+único agregado de backend que necesitó).
+
+## Fase 51 — frontend de disponibilidad dinámica + `services_public.has_dynamic_resource` (ADR-0051, migración `20261002120000_phase51_services_public_dynamic_flag.sql`)
+
+Cierra el frontend de ADR-0051: selector de servicio → día → horario →
+hold → confirmar (login diferido si falta, mismo patrón que ADR-0047).
+
+**Único agregado de backend**: `services_public` (vista pública de solo
+lectura, ADR-0036) gana una columna, `has_dynamic_resource boolean` —
+`true` si el `Service` tiene al menos un `Resource` con
+`dynamic_availability=true`. `drop view` + `create view` (cambia el
+shape de columnas), mismos `grant`/`revoke` que la versión anterior
+(`select` a `anon, authenticated`; `insert/update/delete/truncate`
+revocados). No revela identidad de ningún recurso (ni nombre, ni id, ni
+cantidad) — sólo si corresponde mandar al cliente al flujo nuevo en vez
+del calendario de grilla, que de cualquier forma nunca le va a mostrar
+nada a un servicio sin ninguna `SlotOccurrence` pre-generada. Gate
+liviano de `security-engineer`: **LISTO** (mismo criterio que ADR-0048 —
+es una vista pública).
+
+**Server actions nuevas** (`frontend/app/actions/dynamic-booking.ts`,
+detalle de contrato en `docs/api.md`): `getDynamicAvailability()`,
+`holdDynamicSlot()` (login diferido — redirige a `/login?returnTo=...`
+**antes** de llamar a `hold_dynamic_slot()`, nunca después), `confirmDynamicBooking()`,
+`releaseDynamicHold()`. `app/actions/public.ts` extendido con
+`hasDynamicResource`/`getPublicService()`.
+
+**Pantallas nuevas**: `/[organizationSlug]/reservar-dinamico/[serviceId]`
+(elegir día + horario, chips de día estilo `public-calendar.tsx`,
+horarios con nombre de recurso si `public_resource_names` está
+prendido) y su `/confirmar` (hold con cuenta regresiva de 5 minutos +
+confirmar, `confirm-dynamic-form.tsx`). Entry point en
+`/[organizationSlug]/page.tsx`: servicios con `hasDynamicResource` se
+muestran en una sección aparte ("Ver horarios de {servicio}") en vez
+del calendario de grilla; el calendario sólo se oculta si *todos* los
+servicios son dinámicos.
+
+**Verificado en vivo contra `reservaste-stg`** (la migración de
+`services_public`): `test/phase4.public-calendar.test.ts` (8/8) y
+`test/phase28.plan-catalog-and-change-requests.test.ts` (19/19), sin
+regresión — ambos archivos son los consumidores reales más cercanos de
+`services_public`. Gate de `reviewer` sobre el frontend: **LISTO** en la
+segunda vuelta (primera NO LISTO por esta misma migración sin commitear/
+documentar — ya resuelto — y por `docs/api.md` sin sincronizar — ídem).
+Gate de `security-engineer` sobre el frontend: confirma que el
+login-diferido corre siempre antes del hold, sin bypass, y que
+`returnTo` no abre un open-redirect.
+
+**Deuda técnica heredada, no bloqueante**: `getDynamicAvailability()`
+dedupea por `(resourceId, startAt)` en el cliente por la deuda ya
+registrada en Fase 50 (ventanas superpuestas no fusionadas en
+`create_resource_availability_window()`) — mitigación de presentación,
+no corrige la causa. La cuenta regresiva del hold usa el reloj del
+cliente sin margen de tolerancia — un reloj adelantado puede mostrar
+"vencido" antes de tiempo (el servidor sigue siendo la única fuente de
+verdad real, es sólo UX). Un `Service` servido simultáneamente por un
+recurso dinámico y uno de grilla, en una organización donde el resto de
+servicios son 100% dinámicos, perdería visibilidad pública del lado de
+grilla — consistente con la Decisión 3 de ADR-0051 (soporte N:M
+explícitamente diferido), no un bug introducido acá.
+`confirmar/page.tsx` arma un redirect (cuando faltan `resource`/`start`
+en la URL) usando `organizationSlug`/`serviceId` crudos de la ruta,
+antes de validarlos contra la base — mismo patrón ya preexistente en
+`reservar/confirmar/page.tsx` (no introducido por esta fase), señalado
+por el gate de seguridad como de severidad baja y no confirmado como
+explotable en esta versión de Next; pendiente de que alguien reordene
+la validación antes del redirect en los dos archivos. `holdDynamicSlot()`
+sí aplica `safeReturnTo()` al `returnTo` que recibe (fix aplicado tras
+el gate — defensa en profundidad, `/login` ya lo validaba de todas
+formas).

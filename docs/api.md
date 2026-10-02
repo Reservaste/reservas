@@ -1650,3 +1650,47 @@ existente), persiste `organizations.open_booking_enabled`. OWNER-only, mismo gua
 existente al principio de la función (cubre el formulario entero, no sólo este
 campo). Expuesto en `app/org/[slug]/settings/settings-form.tsx`, sección "Reserva
 abierta".
+
+## Fase 50/51 — disponibilidad dinámica para recursos exclusivos (ADR-0051)
+
+Server actions nuevas en `frontend/app/actions/dynamic-booking.ts` (detalle
+backend completo en `docs/database.md`, secciones "Fase 50" y "Fase 51"):
+
+**`getDynamicAvailability(organizationSlug, serviceId, date)`** — pública, sin
+auth. Wrapea `get_dynamic_availability()`, mapea a `DynamicSlot[]` (`resourceId`,
+`resourceName | null`, `startAt`, `endAt`). Dedupea por `(resourceId, startAt)` en
+el cliente (presentación, no cambia qué expone la RPC — ver deuda técnica de
+ventanas superpuestas en `docs/database.md` Fase 51).
+
+**`holdDynamicSlot(organizationSlug, resourceId, serviceId, startAtIso, returnTo)`**
+(cambio de patrón respecto al resto del flujo público, documentar bien para quien
+lo toque después): a diferencia de `confirmBooking()`/`bookSlot()` (que resuelven
+login recién al confirmar), esta acción **resuelve la sesión primero** —
+`supabase.auth.getUser()`, y si no hay user, `redirect("/login?returnTo=" +
+encodeURIComponent(returnTo))` **antes** de llamar a `hold_dynamic_slot()`. Es así
+porque holdear ya es una escritura real sobre un recurso escaso (ADR-0051), a
+diferencia de "elegir un horario" en el flujo de grilla, que hasta confirmar es
+sólo lectura. Con sesión, llama la RPC y mapea `TOO_MANY_ACTIVE_HOLDS`/
+`SLOT_NO_LONGER_AVAILABLE` (nuevos en `lib/booking-reasons.ts`) a mensaje
+amigable; éxito devuelve `{ error: null, slotOccurrenceId, heldUntil }`.
+
+**`confirmDynamicBooking(slotOccurrenceId, organizationSlug, prevState, formData)`**
+— mismo shape (`BookingActionState`) que `confirmBooking()` de `customer.ts`, para
+reusar `FormError`. Llama `book_dynamic_slot()`; **`HOLD_NOT_FOUND` es el único
+status de rechazo posible más allá de lo que `book_slot()` ya devuelve** (rate
+limits, `SLOT_FULL`, `PAYMENT_REQUIRED`, etc., sin cambios) — cubre cuatro casos
+reales (no existe / no es tuyo / venció / es una ocurrencia de grilla) sin
+distinción observable entre ellos, a propósito (no-oráculo, ver `docs/security.md`
+Fase 50). **Nunca intentar inferir cuál de los cuatro pasó** en ningún mensaje de
+UI nuevo que se agregue después. Éxito: `revalidatePath("/me")` + `redirect` a
+`/me?reservado=1&org=${organizationSlug}`, mismo patrón que `confirmBooking()`.
+
+**`releaseDynamicHold(slotOccurrenceId)`** — wrapea `release_dynamic_hold()`,
+no-op silencioso si el hold no es tuyo o ya no existe (igual que el backend).
+
+**`app/actions/public.ts` (cambio aditivo)**: `listPublicServices()` y la función
+nueva `getPublicService(organizationId, serviceId)` devuelven también
+`hasDynamicResource: boolean` (mapeado a mano desde `services_public.has_dynamic_resource`
+— mismo motivo de siempre, `@reservaste/domain` no republicado). Consumido por
+`app/[organizationSlug]/page.tsx` para decidir si un servicio va a la sección
+"Ver horarios de {servicio}" (flujo nuevo) o al calendario de grilla de siempre.
