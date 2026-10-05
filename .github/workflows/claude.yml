@@ -5,13 +5,29 @@
 # (hoy Mathias, mañana quien triage) decide explícitamente que esto entra
 # al pipeline autónomo poniendo esa etiqueta, en vez de que cualquier
 # Issue dispare un agente con permisos de push a producción.
+#
+# También dispara ante un comentario nuevo en un Issue ya etiquetado
+# "bug" (issue_comment) -- es como el agente retoma la conversación
+# cuando responde una pregunta de clarificación que él mismo dejó. Dos
+# guardas obligatorias en el `if` del job para evitar un loop infinito o
+# ruido en PRs: (a) excluir comentarios del propio bot (`claude[bot]`) y
+# (b) excluir comentarios en Pull Requests, que tècnicamente también
+# emiten `issue_comment` en GitHub Actions.
 on:
   issues:
     types: [opened, labeled]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: auto-fix-bug-${{ github.event.issue.number }}
+  cancel-in-progress: false
 
 jobs:
   auto-fix-bug:
-    if: contains(github.event.issue.labels.*.name, 'bug')
+    if: |
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'bug')) ||
+      (github.event_name == 'issue_comment' && !github.event.issue.pull_request && github.event.issue.state == 'open' && contains(github.event.issue.labels.*.name, 'bug') && github.event.comment.user.login != 'claude[bot]')
     runs-on: ubuntu-latest
     # Un bug real de punta a punta (diagnóstico + fix + qa + review +
     # security gate si aplica + release en hasta 3 repos) puede tardar
@@ -68,7 +84,12 @@ jobs:
             Leé su título y cuerpo con `gh issue view ${{
             github.event.issue.number }} --repo ${{ github.repository }}
             --comments` (incluye comentarios, puede haber contexto
-            adicional ahí).
+            adicional ahí). Si esta corrida arrancó por un comentario
+            nuevo (evento `issue_comment`) en vez de por la etiqueta,
+            es muy probable que sea la respuesta a una pregunta de
+            clarificación que vos mismo dejaste en una corrida anterior
+            -- leé el hilo completo de comentarios y seguí desde ahí en
+            vez de repetir la misma pregunta.
 
             Estructura real del proyecto (tres repos separados, ADR-0016):
             este checkout es sólo `Reservaste/reservas` (docs + agentes).
