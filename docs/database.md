@@ -3226,7 +3226,7 @@ de otra organización, o llamador CUSTOMER → 0 filas. `email` viene de
 `phone` es `customers.phone`. `revoke` a `public, anon`; `grant` a
 `authenticated`. `organization_customers()` no cambia. Migración aditiva:
 `20261005120000_phase54_customer_contact.sql`.
-## Fase 54 — `admin_upgrade_payment()`: upgrade de plan a mitad de período (ADR-0050, migración `20261005100000_phase54_admin_upgrade_payment.sql`)
+## Fase 54 — `admin_upgrade_payment()`: upgrade de plan a mitad de período (ADR-0050, migración `20261005130000_phase54_admin_upgrade_payment.sql`)
 
 RPC `admin_upgrade_payment(p_payment_id uuid, p_new_plan_id uuid, p_effective_date date,
 p_amount numeric default null, p_notes text default null) returns uuid` (id del pago

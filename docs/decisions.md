@@ -4203,6 +4203,8 @@ Propuesta por: Issue #4 "Upgrade desde el ADMIN" (reportado por Ruotea; respuest
 
 ---
 
+**Seguimiento ADR-0050 (implementado):** backend `admin_upgrade_payment` (migración `20261005130000`), frontend `upgradeCustomerPayment` + botón "Hacer upgrade" en la ficha del cliente. `security-engineer` aplicó tres fixes (rechazo de `NaN`, nota de auditoría `app.audit_note` del acortamiento del pago viejo, revalidación de organización bajo el lock). Aproximación conocida: una serie con `start_date` a mitad del período cuenta como período completo en el prorrateo por sesiones. Hueco preexistente, fuera de alcance: la policy `payments_update_staff` permite UPDATE directo de `period_start/period_end` sin auditoría (a tratar aparte).
+
 ## ADR-0051 — `customer_contact()`: email y teléfono del cliente en la ficha, sólo para el equipo
 
 Fecha: 2026-10-05
@@ -4239,4 +4241,3 @@ sin cuenta.
 **Impacto:** migración aditiva (función nueva, sin cambio de schema ni de
 firmas existentes). Toca datos privados multi-tenant → gate obligatorio de
 `security-engineer`. Un `CUSTOMER` y un anónimo no pueden llamarla.
-**Seguimiento ADR-0050 (implementado):** backend `admin_upgrade_payment` (migración `20261005100000`), frontend `upgradeCustomerPayment` + botón "Hacer upgrade" en la ficha del cliente. `security-engineer` aplicó tres fixes (rechazo de `NaN`, nota de auditoría `app.audit_note` del acortamiento del pago viejo, revalidación de organización bajo el lock). Aproximación conocida: una serie con `start_date` a mitad del período cuenta como período completo en el prorrateo por sesiones. Hueco preexistente, fuera de alcance: la policy `payments_update_staff` permite UPDATE directo de `period_start/period_end` sin auditoría (a tratar aparte).
