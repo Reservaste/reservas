@@ -2334,6 +2334,37 @@ Reglas que quedan escritas:
    un cliente de B recibe el contacto (es miembro legítimo de B); la ficha
    no lo muestra porque hace `notFound()` sobre el listado de A.
 4. No loguear el resultado (email/teléfono son PII).
+## Fase 54 — upgrade de plan a mitad de período (ADR-0050) — reglas
+
+`admin_upgrade_payment(p_payment_id, p_new_plan_id, p_effective_date, p_amount, p_notes)`
+es `SECURITY DEFINER` con `search_path = public`, `EXECUTE` sólo para
+`authenticated` (revocado de `public`/`anon`; `service_role` lo conserva por
+default pero sin `auth.uid()` `has_org_permission` da falso).
+
+1. **Autorización antes del lock, re-chequeada bajo el lock.** Se lee
+   `organization_id` sin lock, se exige `MANAGE_PAYMENTS` y recién ahí
+   `FOR UPDATE`; bajo el lock se exige que la organización siga siendo la
+   misma. Un no autorizado nunca bloquea filas ajenas.
+2. **Sin filtrado de existencia.** Pago inexistente, de otra organización o
+   sin permiso → el mismo `PAYMENT_UPGRADE_NOT_AUTHORIZED`. Plan de otra
+   organización o inexistente → el mismo `PAYMENT_UPGRADE_PLAN_NOT_FOUND`
+   (el plan se busca filtrando por la organización **del pago**, nunca por un
+   parámetro).
+3. **`organizationId` y `customerId` nunca vienen del cliente**: el pago nuevo
+   hereda ambos del pago viejo bloqueado.
+4. **Montos: rechazar `NaN` explícitamente.** `'NaN'::numeric < 0` es falso y
+   `numeric(12,2)` acepta `NaN`; toda RPC que reciba un monto tiene que
+   chequear `= 'NaN'::numeric` además de `< 0` (igual que la Fase 44). Por
+   PostgREST se llega mandando el string `"NaN"`.
+5. **Cobertura:** nunca dos pagos vivos por `(customer, service)` en una
+   fecha (el `EXCLUDE` no se relaja; acortar + insertar en la misma
+   transacción) y nunca un hueco (el nuevo arranca en la fecha efectiva y el
+   viejo termina el día anterior; misma cobertura de servicios exigida).
+6. **Auditoría:** acortar `period_end` no cambia `status` y no lo ve
+   `payments_audit_status`; la RPC deja la constancia vía `app.audit_note`
+   en el `PAYMENT_CREATED` del pago nuevo (id del viejo, plan viejo,
+   `period_end` antes → después). Toda RPC futura que modifique un pago sin
+   cambiar su estado tiene que dejar constancia equivalente.
 
 ## Pendiente de definir (Phase 1)
 

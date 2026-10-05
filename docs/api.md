@@ -1531,3 +1531,26 @@ el contexto correcto antes de que ese código, sin tocar, corra.
 null; phone: string | null }`. Llama a la RPC `customer_contact()`; ante
 0 filas o error devuelve ambos en `null`. Se usa sólo en la ficha de
 cliente (`/org/[slug]/customers/[customerId]`), nunca en listados.
+### Fase 54 — `upgradeCustomerPayment()` y RPC `admin_upgrade_payment` (ADR-0050, Issue #4)
+
+`upgradeCustomerPayment(organizationSlug, paymentId, prev, formData)` (server
+action en `app/actions/billing.ts`, requiere membresía con `MANAGE_PAYMENTS`
+en la UI; la defensa real es la RPC). `FormData`: `newPlanId` (uuid del
+plan nuevo), `effectiveDate` (`YYYY-MM-DD`), `amount` (opcional, ≥ 0, acepta
+coma), `notes` (opcional). Llama a
+`rpc('admin_upgrade_payment', { p_payment_id, p_new_plan_id, p_effective_date, p_amount, p_notes })`,
+que devuelve el uuid del pago nuevo, y hace `revalidatePath(/org/<slug>, 'layout')`.
+
+Qué hace la RPC (atómica): acorta el pago PAID viejo a `effectiveDate - 1`
+y crea un pago PAID nuevo desde `effectiveDate` hasta el fin original del
+período. Si `amount` es null, el servidor prorratea el precio del plan nuevo
+por sesiones restantes (días corridos si el cliente aún no tiene tantas
+series como la frecuencia nueva). Un solo pago vigente por fecha; el
+`EXCLUDE` no se relaja.
+
+Errores (traducidos en `lib/plan-upgrade.ts`): `PAYMENT_UPGRADE_NOT_AUTHORIZED`,
+`_NOT_PAID`, `_NOT_PERIOD_PAYMENT`, `_INVALID_DATE`, `_PLAN_NOT_FOUND`,
+`_SAME_PLAN`, `_PLAN_INACTIVE`, `_PLAN_DROP_IN`, `_NOT_HIGHER_PLAN`,
+`_SCOPE_MISMATCH`, `_INVALID_AMOUNT` (negativo o NaN), más
+`payment_service_coverage_no_overlap` / `PAYMENT_DUPLICATE_PERIOD` cuando ya
+hay una renovación cargada que solapa.

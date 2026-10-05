@@ -3226,3 +3226,42 @@ de otra organización, o llamador CUSTOMER → 0 filas. `email` viene de
 `phone` es `customers.phone`. `revoke` a `public, anon`; `grant` a
 `authenticated`. `organization_customers()` no cambia. Migración aditiva:
 `20261005120000_phase54_customer_contact.sql`.
+## Fase 54 — `admin_upgrade_payment()`: upgrade de plan a mitad de período (ADR-0050, migración `20261005100000_phase54_admin_upgrade_payment.sql`)
+
+RPC `admin_upgrade_payment(p_payment_id uuid, p_new_plan_id uuid, p_effective_date date,
+p_amount numeric default null, p_notes text default null) returns uuid` (id del pago
+nuevo). `SECURITY DEFINER`, `search_path = public`, `revoke` de `public`/`anon`,
+`grant` a `authenticated`. **Sin cambios de tablas ni constraints**: el `EXCLUDE`
+`payment_service_coverage_no_overlap` no se relaja; el upgrade *particiona* el período.
+
+Flujo (una transacción): (1) `has_org_permission(org del pago, 'MANAGE_PAYMENTS')`
+**antes** de bloquear nada — un pago ajeno, inexistente o sin permiso dan el mismo
+`PAYMENT_UPGRADE_NOT_AUTHORIZED` (a diferencia de `set_payment_status`, que distingue
+`PAYMENT_NOT_FOUND`); (2) `SELECT ... FOR UPDATE` del pago viejo y validaciones;
+(3) `UPDATE payments SET period_end = p_effective_date - 1` (el trigger
+`payments_coverage_sync_status` replica a `payment_service_coverage`; el monto viejo no se
+toca); (4) `INSERT` del pago nuevo `PAID` (`period_start = p_effective_date`, `period_end` =
+el original, `created_by = auth.uid()`), que dispara cobertura, doble cobro, auditoría
+`PAYMENT_CREATED`, reconciliación de fechas pendientes y cierre de `plan_change_requests`.
+
+Prorrateo (si `p_amount` es `NULL`): `round(price_nuevo × sesiones_restantes /
+sesiones_totales, 2)`. Sesiones = fechas del período que caen en los `weekday` de las
+series `ACTIVE` del cliente (para los servicios cubiertos, en el orden de cuota
+`created_at, id`, tantas como `weekly_quota`) — sólo cuando el cliente ya tiene tantas series
+como la frecuencia del plan nuevo. Si no (plan `UNLIMITED`, o horario nuevo aún sin armar),
+proporción por días corridos `(period_end - fecha + 1) / (period_end - period_start + 1)`.
+`p_amount` sobrescribe y no se valida contra el precio.
+
+Validaciones y códigos (`PAYMENT_UPGRADE_*`): `NOT_AUTHORIZED`, `NOT_PAID`,
+`NOT_PERIOD_PAYMENT` (pago de turno suelto), `INVALID_DATE` (nula o fuera de
+`(period_start, period_end]`; también es lo que ve un segundo upgrade sobre el mismo pago
+con la misma fecha o posterior), `PLAN_NOT_FOUND` (inexistente o de otra org),
+`SAME_PLAN`, `PLAN_INACTIVE`, `PLAN_DROP_IN`, `NOT_HIGHER_PLAN` (igual/menor, o partiendo de
+`UNLIMITED`), `SCOPE_MISMATCH` (el plan nuevo no cubre exactamente los servicios de las filas
+de `payment_service_coverage` del pago viejo), `INVALID_AMOUNT` (negativo o NaN).
+
+Notas: el acortamiento del pago viejo **no** se audita (`payments_audit_status` sólo mira
+`status`); queda el `PAYMENT_CREATED` del nuevo. Un upgrade con fecha retroactiva *anterior*
+a otro upgrade previo del mismo pago es posible (el pago viejo se acorta más y el tramo
+intermedio queda para el plan intermedio): sigue habiendo un solo pago vigente por fecha.
+Tests: `backend/test/phase54.admin-upgrade-payment.test.ts` (24 casos).
