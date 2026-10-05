@@ -70,7 +70,11 @@ jobs:
           # su cuenta contra Reservaste/backend y Reservaste/frontend --
           # dos repos que este workflow, corriendo en Reservaste/reservas,
           # no toca de otra forma. Sin esto, cualquier `git push`/`gh pr
-          # create` contra backend o frontend falla.
+          # create` contra backend o frontend falla. Se expone como
+          # CROSS_REPO_PAT (no GH_TOKEN): la Action gestiona GH_TOKEN
+          # internamente y pisa cualquier valor que le demos con ese
+          # nombre -- ver instrucciones explícitas en el prompt para
+          # usar CROSS_REPO_PAT a mano en cada operación cross-repo.
           claude_args: |
             --allowedTools "Bash,Read,Write,Edit,Glob,Grep,Task,TodoWrite,WebFetch,WebSearch"
           prompt: |
@@ -110,10 +114,36 @@ jobs:
             working directory -- lo que sea más simple para vos, ambos
             layouts funcionan igual de bien siempre que backend y frontend
             queden como carpetas hermanas entre sí). Usá `gh repo clone
-            Reservaste/backend` / `gh repo clone Reservaste/frontend` --
-            `GH_TOKEN` ya está en el entorno (ver `env:` de este step) así
-            que `gh`/`git push`/`git` sobre esos remotos no necesitan
-            login aparte.
+            Reservaste/backend` / `gh repo clone Reservaste/frontend`
+            para clonarlos (de sólo lectura funciona sin nada más, son
+            públicos).
+
+            CRÍTICO sobre autenticarte contra backend/frontend para
+            escribir (push, PR): la variable de entorno que te da acceso
+            es `CROSS_REPO_PAT`, NO `GH_TOKEN` -- `GH_TOKEN` existe en tu
+            entorno pero es un token de instalación de esta Action
+            (`ghs_...`, identidad `claude[bot]`) sin permiso de escritura
+            sobre esos dos repos, y confiar en él es exactamente lo que
+            falló en corridas anteriores (403 "denied to claude[bot]").
+            Para cada remoto cross-repo, fijá la URL con el token
+            embebido apenas lo clones, así no dependés de ningún
+            credential helper global que puedas no controlar:
+            ```
+            git -C ../backend remote set-url origin \
+              "https://x-access-token:${CROSS_REPO_PAT}@github.com/Reservaste/backend.git"
+            git -C ../frontend remote set-url origin \
+              "https://x-access-token:${CROSS_REPO_PAT}@github.com/Reservaste/frontend.git"
+            ```
+            (ajustá las rutas si clonaste en otro lugar). Con eso,
+            `git push` contra esos remotos ya autentica bien. Para
+            comandos `gh` contra esos repos (`gh pr create`, `gh pr
+            merge`, etc.), `gh` no lee la URL del remoto para auth --
+            pasá el override puntual en cada invocación:
+            `GH_TOKEN="$CROSS_REPO_PAT" gh pr create --repo
+            Reservaste/frontend ...` (y lo mismo para `gh pr merge`).
+            Para operaciones dentro de `Reservaste/reservas` (este
+            checkout, p. ej. el comentario final del paso 9 o el commit
+            de docs del paso 8), `GH_TOKEN` del entorno alcanza.
 
             CRÍTICO sobre delegar a subagentes (Task/Agent tool) en ESTA
             corrida: por defecto esa herramienta puede lanzar al subagente
@@ -206,4 +236,10 @@ jobs:
             sin tocar código. Preferí no actuar antes que adivinar mal en
             un pipeline que ya no tiene revisión humana detrás.
         env:
-          GH_TOKEN: ${{ secrets.CROSS_REPO_PAT }}
+          # NO se llama GH_TOKEN a propósito (ver nota en el prompt):
+          # anthropics/claude-code-action@v1 gestiona GH_TOKEN
+          # internamente (token de instalación `ghs_...`, identidad
+          # `claude[bot]`) y pisa cualquier valor que le pasemos acá con
+          # ese mismo nombre -- confirmado en vivo, el agente nunca vio
+          # el valor de CROSS_REPO_PAT cuando se llamaba GH_TOKEN.
+          CROSS_REPO_PAT: ${{ secrets.CROSS_REPO_PAT }}
