@@ -52,13 +52,6 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
-          # TEMPORAL -- diagnóstico del bug "corre pero no comenta" en
-          # issues disparados por `issue_comment` (ver docs/decisions.md,
-          # seguimiento de ADR-0042). Expone el output completo del
-          # agente en el log de este Action -- revertir apenas se
-          # entienda la causa, este repo es público.
-          show_full_output: true
-
           additional_permissions: |
             actions: read
 
