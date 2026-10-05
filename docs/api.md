@@ -420,7 +420,7 @@ pedido pendiente **no habilita ni bloquea una sola reserva**.
 |---|---|---|
 | `requestPlanChange` | CUSTOMER | `(servicePlanId: string, _prev: ActionState, formData: FormData) => Promise<ActionState>` — nota opcional en `formData.get("note")`, máx. 500. Idempotente: repetir el pedido pendiente devuelve éxito sin duplicar. |
 | `getMyPlanChangeRequests` | CUSTOMER | `() => Promise<MyPlanChangeRequest[]>` — pendientes primero, con `currentPlanName` y `resolution`. |
-| `listPlanChangeRequests` | ADMIN | `(organizationSlug: string, includeResolved = false) => Promise<PlanChangeRequest[]>` |
+| `listPlanChangeRequests` | ADMIN | `(organizationSlug: string, includeResolved = false) => Promise<{ requests: PlanChangeRequest[]; error: boolean }>` — `error: true` cuando el RPC falla (no se confunde con "sin pedidos"). La cola se muestra en Pagos y en Planes. |
 | `resolvePlanChangeRequest` | ADMIN | `(organizationSlug: string, requestId: string, resolution: "APPLIED" \| "DISMISSED") => Promise<void>` — target de `<form action>`. |
 
 Errores traducidos por `requestPlanChange`: `NOT_A_CUSTOMER` ("todavía no
@@ -447,7 +447,7 @@ es para los casos en que la venta no pasó por ahí.
 3. `/me/servicios`: mostrar el pedido pendiente y un acceso al catálogo
    del negocio.
 4. Admin: listar los pedidos pendientes (`listPlanChangeRequests`) donde
-   el mostrador ya mira planes/pagos, con "marcar como atendido"
+   el mostrador ya mira planes/pagos (Pagos y Planes, Issue #6), con "marcar como atendido"
    (`resolvePlanChangeRequest`) — recordando que cobrar el plan pedido ya
    lo cierra solo.
 
