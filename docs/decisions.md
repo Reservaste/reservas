@@ -4200,3 +4200,42 @@ Propuesta por: Issue #4 "Upgrade desde el ADMIN" (reportado por Ruotea; respuest
 **Alternativas descartadas:** (a) relajar el `EXCLUDE` y permitir dos pagos solapados → obliga a una regla de precedencia en el motor de reservas, que ADR-0024 prohibió; (b) VOID + recargar con monto manual → pierde el registro de lo ya cobrado y deja ventana sin cobertura entre los dos pasos; (c) cobrar sólo la diferencia → descartada por el producto (opción A).
 
 **Impacto:** una migración (función nueva, `grant execute` sólo a `authenticated`, `revoke` de `public/anon`) + una server action y un formulario. **Gates:** `security-engineer` obligatorio (pagos + RLS/multi-tenant), `reviewer`, `qa-engineer` con suite de integración completa. Incluye tests de: upgrade feliz, atomicidad, cross-tenant, rol sin `MANAGE_PAYMENTS`, fechas inválidas, plan inferior/igual, `DROP_IN`, doble upgrade sobre el mismo pago.
+
+---
+
+## ADR-0051 — `customer_contact()`: email y teléfono del cliente en la ficha, sólo para el equipo
+
+Fecha: 2026-10-05
+Estado: **Aceptada**
+Origen: Issue #5 (Ruotea) — "al clickear un cliente sólo veo el nombre;
+quiero ver también su correo y teléfono".
+
+**Problema:** la ficha de cliente del panel admin sólo muestra
+`full_name`. `organization_customers()` no devuelve email ni teléfono, y
+el email vive en `auth.users` (inaccesible para el rol `authenticated`);
+`customers.phone` existe (ADR-0026) pero sólo se lee a mano para clientes
+sin cuenta.
+
+**Decisión:**
+
+1. **RPC nueva, de a un cliente: `customer_contact(p_customer_id uuid)`**
+   → `(email text, phone text)`, `security definer`, `stable`,
+   `search_path = public`. Se resuelve la organización desde
+   `customers.organization_id` (nunca por parámetro del llamador) y exige
+   `is_organization_member(c.organization_id)` (OWNER/STAFF activos —
+   el equipo). Cliente inexistente o de otra organización → 0 filas
+   (mismo resultado, sin oráculo cross-tenant). `email` sale de
+   `auth.users` vía `customers.profile_id` (null para clientes
+   gestionados); `phone` es `customers.phone`.
+2. **No se amplía `organization_customers()`**: esa RPC alimenta
+   listados/selectores; sumarle email/teléfono expondría el dato de todos
+   los clientes en cada pantalla. El contacto se pide sólo en la ficha.
+3. Grants: `revoke ... from public, anon`; `grant execute to
+   authenticated` (patrón ADR-0019/Fase 19).
+4. Frontend: acción `getCustomerContact(slug, customerId)` + bloque
+   "Contacto" en `customers/[customerId]/page.tsx`; los datos faltantes
+   se muestran como "Sin correo" / "Sin teléfono".
+
+**Impacto:** migración aditiva (función nueva, sin cambio de schema ni de
+firmas existentes). Toca datos privados multi-tenant → gate obligatorio de
+`security-engineer`. Un `CUSTOMER` y un anónimo no pueden llamarla.
