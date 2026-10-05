@@ -3214,3 +3214,15 @@ explicando por qué ese test necesita un servicio gratuito, ver arriba); (e)
 (h) `NO_DROP_IN_PLAN`. **Verificado en vivo contra `reservaste-stg`**: los 8 casos pasan,
 incluidos en los 366/366 de la suite completa. Migración sin
 aplicar contra `reservaste-stg` todavía.
+
+## Fase 54 — `customer_contact()` (ADR-0050)
+
+Función nueva `customer_contact(p_customer_id uuid) returns table (email
+text, phone text)`: `security definer`, `stable`, `search_path = public`.
+La organización se deriva de `customers.organization_id`; exige
+`is_organization_member()` (OWNER/STAFF activos). Cliente inexistente,
+de otra organización, o llamador CUSTOMER → 0 filas. `email` viene de
+`auth.users` vía `customers.profile_id` (null en clientes gestionados);
+`phone` es `customers.phone`. `revoke` a `public, anon`; `grant` a
+`authenticated`. `organization_customers()` no cambia. Migración aditiva:
+`20261005120000_phase54_customer_contact.sql`.

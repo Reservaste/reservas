@@ -1524,3 +1524,10 @@ sólo le permiten a un segundo contexto de navegador replantar la cookie
 y el shape de `ClaimActivationState` en `frontend/app/actions/activation.ts` quedan
 intactos — esta fase sólo agrega una forma nueva de que la cookie llegue a existir en
 el contexto correcto antes de que ese código, sin tocar, corra.
+
+## Fase 54 — `getCustomerContact()` (ADR-0050, `admin.ts`)
+
+`getCustomerContact(organizationSlug, customerId)` → `{ email: string |
+null; phone: string | null }`. Llama a la RPC `customer_contact()`; ante
+0 filas o error devuelve ambos en `null`. Se usa sólo en la ficha de
+cliente (`/org/[slug]/customers/[customerId]`), nunca en listados.

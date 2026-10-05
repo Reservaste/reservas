@@ -2300,6 +2300,41 @@ no en el repo).
    cookie queda en otro host que el del redirect). **Nunca `supabase config
    push`** contra producción: subiría `site_url`/redirects de local.
 
+## Contacto del cliente: `customer_contact()` (ADR-0050) — reglas
+
+Verificado por `security-engineer` (2026-10-05) contra base local:
+`pg_proc.proacl` = `{postgres, authenticated, service_role}` (sin `PUBLIC`
+ni `anon`), `prosecdef = true`, `search_path=public`, todas las referencias
+calificadas (`public.customers`, `auth.users`, `public.is_organization_member`).
+
+| Función | Nivel | Gate |
+|---|---|---|
+| `customer_contact(p_customer_id)` → `(email, phone)` | **ADMIN** (cualquier miembro activo, OWNER o STAFF, sin permiso granular) | `is_organization_member(c.organization_id)` sobre la organización **de la fila `customers`**, nunca por parámetro. Inexistente / otra org / `CUSTOMER` (incluso el propio) / miembro desactivado → 0 filas, indistinguibles. `anon` → `42501`. |
+
+Reglas que quedan escritas:
+
+1. **El email de `auth.users` sólo sale por RPC de a un `Customer`**, con
+   id de cliente como entrada. Nunca se agrega a `organization_customers()`,
+   `occurrence_bookings()` ni a ninguna RPC de listado/selector: eso
+   expondría el padrón de mails en cada pantalla. Ninguna RPC acepta un
+   email como entrada para devolver contacto (sería oráculo de
+   enumeración). Los lookups por email preexistentes
+   (`enroll_customer_by_email()`, `invite_member_by_email()`) devuelven la
+   fila creada, no el email ni datos de `auth.users`, pero sí revelan si
+   el email tiene cuenta (exige `MANAGE_CUSTOMERS`/OWNER respectivamente);
+   no es parte de ADR-0050 y no se amplía.
+2. `phone` ya era legible por cualquier miembro vía
+   `customers_select_self_or_staff`; la RPC no amplía ese nivel. El
+   `email` sí es nuevo para STAFF sin `MANAGE_CUSTOMERS` — aceptado por
+   ADR-0050 (el equipo necesita contactar al cliente). Si se quisiera
+   restringir, el lugar es un `has_org_permission()` dentro de la RPC, no
+   el frontend.
+3. Igual que en la regla de Fases 37/38: `getCustomerContact(slug, id)`
+   gatea en la RPC, no en el slug. Un miembro de A y B que pide slug A con
+   un cliente de B recibe el contacto (es miembro legítimo de B); la ficha
+   no lo muestra porque hace `notFound()` sobre el listado de A.
+4. No loguear el resultado (email/teléfono son PII).
+
 ## Pendiente de definir (Phase 1)
 
 - Proveedor de auth concreto: **Supabase Auth** (ADR-0002, cerrado).
