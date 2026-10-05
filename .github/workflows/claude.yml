@@ -113,6 +113,29 @@ jobs:
             que `gh`/`git push`/`git` sobre esos remotos no necesitan
             login aparte.
 
+            CRÍTICO sobre delegar a subagentes (Task/Agent tool) en ESTA
+            corrida: por defecto esa herramienta puede lanzar al subagente
+            en background y decirte "vas a ser notificado cuando termine,
+            mientras tanto seguí con otra cosa". Esa semántica asume que
+            hay un turno futuro en el que la notificación te llega -- en
+            una sesión interactiva sí lo hay. Acá NO: esta corrida es de
+            un solo shot, el proceso entero termina en cuanto vos decidís
+            que no tenés nada más que hacer, y si en ese momento quedó un
+            subagente corriendo en background, su resultado se pierde para
+            siempre -- nadie va a estar para leer esa notificación, el job
+            ya cerró. Si alguna vez ves un mensaje tipo "Async agent
+            launched" o "you will be notified automatically", NO lo
+            tomes como "ya diste el paso, podés terminar": tenés que forzar
+            modo foreground/síncrono en cada delegación a un subagente
+            (`backend-engineer`, `frontend-engineer`, `qa-engineer`,
+            `reviewer`, `security-engineer`, `release-manager`) -- pasá
+            explícitamente la opción que lo bloquee hasta tener el
+            resultado real (p. ej. `run_in_background: false` si la
+            herramienta la expone) y no avances al paso siguiente ni
+            termines tu respuesta hasta tener el resultado completo de
+            cada subagente delegado, nunca sólo la confirmación de que
+            arrancó.
+
             Flujo esperado, el mismo de siempre en este proyecto:
             1. Diagnosticá el bug con evidencia real (leé código, corré
                tests, no asumas) antes de tocar nada.
@@ -126,7 +149,9 @@ jobs:
                la decisión se registra igual.
             3. Delegá la implementación a `backend-engineer`/
                `frontend-engineer` según corresponda vía el mecanismo de
-               subagentes normal (Task tool).
+               subagentes normal (Task tool), SIEMPRE en foreground (ver
+               nota crítica arriba) -- esperá su resultado completo antes
+               de seguir.
             4. `qa-engineer` corre la suite de integración/unit completa
                del repo que tocaste, no sólo el archivo nuevo -- tiene que
                dar verde antes de seguir.
@@ -157,6 +182,16 @@ jobs:
                desplegado (o el push a `main` ya disparó el deploy
                automático) -- si algo quedó pendiente de verificar en
                producción, dejalo abierto y decilo en el comentario.
+
+            El paso 9 NO es opcional ni condicional a que los pasos
+            anteriores hayan salido bien: es tu ÚLTIMA acción en TODOS los
+            casos, sin excepción, incluso si te quedaste a mitad de
+            camino, un gate dio NO LISTO, o directamente no pudiste
+            avanzar nada. Esta corrida no tiene una vuelta siguiente en la
+            que alguien vea qué pasó si no lo contás ahora -- si tu
+            respuesta final no incluye haber comentado en el Issue,
+            trataste la corrida como si hubiera un humano que la va a
+            revisar después, y no lo hay.
 
             Si en cualquier punto el bug no es reproducible, la
             información del Issue no alcanza para diagnosticarlo con
