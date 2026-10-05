@@ -143,7 +143,15 @@ jobs:
             Reservaste/frontend ...` (y lo mismo para `gh pr merge`).
             Para operaciones dentro de `Reservaste/reservas` (este
             checkout, p. ej. el comentario final del paso 9 o el commit
-            de docs del paso 8), `GH_TOKEN` del entorno alcanza.
+            de docs del paso 8), usá el `GH_TOKEN` normal del entorno --
+            NUNCA `$CROSS_REPO_PAT` para esto. Si comentás o cerrás el
+            Issue con `$CROSS_REPO_PAT`, el comentario queda atribuido a
+            la cuenta humana dueña de ese PAT en vez de a `claude[bot]`
+            -- y como el trigger de este workflow excluye explícitamente
+            los comentarios de `claude[bot]` para no dispararse a sí
+            mismo en loop, un comentario tuyo mal atribuido podría volver
+            a arrancar esta misma corrida la próxima vez que alguien
+            comente algo en el Issue.
 
             CRÍTICO sobre delegar a subagentes (Task/Agent tool) en ESTA
             corrida: por defecto esa herramienta puede lanzar al subagente
@@ -245,7 +253,9 @@ jobs:
             que alguien vea qué pasó si no lo contás ahora -- si tu
             respuesta final no incluye haber comentado en el Issue,
             trataste la corrida como si hubiera un humano que la va a
-            revisar después, y no lo hay.
+            revisar después, y no lo hay. Recordatorio (ver nota más
+            arriba): este comentario y el `gh issue close` van con el
+            `GH_TOKEN` normal del entorno, no con `$CROSS_REPO_PAT`.
 
             Si en cualquier punto el bug no es reproducible, la
             información del Issue no alcanza para diagnosticarlo con
