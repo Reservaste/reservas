@@ -45,6 +45,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          # persist-credentials: false (ADR-0042) -- por defecto este
+          # step configura un header de auth global (token por defecto
+          # de la Action, identidad "claude[bot]") que después pisa a
+          # CROSS_REPO_PAT en cualquier `git push` plano contra los
+          # clones hermanos de backend/frontend, aunque GH_TOKEN esté
+          # bien seteado -- confirmado en vivo: `gh repo clone` siempre
+          # funcionó (usa su propio auth), pero `git push` daba 403
+          # "denied to claude[bot]" sin importar qué tuviera CROSS_REPO_PAT.
+          persist-credentials: false
 
       - name: Run Claude Code
         id: claude
