@@ -2300,7 +2300,7 @@ no en el repo).
    cookie queda en otro host que el del redirect). **Nunca `supabase config
    push`** contra producción: subiría `site_url`/redirects de local.
 
-## Contacto del cliente: `customer_contact()` (ADR-0050) — reglas
+## Contacto del cliente: `customer_contact()` (ADR-0051) — reglas
 
 Verificado por `security-engineer` (2026-10-05) contra base local:
 `pg_proc.proacl` = `{postgres, authenticated, service_role}` (sin `PUBLIC`

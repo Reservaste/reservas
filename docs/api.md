@@ -1525,7 +1525,7 @@ y el shape de `ClaimActivationState` en `frontend/app/actions/activation.ts` que
 intactos — esta fase sólo agrega una forma nueva de que la cookie llegue a existir en
 el contexto correcto antes de que ese código, sin tocar, corra.
 
-## Fase 54 — `getCustomerContact()` (ADR-0050, `admin.ts`)
+## Fase 54 — `getCustomerContact()` (ADR-0051, `admin.ts`)
 
 `getCustomerContact(organizationSlug, customerId)` → `{ email: string |
 null; phone: string | null }`. Llama a la RPC `customer_contact()`; ante
