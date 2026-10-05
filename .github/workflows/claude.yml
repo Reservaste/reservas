@@ -209,11 +209,33 @@ jobs:
                `Reservaste/reservas`.
             9. Comentá en el Issue #${{ github.event.issue.number }} (`gh
                issue comment`) un resumen breve en español de qué era el
-               bug, qué se cambió, y los links de los commits/PRs. Cerrá
-               el Issue (`gh issue close`) sólo si el fix ya quedó
+               bug, qué se cambió, y los links de los commits/PRs al
+               final (como referencia, no como parte de la explicación).
+               Cerrá el Issue (`gh issue close`) sólo si el fix ya quedó
                desplegado (o el push a `main` ya disparó el deploy
                automático) -- si algo quedó pendiente de verificar en
                producción, dejalo abierto y decilo en el comentario.
+
+               Quien lee este comentario (y quien abre la mayoría de
+               estos Issues) es del equipo de ventas, no del equipo
+               técnico -- no leyó CLAUDE.md, no sabe qué es RLS, un
+               schema, una RPC, un PR, un componente, ni le importa si
+               el fix fue en el frontend o el backend. Escribí como le
+               explicarías a un cliente qué pasaba y qué cambió, en
+               términos de lo que esa persona ve en la pantalla:
+               "antes pasaba esto cuando hacías tal cosa, ahora en vez
+               de eso pasa esto otro". Nada de nombres de archivos,
+               tablas, funciones, ni jerga de desarrollo en el cuerpo
+               del comentario -- si hace falta precisión técnica para
+               el equipo de desarrollo, va en los links del final, no
+               en el texto. Mismo criterio para preguntas de
+               clarificación (ver más abajo): preguntá qué vio, qué
+               esperaba ver, en qué pantalla y haciendo qué -- nunca le
+               pidas a quien no es técnico que elija entre explicaciones
+               técnicas (p. ej. no le preguntes si es "un problema de
+               identidad de sesión" o "un problema de visualización");
+               preguntale por el síntoma concreto y los pasos para
+               reproducirlo.
 
             El paso 9 NO es opcional ni condicional a que los pasos
             anteriores hayan salido bien: es tu ÚLTIMA acción en TODOS los
