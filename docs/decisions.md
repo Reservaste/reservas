@@ -4735,3 +4735,101 @@ extender `guard_organization_id_immutable()` (ya genérica) a esas
 tablas es trivial — queda como ítem de backlog, no urgente (mismo
 perfil de riesgo bajo: sólo explotable por alguien miembro de dos
 organizaciones a la vez).
+
+## ADR-0053 — Upgrade de plan a mitad de período: acortar el pago vigente + cobrar el nuevo prorrateado por sesiones
+
+Fecha: 2026-10-05
+Estado: **Aceptada**
+Origen: Issue #4 (`Reservaste/reservas`, etiqueta `bug`, "Upgrade desde el
+ADMIN"). Decisión tomada por el Orchestrator en la corrida autónoma de
+ADR-0042, con las respuestas de producto de @Ruotea en el hilo del Issue.
+
+**Problema.** Un cliente con un pago PAID vigente de un plan 1x/semana quiere
+pasar a 2x/semana a mitad de mes. Hoy el mostrador recibe "Ya hay un pago
+registrado que cubre parte de ese período"
+(`payment_service_coverage_no_overlap`, ADR-0029; `PAYMENT_DUPLICATE_PERIOD`,
+Fase 25). El EXCLUDE es correcto y **no se relaja**; lo que falta es una
+operación de "cambio de plan" de primera clase. La única salida existente
+(ADR-0024 resolución 1: VOID + recargar el mes entero) obliga a anular un pago
+efectivamente cobrado y a cobrar de nuevo el mes completo.
+
+**Respuestas de producto (Issue #4, @Ruotea) que fijan el diseño:**
+
+1. Se cobra el **proporcional del plan nuevo completo** (opción A): plan viejo
+   10, plan nuevo 20, mitad de mes → se cobran 10. El pago ya hecho del plan
+   viejo no se devuelve ni se descuenta (consistente con ADR-0031 resolución 4:
+   sin nota de crédito).
+2. El prorrateo es por **cantidad de sesiones restantes**, no por días.
+3. El plan viejo **se reemplaza desde la fecha del upgrade** (no conviven).
+4. La renovación del mes siguiente es del plan nuevo.
+
+**Decisión.**
+
+- **Mecanismo: acortar, no relajar.** El upgrade, en una sola transacción:
+  (a) pone `period_end = effective_date - 1` en el `Payment` vigente (el plan
+  viejo queda cobrado y vigente hasta el día anterior), y (b) inserta un
+  `Payment` nuevo del plan nuevo con `period_start = effective_date` y
+  `period_end` = el fin del período del pago viejo. Los dos períodos son
+  contiguos y **disjuntos**, así que el `EXCLUDE` de
+  `payment_service_coverage` y `check_payment_no_duplicate()` no se tocan y
+  nunca hay "dos planes activos" que resolver en el motor de reservas
+  (ADR-0024 resolución 1 sigue siendo la razón de fondo). Editar el período de
+  un pago ya era dato editable de admin (Fase 22: `sync_payment_service_coverage_status`
+  propaga `period_*` a la cobertura), por lo que no hay mecanismo nuevo de
+  sincronización.
+- **Nueva RPC `upgrade_customer_plan(p_payment_id, p_new_plan_id,
+  p_effective_date, p_amount, p_notes)`**, SECURITY DEFINER, `search_path =
+  public`, gateada igual que registrar un pago (membresía/permiso de pagos de
+  la organización del pago, nunca confiar en un `organization_id` del cliente).
+  Serializa por Customer con `pg_advisory_xact_lock(hashtext(customer_id))`
+  (mismo patrón que Fase 25). Todo o nada.
+- **Nueva RPC de solo lectura `quote_plan_upgrade(p_payment_id,
+  p_new_plan_id, p_effective_date)`** que devuelve el monto sugerido y su
+  desglose (sesiones restantes / sesiones del período). Es sugerencia: como en
+  ADR-0031, `amount` sigue siendo libre y el mostrador puede ajustarlo.
+- **Sesiones restantes**: para el plan nuevo `WEEKLY_QUOTA` con cuota *k*, se
+  cuentan las ocurrencias de calendario, dentro de `[effective_date,
+  period_end]` y dentro del período completo, de los días de semana de las *k*
+  series en vigencia del cliente (ADR-0024 precisión 1, mismo desempate
+  `created_at asc, id asc`) sobre los servicios que cubre el plan. Si el
+  cliente todavía no tiene exactamente *k* series en vigencia (ej. el
+  mostrador va a cargar la del miércoles después del cobro) o el plan no es de
+  cuota, **fallback explícito a proporción de días calendario** del período;
+  la respuesta indica cuál de los dos métodos usó (`method`:
+  `SESSIONS | DAYS`). Redondeo half-up a unidad entera de moneda, acotado a
+  `[0, precio de lista]` (idéntico a ADR-0031).
+- **Alcance**: sólo pagos anclados a período (`slot_occurrence_id is null`),
+  `PAID` o no anulados, plan distinto al nuevo, `effective_date` en
+  `(period_start, period_end]`. Si `effective_date = period_start` el pago
+  viejo quedaría vacío: se rechaza (`UPGRADE_DATE_AT_PERIOD_START`) y el
+  camino es el de siempre (VOID + recargar, ADR-0024 res. 1). El plan nuevo
+  debe ser de la misma organización y activo; debe cubrir al menos un servicio
+  del plan viejo. Códigos de error nuevos, estables: `PAYMENT_NOT_UPGRADABLE`,
+  `UPGRADE_SAME_PLAN`, `UPGRADE_DATE_OUT_OF_PERIOD`,
+  `UPGRADE_DATE_AT_PERIOD_START`, `UPGRADE_PLAN_NOT_COMPATIBLE`.
+- **Auditoría**: el cambio de `period_end` del pago viejo y el insert del nuevo
+  quedan en `audit_log` por los triggers existentes (ADR-0032), con
+  `app.audit_note = 'plan_upgrade'` para correlacionarlos.
+- **Renovación (resolución 4 de producto)**: sin cambio de código — la
+  renovación se resuelve desde el último pago no anulado del cliente, que ahora
+  es el del plan nuevo.
+- **Series al subir de cuota**: no se crean ni cancelan series automáticamente
+  (ADR-0024 resolución 4 aplica en ambos sentidos). El mostrador agrega la
+  serie del miércoles aparte; la puerta blanda `OVER_PLAN_QUOTA` ya la acepta
+  porque el pago vigente a esa fecha es del plan nuevo.
+
+**Alternativas descartadas.** (1) Relajar el `EXCLUDE` para permitir dos pagos
+solapados y resolver "cuál manda" en `payment_covers_slot()` — descartado por
+ADR-0024 res. 1 y porque "se reemplaza desde la fecha del upgrade" no necesita
+solapamiento. (2) Cobrar sólo la diferencia entre planes (opción B del
+Issue) — el producto eligió A explícitamente. (3) Prorrateo por días como
+método único — el producto pidió sesiones; días queda sólo de fallback.
+
+**Impacto.** Backend: migración Fase 54 (2 funciones, sin tablas ni columnas
+nuevas), tests de integración (incluida concurrencia y cross-tenant).
+Frontend: acción "Cambiar de plan" en los pagos del cliente (admin) con
+cotización y monto editable; el mensaje de solapamiento pasa a sugerir esa
+acción. **Gate de `security-engineer` obligatorio** (pagos + RPC definer +
+aislamiento multi-tenant). Sin cambio de contrato en RPCs existentes.
+
+**Seguimiento**: ver estado de implementación al pie cuando se cierre.
