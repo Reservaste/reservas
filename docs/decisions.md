@@ -4169,3 +4169,34 @@ negocio). Sin dependencias con ADR-0044 a ADR-0048.
 **Pendiente**: el usuario todavía no dio luz verde para implementar esto
 — queda documentado como próximo ítem del backlog de generalización,
 a la espera de que se confirme cuándo entra en la cola de trabajo.
+
+## ADR-0050 — Upgrade de plan a mitad de período: acortar el pago viejo + cobrar el nuevo prorrateado, en una RPC atómica
+
+Fecha: 2026-10-05
+Estado: **Aceptada**
+Propuesta por: Issue #4 "Upgrade desde el ADMIN" (reportado por Ruotea; respuestas de producto en los comentarios del issue).
+
+**Problema:** un cliente con un pago PAID de un plan (p. ej. 1x/semana) que quiere pasar a 2x/semana a mitad de mes no puede: cargar el plan nuevo por el mismo período choca con `payment_service_coverage_no_overlap` ("Ya hay un pago registrado que cubre parte de ese período"). El `EXCLUDE` es deliberado (ADR-0022/0024); ADR-0024 resolución 1 dejó el cambio de plan como "VOID + recargar", que obliga a anular un pago ya cobrado y recargar el mes completo, sin forma de expresar el prorrateo.
+
+**Definiciones de producto (Issue #4, comentario de Ruotea):**
+1. Se cobra el **proporcional del plan nuevo completo** (opción A) por lo que resta del período. Ej.: plan 10 → plan 20 a mitad de mes: se cobran 10 (la mitad de 20).
+2. El prorrateo es **por cantidad de sesiones restantes**.
+3. El plan viejo **se reemplaza desde la fecha del upgrade** (no conviven).
+4. La renovación del mes siguiente es del plan nuevo.
+
+**Decisión:** el `EXCLUDE` **no se relaja** y sigue habiendo **un solo pago vigente por `(customer, service)` en cada fecha** (se preserva el argumento de ADR-0024 res. 1: el motor de reservas nunca resuelve "cuál de dos planes manda"). En vez de dos pagos solapados, el upgrade *particiona* el período:
+
+- Nueva RPC `admin_upgrade_payment(p_payment_id, p_new_plan_id, p_effective_date, p_amount default null, p_notes default null) returns uuid` (id del pago nuevo), transaccional:
+  1. Bloquea el pago viejo (`FOR UPDATE`) y exige `MANAGE_PAYMENTS` en su organización (cross-tenant → error, sin filtrar existencia).
+  2. Valida: pago `PAID`, anclado a período (no `DROP_IN`/ocurrencia); plan nuevo de la misma organización, activo, no `DROP_IN`, distinto del actual, de **mayor** frecuencia (`UNLIMITED` > `WEEKLY_QUOTA` con más `weekly_quota`; bajar de plan sigue siendo VOID + recargar, ADR-0024 res. 4); misma cobertura de servicios que el viejo para los servicios del pago; `p_effective_date` en `(period_start, period_end]`.
+  3. Acorta el pago viejo: `period_end = p_effective_date - 1`. El trigger `payments_coverage_sync_status` ya replica el cambio a `payment_service_coverage`. El monto del viejo no se toca (ya se cobró).
+  4. Inserta el pago nuevo `PAID`: `period_start = p_effective_date`, `period_end` = el original del viejo, `service_plan_id = p_new_plan_id`, `amount = coalesce(p_amount, prorrateo)`.
+  5. Todo o nada: si cualquier paso falla (incl. el `EXCLUDE`), no cambia nada.
+- **Monto sugerido (prorrateo por sesiones):** `round(precio_plan_nuevo × sesiones_restantes / sesiones_totales, 2)`, con sesiones = fechas del período `[fecha_upgrade, fin]` / `[inicio, fin]` que caen en los días de semana de las series (`RecurringBooking` en vigencia) del cliente para ese servicio. Si el cliente todavía tiene menos series que la frecuencia del plan nuevo (el horario nuevo aún no se armó, que es el caso típico del issue), no se conocen todos sus días de semana: se usa proporción por días corridos `(días restantes / días del período)`, que equivale a la de sesiones para un horario semanal uniforme. El mostrador puede **sobrescribir** el monto (`p_amount`), igual que en el cobro común; el sistema no valida el monto contra el precio (mismo criterio que `payments.amount` hoy).
+- Sin cambios de tablas ni constraints; sin cobro online. Las series NO se cancelan ni se crean (ADR-0024 res. 4); la cuota por fecha ya resuelve el plan vigente por fecha, así que desde `p_effective_date` rige la frecuencia nueva y ADR-0019 reconstituye las fechas `OVER_PLAN_QUOTA`.
+- Un pedido pendiente de `plan_change_requests` (Fase 28) se cierra solo por el insert del pago nuevo, igual que un cobro común.
+- Frontend: acción de servidor `upgradeCustomerPayment` + botón "Hacer upgrade" en el pago vigente del cliente en el admin (plan nuevo, fecha efectiva con default hoy, monto sugerido editable).
+
+**Alternativas descartadas:** (a) relajar el `EXCLUDE` y permitir dos pagos solapados → obliga a una regla de precedencia en el motor de reservas, que ADR-0024 prohibió; (b) VOID + recargar con monto manual → pierde el registro de lo ya cobrado y deja ventana sin cobertura entre los dos pasos; (c) cobrar sólo la diferencia → descartada por el producto (opción A).
+
+**Impacto:** una migración (función nueva, `grant execute` sólo a `authenticated`, `revoke` de `public/anon`) + una server action y un formulario. **Gates:** `security-engineer` obligatorio (pagos + RLS/multi-tenant), `reviewer`, `qa-engineer` con suite de integración completa. Incluye tests de: upgrade feliz, atomicidad, cross-tenant, rol sin `MANAGE_PAYMENTS`, fechas inválidas, plan inferior/igual, `DROP_IN`, doble upgrade sobre el mismo pago.
